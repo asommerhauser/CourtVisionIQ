@@ -2,10 +2,10 @@
 /Data/
 
 # Ignore Play by Play Logs folder
-/Play by Play Logs/
+/PlayByPlayLogs/
 
 # Ignore Raw Data folder
-/Raw Data/
+/RawData/
 
 # Ignore Play by Play Logs zip file
 /Play by Play Logs.zip
