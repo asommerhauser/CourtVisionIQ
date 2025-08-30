@@ -1,0 +1,11 @@
+# Ignore Data folder
+/Data/
+
+# Ignore Play by Play Logs folder
+/Play by Play Logs/
+
+# Ignore Raw Data folder
+/Raw Data/
+
+# Ignore Play by Play Logs zip file
+/Play by Play Logs.zip
