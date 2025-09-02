@@ -14,19 +14,26 @@ class DataCleaner:
         Index to stop processing files at. If None, goes through the end.
     """
 
-    DATA_PATH = "./RawData/MasterFiles"  # constant route to the data folder
+    DATA_PATH = "./RawData/MasterFiles"
 
     def __init__(self, start=0, end=None):
         self.start = start
         self.end = end
 
     def parse_file(self, csv_path):
-        """
-        Load CSV into a DataFrame and print the first few rows for testing.
-        """
         df = pd.read_csv(csv_path)
-        print(f"\n=== Preview of {os.path.basename(csv_path)} ===")
-        print(df.head())   # show first 5 rows
+
+        # normalize column names
+        df.rename(columns=lambda c: c.strip(), inplace=True)
+
+        drop_cols = [
+            "game_id", "away_score", "home_score", "remaining_time",
+            "play_length", "play_id", "team", "outof", "possession", "shot_distance",
+            "original_x", "original_y", "converted_x", "converted_y", "description"
+        ]
+
+        df = df.drop(columns=drop_cols, errors="ignore")
+
         return df
 
     def run(self):
@@ -34,7 +41,7 @@ class DataCleaner:
         Loop through files in DATA_PATH and parse them.
         """
         files = sorted(os.listdir(self.DATA_PATH))
-        files = files[self.start:self.end]  # respect start/end slice
+        files = files[self.start:self.end]
 
         for fname in files:
             if fname.endswith(".csv"):
@@ -42,5 +49,5 @@ class DataCleaner:
                 self.parse_file(fpath)
 
 if __name__ == "__main__":
-    cleaner = DataCleaner(start=0, end=None)  # go through all files
+    cleaner = DataCleaner()
     cleaner.run()
