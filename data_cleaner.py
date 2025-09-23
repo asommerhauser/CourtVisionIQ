@@ -21,7 +21,7 @@ class DataCleaner:
         self.end = end
 
     def parse_file(self, csv_path):
-        df = pd.read_csv(csv_path)
+        df = pd.read_csv(csv_path, low_memory=False, na_values=["", " "])
 
         # normalize column names
         df.rename(columns=lambda c: c.strip(), inplace=True)
@@ -46,7 +46,8 @@ class DataCleaner:
         for fname in files:
             if fname.endswith(".csv"):
                 fpath = os.path.join(self.DATA_PATH, fname)
-                self.parse_file(fpath)
+                df = self.parse_file(fpath)
+                print(df.columns)
 
 if __name__ == "__main__":
     cleaner = DataCleaner()
