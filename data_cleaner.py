@@ -20,6 +20,9 @@ class DataCleaner:
         self.start = start
         self.end = end
 
+        self.events = []
+        self.output_columns = ["gameId","roster1","roster2","time","event","player","type","result","season","playoff"]
+
     def parse_file(self, csv_path):
         df = pd.read_csv(csv_path, low_memory=False, na_values=["", " "])
 
@@ -34,7 +37,35 @@ class DataCleaner:
 
         df = df.drop(columns=drop_cols, errors="ignore")
 
-        return df
+        for _, row in df.iterrows():
+            new_row = self.process_row(row)
+            if new_row != None:
+                self.events.append(new_row)
+
+        cleaned_df = pd.DataFrame(self.events)
+
+        return df, cleaned_df
+    
+    def process_row(self, row):
+        """
+        Takes in a dataframe row and returns a list of one or more
+        normalized event dictionaries.
+        """
+
+        if row["event_type"] == "shot":
+            return {
+                "gameId": "null",  # placeholder
+                "roster1": [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]],
+                "roster2": [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]],
+                "time": "null",    # placeholder
+                "event": "shot",
+                "player": row["player"] if pd.notna(row["player"]) else "null",
+                "type": str(row["points"]) if pd.notna(row["points"]) else "null",
+                "result": row["result"] if pd.notna(row["result"]) else "null",
+                "season": 1,
+                "playoff": 1
+            }
+        return None
 
     def run(self):
         """
@@ -46,8 +77,9 @@ class DataCleaner:
         for fname in files:
             if fname.endswith(".csv"):
                 fpath = os.path.join(self.DATA_PATH, fname)
-                df = self.parse_file(fpath)
-                print(df.columns)
+                df = self.parse_file(fpath)[1]
+                print(df.head)
+
 
 if __name__ == "__main__":
     cleaner = DataCleaner()
