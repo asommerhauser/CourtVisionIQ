@@ -39,8 +39,8 @@ class DataCleaner:
 
         for _, row in df.iterrows():
             new_row = self.process_row(row)
-            if new_row != None:
-                self.events.append(new_row)
+            if new_row:
+                self.events.extend(new_row)
 
         cleaned_df = pd.DataFrame(self.events)
 
@@ -52,20 +52,35 @@ class DataCleaner:
         normalized event dictionaries.
         """
 
-        if row["event_type"] == "shot":
-            return {
-                "gameId": "null",  # placeholder
+        events = []
+
+        if pd.notna(row["assist"]) and str(row["assist"]).strip() != "":
+            events.append({
                 "roster1": [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]],
                 "roster2": [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]],
-                "time": "null",    # placeholder
+                "time": "null",
+                "event": "assist",
+                "player": row["assist"],
+                "type": str(row["points"]) if pd.notna(row["points"]) else "null",
+                "result": "score",  # assist implies made basket
+                "season": 1,
+                "playoff": 1
+            })
+
+        if row["event_type"] == "shot":
+            events.append({
+                "roster1": [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]],
+                "roster2": [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]],
+                "time": "null",
                 "event": "shot",
                 "player": row["player"] if pd.notna(row["player"]) else "null",
                 "type": str(row["points"]) if pd.notna(row["points"]) else "null",
                 "result": row["result"] if pd.notna(row["result"]) else "null",
                 "season": 1,
                 "playoff": 1
-            }
-        return None
+            })
+            
+        return events
 
     def run(self):
         """
@@ -79,6 +94,7 @@ class DataCleaner:
                 fpath = os.path.join(self.DATA_PATH, fname)
                 df = self.parse_file(fpath)[1]
                 print(df.head)
+                print(df.columns)
 
 
 if __name__ == "__main__":
