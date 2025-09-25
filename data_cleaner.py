@@ -82,40 +82,63 @@ class DataCleaner:
         Takes in a dataframe row and returns a list of one or more
         normalized event dictionaries.
         """
-
         events = []
 
+        # Common computed values
+        time_val = self.convert_time(row["period"], row["elapsed"])
+        shot_type = ("3pt" if (pd.notna(row["type"]) and str(row["type"]).lower().startswith("3pt"))
+                    else ("2pt" if pd.notna(row["type"]) else "null"))
+
+        # ASSIST (only when present; implies made basket)
         if pd.notna(row["assist"]) and str(row["assist"]).strip() != "":
             events.append({
                 "roster1": [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]],
                 "roster2": [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]],
-                "time": self.convert_time(row["period"], row["elapsed"]),
+                "time": time_val if time_val is not None else "null",
                 "event": "assist",
                 "player": row["assist"],
-                "type": ("3pt" if (pd.notna(row["type"]) and str(row["type"]).lower().startswith("3pt")) else ("2pt" if pd.notna(row["type"]) else "null")),
-                "result": "score",  # assist implies made basket
+                "type": shot_type,      # 2pt/3pt
+                "result": "score",
                 "season": 1,
                 "playoff": 1
             })
 
+        # BLOCK (when present; paired with a shot that becomes 'blocked')
+        has_block = pd.notna(row.get("block")) and str(row.get("block")).strip() != ""
+
         if row["event_type"] == "shot":
+            if has_block:
+                events.append({
+                    "roster1": [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]],
+                    "roster2": [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]],
+                    "time": time_val if time_val is not None else "null",
+                    "event": "block",
+                    "player": row["block"],                                    # blocker
+                    "type": (row["player"] if pd.notna(row["player"]) else "null"),  # victim (shooter), per old file
+                    "result": "block",
+                    "season": 1,
+                    "playoff": 1
+                })
+
+            # SHOT (coerce result to 'blocked' if a block occurred)
             events.append({
                 "roster1": [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]],
                 "roster2": [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]],
-                "time": self.convert_time(row["period"], row["elapsed"]),
+                "time": time_val if time_val is not None else "null",
                 "event": "shot",
                 "player": row["player"] if pd.notna(row["player"]) else "null",
-                "type": ("3pt" if (pd.notna(row["type"]) and str(row["type"]).lower().startswith("3pt")) else ("2pt" if pd.notna(row["type"]) else "null")),
-                "result": row["result"] if pd.notna(row["result"]) else "null",
+                "type": shot_type,  # 2pt/3pt
+                "result": ("blocked" if has_block else (row["result"] if pd.notna(row["result"]) else "null")),
                 "season": 1,
                 "playoff": 1
             })
-    
-        if row['event_type'] == 'free throw':
+
+        # FREE THROW normalized under shot
+        if row["event_type"] == "free throw":
             events.append({
                 "roster1": [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]],
                 "roster2": [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]],
-                "time": self.convert_time(row["period"], row["elapsed"]),
+                "time": time_val if time_val is not None else "null",
                 "event": "shot",
                 "player": row["player"] if pd.notna(row["player"]) else "null",
                 "type": "free throw",
