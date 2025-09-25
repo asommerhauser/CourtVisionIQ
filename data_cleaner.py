@@ -46,6 +46,37 @@ class DataCleaner:
 
         return df, cleaned_df
     
+    def convert_time(self, quarter, time_past):
+        """
+        Compute cumulative game time in seconds since tipoff.
+        NBA: Q1–Q4 = 12:00 each; OT periods = 5:00 each.
+        quarter: int-like (1,2,3,4,5=OT1,6=OT2,...)
+        time_past: "H:MM:SS" (hours usually 0)
+        """
+        if pd.isna(quarter) or pd.isna(time_past):
+            return None
+        try:
+            q = int(quarter)
+            parts = str(time_past).strip().split(":")
+            if len(parts) == 3:
+                hh, mm, ss = map(int, parts)
+            elif len(parts) == 2:  # fallback, "MM:SS"
+                hh = 0
+                mm, ss = map(int, parts)
+            else:
+                return None
+        except Exception:
+            return None
+
+        # Base seconds through the start of this period
+        if q > 4:
+            base = (48 * 60) + ((q - 5) * 5 * 60)
+        else:
+            base = (q - 1) * 12 * 60
+
+        # Add elapsed within the period
+        return base + (hh * 3600) + (mm * 60) + ss
+    
     def process_row(self, row):
         """
         Takes in a dataframe row and returns a list of one or more
@@ -58,7 +89,7 @@ class DataCleaner:
             events.append({
                 "roster1": [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]],
                 "roster2": [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]],
-                "time": "null",
+                "time": self.convert_time(row["period"], row["elapsed"]),
                 "event": "assist",
                 "player": row["assist"],
                 "type": str(row["points"]) if pd.notna(row["points"]) else "null",
@@ -71,7 +102,7 @@ class DataCleaner:
             events.append({
                 "roster1": [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]],
                 "roster2": [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]],
-                "time": "null",
+                "time": self.convert_time(row["period"], row["elapsed"]),
                 "event": "shot",
                 "player": row["player"] if pd.notna(row["player"]) else "null",
                 "type": str(row["points"]) if pd.notna(row["points"]) else "null",
