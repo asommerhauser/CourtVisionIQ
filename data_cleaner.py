@@ -92,7 +92,7 @@ class DataCleaner:
                 "time": self.convert_time(row["period"], row["elapsed"]),
                 "event": "assist",
                 "player": row["assist"],
-                "type": str(row["points"]) if pd.notna(row["points"]) else "null",
+                "type": ("3pt" if (pd.notna(row["type"]) and str(row["type"]).lower().startswith("3pt")) else ("2pt" if pd.notna(row["type"]) else "null")),
                 "result": "score",  # assist implies made basket
                 "season": 1,
                 "playoff": 1
@@ -105,7 +105,7 @@ class DataCleaner:
                 "time": self.convert_time(row["period"], row["elapsed"]),
                 "event": "shot",
                 "player": row["player"] if pd.notna(row["player"]) else "null",
-                "type": str(row["points"]) if pd.notna(row["points"]) else "null",
+                "type": ("3pt" if (pd.notna(row["type"]) and str(row["type"]).lower().startswith("3pt")) else ("2pt" if pd.notna(row["type"]) else "null")),
                 "result": row["result"] if pd.notna(row["result"]) else "null",
                 "season": 1,
                 "playoff": 1
