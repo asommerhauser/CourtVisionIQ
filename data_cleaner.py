@@ -110,7 +110,20 @@ class DataCleaner:
                 "season": 1,
                 "playoff": 1
             })
-            
+    
+        if row['event_type'] == 'free throw':
+            events.append({
+                "roster1": [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]],
+                "roster2": [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]],
+                "time": self.convert_time(row["period"], row["elapsed"]),
+                "event": "shot",
+                "player": row["player"] if pd.notna(row["player"]) else "null",
+                "type": "free throw",
+                "result": row["result"] if pd.notna(row["result"]) else "null",
+                "season": 1,
+                "playoff": 1
+            })
+
         return events
 
     def run(self):
@@ -124,8 +137,10 @@ class DataCleaner:
             if fname.endswith(".csv"):
                 fpath = os.path.join(self.DATA_PATH, fname)
                 df = self.parse_file(fpath)[1]
-                print(df.head)
-                print(df.columns)
+                cols = ["time", "event", "player", "type", "result"]
+
+                print(df[cols].head(10))   # first 10
+                print(df[cols].tail(10))   # last 10
 
 
 if __name__ == "__main__":
