@@ -79,6 +79,23 @@ class DataCleaner:
         # Add elapsed within the period
         return base + (hh * 3600) + (mm * 60) + ss
     
+    def parse_rosters(self, roster1, roster2, actor):
+        """
+        Given two rosters (roster1, roster2) and an actor (player name),
+        return (teammates, opponents) where the actor is removed from
+        their own roster and the rosters are returned as lists.
+        """
+        if actor in roster1:
+            teammates = [p for p in roster1 if p != actor]
+            opponents = list(roster2)
+        elif actor in roster2:
+            teammates = [p for p in roster2 if p != actor]
+            opponents = list(roster1)
+        else:
+            teammates = list(roster1)
+            opponents = list(roster2)
+        return teammates, opponents
+    
     def process_row(self, row):
         """
         Takes in a dataframe row and returns a list of one or more
@@ -92,6 +109,8 @@ class DataCleaner:
             else:
                 self.playoff = 1
 
+        rosters = self.parse_rosters([row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]], [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]], row["player"])
+
         # Common computed values
         time_val = self.convert_time(row["period"], row["elapsed"])
         shot_type = ("3pt" if (pd.notna(row["type"]) and str(row["type"]).lower().startswith("3pt"))
@@ -99,9 +118,12 @@ class DataCleaner:
 
         # ASSIST (only when present; implies made basket)
         if pd.notna(row["assist"]) and str(row["assist"]).strip() != "":
+            # Parse rosters for the assist action
+            assist_rosters = self.parse_rosters([row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]], [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]], row["assist"])
+
             events.append({
-                "roster1": [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]],
-                "roster2": [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]],
+                "teammates": assist_rosters[0],
+                "opponents": assist_rosters[1],
                 "time": time_val if time_val is not None else "null",
                 "event": "assist",
                 "player": row["assist"],
@@ -117,8 +139,8 @@ class DataCleaner:
         if row["event_type"] == "shot":
             # SHOT (coerce result to 'blocked' if a block occurred)
             events.append({
-                "roster1": [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]],
-                "roster2": [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]],
+                "teammates": rosters[0],
+                "opponents": rosters[1],
                 "time": time_val if time_val is not None else "null",
                 "event": "shot",
                 "player": row["player"] if pd.notna(row["player"]) else "null",
@@ -129,9 +151,11 @@ class DataCleaner:
             })
 
             if has_block:
+                block_rosters = self.parse_rosters([row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]], [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]], row["block"])
+                
                 events.append({
-                    "roster1": [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]],
-                    "roster2": [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]],
+                    "teammates": block_rosters[0],
+                    "opponents": block_rosters[1],
                     "time": time_val if time_val is not None else "null",
                     "event": "block",
                     "player": row["block"],                                    # blocker
@@ -144,8 +168,8 @@ class DataCleaner:
         # FREE THROW normalized under shot
         if row["event_type"] == "free throw":
             events.append({
-                "roster1": [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]],
-                "roster2": [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]],
+                "teammates": rosters[0],
+                "opponents": rosters[1],
                 "time": time_val if time_val is not None else "null",
                 "event": "shot",
                 "player": row["player"] if pd.notna(row["player"]) else "null",
@@ -176,7 +200,7 @@ class DataCleaner:
 
                 # run the parser
                 df = self.parse_file(fpath)[1]
-                cols = ["time", "event", "player", "type", "result", "season", "playoff"]
+                cols = ["teammates", "opponents", "player"]
 
                 print(df[cols].head(10))   # first 10
                 print(df[cols].tail(10))   # last 10
