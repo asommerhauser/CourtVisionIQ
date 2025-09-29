@@ -20,9 +20,10 @@ class DataCleaner:
         self.start = start
         self.end = end
         self.season = 0
+        self.playoff = 0
 
         self.events = []
-        self.output_columns = ["gameId","roster1","roster2","time","event","player","type","result","season","playoff"]
+        self.output_columns = ["roster1","roster2","time","event","player","type","result","season","playoff"]
 
     def parse_file(self, csv_path):
         df = pd.read_csv(csv_path, low_memory=False, na_values=["", " "])
@@ -85,6 +86,12 @@ class DataCleaner:
         """
         events = []
 
+        if row['event_type'] == "start of period" and row['period'] == 1:
+            if str(row["data_set"])[-1] == "n":
+                self.playoff = 0
+            else:
+                self.playoff = 1
+
         # Common computed values
         time_val = self.convert_time(row["period"], row["elapsed"])
         shot_type = ("3pt" if (pd.notna(row["type"]) and str(row["type"]).lower().startswith("3pt"))
@@ -101,7 +108,7 @@ class DataCleaner:
                 "type": shot_type,      # 2pt/3pt
                 "result": "score",
                 "season": self.season,
-                "playoff": 1
+                "playoff": self.playoff
             })
 
         # BLOCK (when present; paired with a shot that becomes 'blocked')
@@ -118,7 +125,7 @@ class DataCleaner:
                 "type": shot_type,  # 2pt/3pt
                 "result": ("blocked" if has_block else (row["result"] if pd.notna(row["result"]) else "null")),
                 "season": self.season,
-                "playoff": 1
+                "playoff": self.playoff
             })
 
             if has_block:
@@ -131,7 +138,7 @@ class DataCleaner:
                     "type": (row["player"] if pd.notna(row["player"]) else "null"),  # victim (shooter), per old file
                     "result": "block",
                     "season": self.season,
-                    "playoff": 1
+                    "playoff": self.playoff
                 })
 
         # FREE THROW normalized under shot
@@ -145,7 +152,7 @@ class DataCleaner:
                 "type": "free throw",
                 "result": row["result"] if pd.notna(row["result"]) else "null",
                 "season": self.season,
-                "playoff": 1
+                "playoff": self.playoff
             })
 
         return events
@@ -169,7 +176,7 @@ class DataCleaner:
 
                 # run the parser
                 df = self.parse_file(fpath)[1]
-                cols = ["time", "event", "player", "type", "result", "season"]
+                cols = ["time", "event", "player", "type", "result", "season", "playoff"]
 
                 print(df[cols].head(10))   # first 10
                 print(df[cols].tail(10))   # last 10
