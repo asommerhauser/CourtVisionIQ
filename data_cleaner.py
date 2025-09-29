@@ -19,6 +19,7 @@ class DataCleaner:
     def __init__(self, start=0, end=None):
         self.start = start
         self.end = end
+        self.season = 0
 
         self.events = []
         self.output_columns = ["gameId","roster1","roster2","time","event","player","type","result","season","playoff"]
@@ -99,7 +100,7 @@ class DataCleaner:
                 "player": row["assist"],
                 "type": shot_type,      # 2pt/3pt
                 "result": "score",
-                "season": 1,
+                "season": self.season,
                 "playoff": 1
             })
 
@@ -116,7 +117,7 @@ class DataCleaner:
                 "player": row["player"] if pd.notna(row["player"]) else "null",
                 "type": shot_type,  # 2pt/3pt
                 "result": ("blocked" if has_block else (row["result"] if pd.notna(row["result"]) else "null")),
-                "season": 1,
+                "season": self.season,
                 "playoff": 1
             })
 
@@ -129,7 +130,7 @@ class DataCleaner:
                     "player": row["block"],                                    # blocker
                     "type": (row["player"] if pd.notna(row["player"]) else "null"),  # victim (shooter), per old file
                     "result": "block",
-                    "season": 1,
+                    "season": self.season,
                     "playoff": 1
                 })
 
@@ -143,7 +144,7 @@ class DataCleaner:
                 "player": row["player"] if pd.notna(row["player"]) else "null",
                 "type": "free throw",
                 "result": row["result"] if pd.notna(row["result"]) else "null",
-                "season": 1,
+                "season": self.season,
                 "playoff": 1
             })
 
@@ -158,9 +159,17 @@ class DataCleaner:
 
         for fname in files:
             if fname.endswith(".csv"):
+                # establish the path to the file
                 fpath = os.path.join(self.DATA_PATH, fname)
+
+                # peek first row to get season
+                temp_df = pd.read_csv(fpath, nrows=1)
+                dataset_val = str(temp_df.iloc[0]["data_set"])
+                self.season = int(dataset_val[:4]) + 1
+
+                # run the parser
                 df = self.parse_file(fpath)[1]
-                cols = ["time", "event", "player", "type", "result"]
+                cols = ["time", "event", "player", "type", "result", "season"]
 
                 print(df[cols].head(10))   # first 10
                 print(df[cols].tail(10))   # last 10
