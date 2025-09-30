@@ -79,6 +79,14 @@ class DataCleaner:
         # Add elapsed within the period
         return base + (hh * 3600) + (mm * 60) + ss
     
+    def home_indicator(self, home_roster, player):
+        """
+        Given the home roster list and a player name,
+        return 1 if the player is in the home roster,
+        else return 0.
+        """
+        return 1 if player in home_roster else 0
+    
     def parse_rosters(self, roster1, roster2, actor):
         """
         Given two rosters (roster1, roster2) and an actor (player name),
@@ -111,6 +119,8 @@ class DataCleaner:
 
         rosters = self.parse_rosters([row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]], [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]], row["player"])
 
+        home = self.home_indicator([row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]], row["player"])
+
         # Common computed values
         time_val = self.convert_time(row["period"], row["elapsed"])
         shot_type = ("3pt" if (pd.notna(row["type"]) and str(row["type"]).lower().startswith("3pt"))
@@ -129,6 +139,7 @@ class DataCleaner:
                 "player": row["assist"],
                 "type": shot_type,      # 2pt/3pt
                 "result": "score",
+                "home/away": home,
                 "season": self.season,
                 "playoff": self.playoff
             })
@@ -146,6 +157,7 @@ class DataCleaner:
                 "player": row["player"] if pd.notna(row["player"]) else "null",
                 "type": shot_type,  # 2pt/3pt
                 "result": ("blocked" if has_block else (row["result"] if pd.notna(row["result"]) else "null")),
+                "home/away": home,
                 "season": self.season,
                 "playoff": self.playoff
             })
@@ -161,6 +173,7 @@ class DataCleaner:
                     "player": row["block"],                                    # blocker
                     "type": (row["player"] if pd.notna(row["player"]) else "null"),  # victim (shooter), per old file
                     "result": "block",
+                    "home/away": (0 if home == 1 else 1),
                     "season": self.season,
                     "playoff": self.playoff
                 })
@@ -175,6 +188,7 @@ class DataCleaner:
                 "player": row["player"] if pd.notna(row["player"]) else "null",
                 "type": "free throw",
                 "result": row["result"] if pd.notna(row["result"]) else "null",
+                "home/away": home,
                 "season": self.season,
                 "playoff": self.playoff
             })
@@ -200,7 +214,7 @@ class DataCleaner:
 
                 # run the parser
                 df = self.parse_file(fpath)[1]
-                cols = ["teammates", "opponents", "player"]
+                cols = ["event", "time", "player", "home/away"]
 
                 print(df[cols].head(10))   # first 10
                 print(df[cols].tail(10))   # last 10
