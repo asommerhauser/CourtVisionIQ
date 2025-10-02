@@ -21,6 +21,9 @@ class DataCleaner:
         self.end = end
         self.season = 0
         self.playoff = 0
+        self.home_players = []
+        self.away_players = []
+        self.first = True
 
         self.events = []
         self.output_columns = ["roster1","roster2","time","event","player","type","result","season","playoff"]
@@ -43,6 +46,19 @@ class DataCleaner:
             new_row = self.process_row(row)
             if new_row:
                 self.events.extend(new_row)
+        
+        self.events.append({
+            "teammates": self.home_players,
+            "opponents": self.away_players,
+            "time": 0,
+            "event": "end",
+            "player": "end",
+            "type": "end",
+            "result": "end",
+            "home/away": 0,
+            "season": self.season,
+            "playoff": self.playoff
+        })
 
         cleaned_df = pd.DataFrame(self.events)
 
@@ -117,9 +133,40 @@ class DataCleaner:
             else:
                 self.playoff = 1
 
-        rosters = self.parse_rosters([row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]], [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]], row["player"])
+            if not self.first:
+                events.append({
+                    "teammates": self.home_players,
+                    "opponents": self.away_players,
+                    "time": 0,
+                    "event": "end",
+                    "player": "end",
+                    "type": "end",
+                    "result": "end",
+                    "home/away": 0,
+                    "season": self.season,
+                    "playoff": self.playoff
+                })
+            else:
+                self.first = False
 
-        home = self.home_indicator([row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]], row["player"])
+            home_players = []
+            away_players = []
+
+        home_five = [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]]
+        away_five = [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]]
+
+        for p in home_five:
+            if pd.notna(p) and p not in self.home_players:
+                self.home_players.append(p)
+        for p in away_five:
+            if pd.notna(p) and p not in self.away_players:
+                self.away_players.append(p)
+
+        rosters = self.parse_rosters(home_five, away_five, row["player"])
+
+        home = self.home_indicator(home_five, row["player"])
+
+
 
         # Common computed values
         time_val = self.convert_time(row["period"], row["elapsed"])
@@ -207,6 +254,9 @@ class DataCleaner:
                 # establish the path to the file
                 fpath = os.path.join(self.DATA_PATH, fname)
 
+                # reset the first flag
+                self.first = True
+
                 # peek first row to get season
                 temp_df = pd.read_csv(fpath, nrows=1)
                 dataset_val = str(temp_df.iloc[0]["data_set"])
@@ -214,7 +264,7 @@ class DataCleaner:
 
                 # run the parser
                 df = self.parse_file(fpath)[1]
-                cols = ["event", "time", "player", "home/away"]
+                cols = ["teammates", "opponents", "season", "event", "time", "player", "home/away"]
 
                 print(df[cols].head(10))   # first 10
                 print(df[cols].tail(10))   # last 10
