@@ -149,8 +149,8 @@ class DataCleaner:
             else:
                 self.first = False
 
-            home_players = []
-            away_players = []
+            self.home_players = []
+            self.away_players = []
 
         home_five = [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]]
         away_five = [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]]
@@ -165,8 +165,6 @@ class DataCleaner:
         rosters = self.parse_rosters(home_five, away_five, row["player"])
 
         home = self.home_indicator(home_five, row["player"])
-
-
 
         # Common computed values
         time_val = self.convert_time(row["period"], row["elapsed"])
@@ -240,6 +238,32 @@ class DataCleaner:
                 "playoff": self.playoff
             })
 
+        # REBOUND
+        if row["event_type"] == "rebound":
+            # rebound type: offensive/defensive/etc.
+            rebound_type = (
+                "defensive" if row["type"] == "rebound defensive"
+                else "offensive" if row["type"] == "rebound offensive"
+                else "null"
+            )
+
+            # 'cop' flag matches old behavior: 'cop' if offensive, else 'null'
+            cop = "cop" if (pd.notna(row["type"]) and str(row["type"]).lower() == "offensive") else "null"
+
+            events.append({
+                "teammates": rosters[0],
+                "opponents": rosters[1],
+                "time": time_val if time_val is not None else "null",
+                "event": "rebound",
+                "player": row["player"] if pd.notna(row["player"]) else "null",
+                "type": rebound_type,   # offensive / defensive / etc.
+                "result": cop,          # 'cop' or 'null' per old logic
+                "home/away": home,
+                "season": self.season,
+                "playoff": self.playoff
+            })
+
+
         return events
 
     def run(self):
@@ -264,7 +288,7 @@ class DataCleaner:
 
                 # run the parser
                 df = self.parse_file(fpath)[1]
-                cols = ["teammates", "opponents", "season", "event", "time", "player", "home/away"]
+                cols = ["teammates", "opponents", "event", "player", "type"]
 
                 print(df[cols].head(10))   # first 10
                 print(df[cols].tail(10))   # last 10
