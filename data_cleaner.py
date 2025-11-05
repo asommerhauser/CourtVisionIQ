@@ -351,6 +351,10 @@ class DataCleaner:
 
         # REBOUND
         if row["event_type"] == "rebound":
+            # skip pure team rebounds
+            if row["type"] == "team rebound":
+                return events
+
             # rebound type: offensive/defensive/etc.
             rebound_type = (
                 "defensive" if row["type"] == "rebound defensive"
@@ -358,8 +362,8 @@ class DataCleaner:
                 else "null"
             )
 
-            # 'cop' flag matches old behavior: 'cop' if offensive, else 'null'
-            cop = "cop" if (pd.notna(row["type"]) and str(row["type"]).lower() == "offensive") else "null"
+            # 'cop' only for offensive boards
+            cop = "cop" if rebound_type == "offensive" else "null"
 
             events.append({
                 "teammates": rosters[0],
@@ -367,8 +371,8 @@ class DataCleaner:
                 "time": time_val if time_val is not None else "null",
                 "event": "rebound",
                 "player": row["player"] if pd.notna(row["player"]) else "null",
-                "type": rebound_type,   # offensive / defensive / etc.
-                "result": cop,          # 'cop' or 'null' per old logic
+                "type": rebound_type,   # offensive / defensive / null
+                "result": cop,          # 'cop' for offensive, 'null' otherwise
                 "home/away": home,
                 "season": self.season,
                 "playoff": self.playoff
