@@ -28,6 +28,8 @@ class DataCleaner:
         self.events = []
         self.output_columns = ["roster1","roster2","time","event","player","type","result","season","playoff"]
 
+    # ----------------- HELPER FUNCTIONS -----------------
+
     def parse_file(self, csv_path):
         df = pd.read_csv(csv_path, low_memory=False, na_values=["", " "])
 
@@ -119,6 +121,46 @@ class DataCleaner:
             teammates = list(roster1)
             opponents = list(roster2)
         return teammates, opponents
+
+    def determine_turnover_type(self, data):
+        """
+        Map raw turnover 'type' text into a coarse turnover category.
+
+        Returns one of:
+        - 'violation'
+        - 'error'
+        - 'null'
+        - 'unrecognized'
+        """
+        check_vio = [
+            '3-second violation', 'shot clock', '8-second violation', 'lane violation', 'offensive goaltending',
+            'palming', 'backcourt', '5-second violation', 'double dribble', 'discontinue dribble', 'illegal assist',
+            'jump ball violation', 'offensive foul', 'illegal screen', 'basket from below', 'punched ball',
+            'too many players', 'traveling', 'kicked ball'
+        ]
+        check_error = [
+            'lost ball', 'out of bounds lost ball', 'step out of bounds',
+            'bad pass', 'inbound'
+        ]
+
+        if pd.isna(data):
+            return 'null'  # keep missing data
+        data = str(data).strip().lower()
+
+        if data == '' or data == 'null':
+            return 'null'  # still keep
+        elif data == 'no turnover':
+            return None  # skip this one completely
+        elif data in check_vio:
+            return 'violation'
+        elif data in check_error:
+            return 'error'
+        else:
+            print("FLAG UNRECOGNIZED TURNOVER", data)
+            return None  # skip unrecognized junk
+
+
+    # -----------------------------------------------------
     
     def process_row(self, row):
         """
@@ -263,6 +305,69 @@ class DataCleaner:
                 "playoff": self.playoff
             })
 
+        # TURNOVER
+        if row["event_type"] == "turnover":
+            time_safe = time_val if time_val is not None else "null"
+
+            turnover_player = row["player"] if pd.notna(row["player"]) else "null"
+            steal_player = row.get("steal")
+            has_steal = pd.notna(steal_player) and str(steal_player).strip() != ""
+
+            # If a steal is credited, create a steal-side event
+            if has_steal:
+                steal_player = str(steal_player).strip()
+
+                steal_rosters = self.parse_rosters(home_five, away_five, steal_player)
+                steal_home = self.home_indicator(home_five, steal_player)
+
+                # Steal perspective: same 'event' as old code (turnover),
+                # but result='steal' marks this as the steal event.
+                events.append({
+                    "teammates": steal_rosters[0],
+                    "opponents": steal_rosters[1],
+                    "time": time_safe,
+                    "event": "turnover",
+                    "player": steal_player,
+                    "type": "steal",      # keep simple; detailed cause not needed here
+                    "result": "steal",    # steal marker
+                    "home/away": steal_home,
+                    "season": self.season,
+                    "playoff": self.playoff
+                })
+
+                # Turnover perspective: ballhandler commits a turnover via steal
+                events.append({
+                    "teammates": rosters[0],
+                    "opponents": rosters[1],
+                    "time": time_safe,
+                    "event": "turnover",
+                    "player": turnover_player,
+                    "type": "steal",      # turnover caused by a steal
+                    "result": "cop",      # change of possession
+                    "home/away": home,
+                    "season": self.season,
+                    "playoff": self.playoff
+                })
+
+            else:
+                # No steal recorded -> classify as violation/error/etc
+                turnover_type = self.determine_turnover_type(row.get("type"))
+
+                if turnover_type is None:
+                    return events  # skip this row completely
+
+                events.append({
+                    "teammates": rosters[0],
+                    "opponents": rosters[1],
+                    "time": time_safe,
+                    "event": "turnover",
+                    "player": turnover_player,
+                    "type": turnover_type,  # 'violation', 'error', or 'null'
+                    "result": "cop",
+                    "home/away": home,
+                    "season": self.season,
+                    "playoff": self.playoff
+                })
 
         return events
 
@@ -290,8 +395,8 @@ class DataCleaner:
                 df = self.parse_file(fpath)[1]
                 cols = ["teammates", "opponents", "event", "player", "type"]
 
-                print(df[cols].head(10))   # first 10
-                print(df[cols].tail(10))   # last 10
+                print(df[cols].head(100))   # first 10
+                print(df[cols].tail(100))   # last 10
 
 
 if __name__ == "__main__":
