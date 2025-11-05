@@ -159,6 +159,58 @@ class DataCleaner:
             print("FLAG UNRECOGNIZED TURNOVER", data)
             return None  # skip unrecognized junk
 
+    def determine_foul_type(self, data):
+        """
+        Normalize raw foul 'type' text.
+
+        - 'offensive charge' -> 'offensive'
+        - '' / NaN -> 'null'
+        - anything ending with 'technical' -> 'technical'
+        - otherwise return original text
+        """
+        if pd.isna(data):
+            return "null"
+
+        data_str = str(data).strip()
+        if data_str == "":
+            return "null"
+
+        # match original behavior
+        if data_str == "offensive charge":
+            return "offensive"
+        if data_str[-9:].lower() == "technical":
+            return "technical"
+
+        return data_str
+
+    def determine_foul_result(self, foul_type):
+        """
+        Map foul type to result category.
+
+        Matches old behavior:
+        - 'personal' / 'null' / 'away from play' -> 'nothing'
+        - 'shooting' / 'technical' -> 'free throw'
+        - 'personal take' / 'flagrant-1' / 'transition take' -> 'free throw op'
+        - 'offensive' -> 'cop'
+        - 'loose ball' -> 'op'
+        - 'flagrant-2' -> 'ejection'
+        """
+        if foul_type in ("personal", "null", "away from play"):
+            return "nothing"
+        elif foul_type in ("shooting", "technical"):
+            return "free throw"
+        elif foul_type in ("personal take", "flagrant-1", "transition take"):
+            return "free throw op"
+        elif foul_type == "offensive":
+            return "cop"
+        elif foul_type == "loose ball":
+            return "op"
+        elif foul_type == "flagrant-2":
+            return "ejection"
+        else:
+            # keep the old "loud fail" behavior so we notice new types
+            raise ValueError(f"Unknown foul type: {foul_type}")
+
 
     # -----------------------------------------------------
     
@@ -385,6 +437,26 @@ class DataCleaner:
                     "season": self.season,
                     "playoff": self.playoff
                 })
+
+        # FOUL
+        if row["event_type"] == "foul":
+            time_safe = time_val if time_val is not None else "null"
+
+            foul_type = self.determine_foul_type(row.get("type"))
+            foul_result = self.determine_foul_result(foul_type)
+
+            events.append({
+                "teammates": rosters[0],
+                "opponents": rosters[1],
+                "time": time_safe,
+                "event": "foul",
+                "player": row["player"] if pd.notna(row["player"]) else "null",
+                "type": foul_type,       # normalized foul type
+                "result": foul_result,   # nothing / free throw / cop / etc.
+                "home/away": home,
+                "season": self.season,
+                "playoff": self.playoff
+            })
 
         return events
 
