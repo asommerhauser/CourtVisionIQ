@@ -194,6 +194,23 @@ class DataCleaner:
             self.home_players = []
             self.away_players = []
 
+            # START EVENT
+            start_home = [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]]
+            start_away = [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]]
+
+            events.append({
+                "teammates": [p for p in start_home if pd.notna(p)],
+                "opponents": [p for p in start_away if pd.notna(p)],
+                "time": 0,
+                "event": "start",
+                "player": "start",
+                "type": "start",
+                "result": "start",
+                "home/away": 0,
+                "season": self.season,
+                "playoff": self.playoff
+            })
+
         home_five = [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]]
         away_five = [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]]
 
