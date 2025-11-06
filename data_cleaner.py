@@ -28,9 +28,9 @@ class DataCleaner:
         self.events = []
         self.output_columns = ["roster1","roster2","time","event","player","type","result","season","playoff"]
 
-    # ----------------- HELPER FUNCTIONS -----------------
-
     def parse_file(self, csv_path):
+        self.events = []
+
         df = pd.read_csv(csv_path, low_memory=False, na_values=["", " "])
 
         # normalize column names
@@ -65,6 +65,8 @@ class DataCleaner:
         cleaned_df = pd.DataFrame(self.events)
 
         return df, cleaned_df
+
+    # ----------------- HELPER FUNCTIONS -----------------
     
     def convert_time(self, quarter, time_past):
         """
@@ -362,8 +364,8 @@ class DataCleaner:
                 else "null"
             )
 
-            # 'cop' only for offensive boards
-            cop = "cop" if rebound_type == "offensive" else "null"
+            # 'cop' only for defensive boards
+            cop = "cop" if rebound_type == "defensive" else "null"
 
             events.append({
                 "teammates": rosters[0],
@@ -371,8 +373,8 @@ class DataCleaner:
                 "time": time_val if time_val is not None else "null",
                 "event": "rebound",
                 "player": row["player"] if pd.notna(row["player"]) else "null",
-                "type": rebound_type,   # offensive / defensive / null
-                "result": cop,          # 'cop' for offensive, 'null' otherwise
+                "type": rebound_type,
+                "result": cop,
                 "home/away": home,
                 "season": self.season,
                 "playoff": self.playoff
@@ -455,8 +457,30 @@ class DataCleaner:
                 "time": time_safe,
                 "event": "foul",
                 "player": row["player"] if pd.notna(row["player"]) else "null",
-                "type": foul_type,       # normalized foul type
-                "result": foul_result,   # nothing / free throw / cop / etc.
+                "type": foul_type,
+                "result": foul_result,
+                "home/away": home,
+                "season": self.season,
+                "playoff": self.playoff
+            })
+
+        # SUBSTITUTION
+        if row["event_type"] == "substitution":
+            entered = row["entered"]
+            left = row["left"]
+
+            # if both missing, skip
+            if pd.isna(entered) and pd.isna(left):
+                return events
+
+            events.append({
+                "teammates": rosters[0],
+                "opponents": rosters[1],
+                "time": time_val if time_val is not None else "null",
+                "event": "substitution",
+                "player": entered,
+                "type": left,
+                "result": "substitution",
                 "home/away": home,
                 "season": self.season,
                 "playoff": self.playoff
@@ -466,30 +490,52 @@ class DataCleaner:
 
     def run(self):
         """
-        Loop through files in DATA_PATH and parse them.
+        Loop through files in DATA_PATH, parse them, and append cleaned events
+        into ./Data/season<season>.csv (one file per season).
         """
         files = sorted(os.listdir(self.DATA_PATH))
         files = files[self.start:self.end]
 
+        os.makedirs("./Data", exist_ok=True)
+
         for fname in files:
-            if fname.endswith(".csv"):
-                # establish the path to the file
-                fpath = os.path.join(self.DATA_PATH, fname)
+            if not fname.endswith(".csv"):
+                continue
 
-                # reset the first flag
-                self.first = True
+            # establish path to the raw file
+            fpath = os.path.join(self.DATA_PATH, fname)
 
-                # peek first row to get season
-                temp_df = pd.read_csv(fpath, nrows=1)
-                dataset_val = str(temp_df.iloc[0]["data_set"])
-                self.season = int(dataset_val[:4]) + 1
+            # reset per-file state
+            self.first = True
+            self.home_players = []
+            self.away_players = []
 
-                # run the parser
-                df = self.parse_file(fpath)[1]
-                cols = ["teammates", "opponents", "event", "player", "type"]
+            # peek first row to get season
+            temp_df = pd.read_csv(fpath, nrows=1)
+            dataset_val = str(temp_df.iloc[0]["data_set"])
+            self.season = int(dataset_val[:4]) + 1
 
-                print(df[cols].head(100))   # first 10
-                print(df[cols].tail(100))   # last 10
+            # parse the file -> cleaned_df for THIS game only
+            _, cleaned_df = self.parse_file(fpath)
+
+            # output path: one CSV per season
+            out_path = f"./Data/season{self.season}.csv"
+
+            # append if file exists, otherwise write with header
+            write_header = not os.path.exists(out_path)
+            cleaned_df.to_csv(
+                out_path,
+                mode="a",
+                header=write_header,
+                index=False
+            )
+
+            # # optional debug
+            # cols = ["teammates", "opponents", "event", "player", "type"]
+            # print(f"Appended {len(cleaned_df)} rows to {out_path} from {fname}")
+            # print(cleaned_df[cols].head(5))
+            # print(cleaned_df[cols].tail(5))
+            
 
 
 if __name__ == "__main__":
