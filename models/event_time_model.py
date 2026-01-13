@@ -1,3 +1,4 @@
+import tensorflow as tf
 from keras import layers, models, Input
 from config import MAX_SEQUENCE_LENGTH
 
@@ -11,7 +12,7 @@ class EventTimeModel:
         self.model_dim = model_dim
         self.num_event_classes = num_event_classes
 
-    def model():
+    def model(self):
         """
         Build the keras model.
         """
