@@ -7,7 +7,7 @@ class EventTimeModel:
     The event time model - more to come.
     """
 
-    def __init__(self, max_seq_len=MAX_SEQUENCE_LENGTH, model_dim=256, num_event_classes=7):
+    def __init__(self, max_seq_len=MAX_SEQUENCE_LENGTH, model_dim=256, num_event_classes=7, encoder):
         self.max_seq_len = max_seq_len
         self.model_dim = model_dim
         self.num_event_classes = num_event_classes
