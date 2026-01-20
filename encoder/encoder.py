@@ -1,16 +1,16 @@
 from .vocab import Vocab
 import ast
+from pathlib import Path
 
 class Encoder:
-    def __init__(self):
-        self.player_vocab = Vocab(["PAD"], f"./vocabs/player_vocab.json")
+    def __init__(self, player_vocab_path: str | Path = "./vocabs/player_vocab.json"):
+        self.player_vocab = Vocab(["PAD"], player_vocab_path)
 
     def encode_roster(self, roster):
         encoded_roster = set()
         roster = self.str_to_list(roster)
         for player in roster:
             encoded_roster.add(self.player_vocab.encode(player))
-
         return encoded_roster
 
 
