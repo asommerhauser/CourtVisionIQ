@@ -1,4 +1,5 @@
 import tensorflow as tf
+import pandas as pd
 from keras import layers, models, Input
 from config import MAX_SEQUENCE_LENGTH
 from pathlib import Path
@@ -8,7 +9,7 @@ class EventTimeModel:
     The event time model - more to come.
     """
 
-    def __init__(self, max_seq_len=MAX_SEQUENCE_LENGTH, model_dim=256, num_event_classes=7, encoder, path="./data"):
+    def __init__(self, encoder, max_seq_len=MAX_SEQUENCE_LENGTH, model_dim=256, num_event_classes=7, path="./data"):
         self.max_seq_len = max_seq_len
         self.model_dim = model_dim
         self.num_event_classes = num_event_classes
@@ -19,6 +20,9 @@ class EventTimeModel:
         self.encoder = encoder
 
     def preprocess(self):
+        """
+        Shape the cleaned data into a form that the model will use for training.
+        """
         for csv_path in self.csv_files:
             print(f"Processing {csv_path.name}")
             df = pd.read_csv(csv_path)
