@@ -3,6 +3,7 @@ import pandas as pd
 from keras import layers, models, Input
 from config import MAX_SEQUENCE_LENGTH
 from pathlib import Path
+from encoder.encoder import Encoder
 from models.roster_set_encoder import RosterSetEncoder, RosterEncoderParams
 
 class EventTimeModel:
@@ -10,12 +11,21 @@ class EventTimeModel:
     The event time model - more to come.
     """
 
-    def __init__(self, encoder, max_seq_len=MAX_SEQUENCE_LENGTH, model_dim=256, num_event_classes=7, path="./data"):
-        self.MODEL = {
-            "max_seq_len": max_seq_len,
-            "model_dim": model_dim,
-            "num_event_classes": num_event_classes,
-        }
+    def __init__(self, encoder: Encoder, roster_parameters: RosterEncoderParams,
+                 sequence_length = MAX_SEQUENCE_LENGTH, 
+                 model_dim = 256, 
+                 event_classes = 7,
+                 path="./data"):
+        
+        # Setting up hyper-parameters
+        # --- Model ---
+        self.sequence_length = sequence_length
+        self.model_dimensions = 256
+        self.event_classes = 7
+
+        # -- Roster Enocder ---
+        self.ROSTER = roster_parameters
+        self.roster_set_encoder = RosterSetEncoder(self.ROSTER)
         
         self.data_dir = Path(path)
         if not self.data_dir.exists():
@@ -48,8 +58,38 @@ class EventTimeModel:
             name="sequence_input"
         )
 
-        # Transformer Encoder
-        x = layers.Dense(self.model_dim, activation="relu")(sequence_input)
+        teammates_roster_ids = Input(
+            shape=(self.sequence_length, self.ROSTER.roster_size),
+            dtype="int32",
+            name="opponents_roster_ids"
+        )
+
+        opponents_roster_ids = Input(
+            shape=(self.sequence_length, self.ROSTER.roster_size),
+            dtype="int32",
+            name="opponents_roster_ids"
+        )
+
+        # Roster Set Transforming
+        teammates_vec = layers.TimeDistributed(
+            self.roster_encoder,
+            name="teammates_roster_vec"
+        )(teammates_roster_ids)
+
+        opponents_vec = layers.TimeDistributed(
+            self.roster_encoder,
+            name="opponents_roster_vec"
+        )(opponents_roster_ids)
+
+        x = layers.Concatenate(name="concat_tokens_rosters")(
+            [sequence_input, teammates_vec, opponents_vec]
+        )
+
+        # Project to model_dim
+        x = layers.Dense(self.model_dim, activation="relu", name="fusion_projection")(x)
+
+        # Placeholder Transformer Encoder
+        x = layers.Dense(self.model_dim, activation="relu", name="token_mlp")(x)
 
         # --- Output Heads ---
         # Event head
