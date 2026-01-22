@@ -3,6 +3,7 @@ import pandas as pd
 from keras import layers, models, Input
 from config import MAX_SEQUENCE_LENGTH
 from pathlib import Path
+from models.roster_set_encoder import RosterSetEncoder, RosterEncoderParams
 
 class EventTimeModel:
     """
@@ -10,9 +11,12 @@ class EventTimeModel:
     """
 
     def __init__(self, encoder, max_seq_len=MAX_SEQUENCE_LENGTH, model_dim=256, num_event_classes=7, path="./data"):
-        self.max_seq_len = max_seq_len
-        self.model_dim = model_dim
-        self.num_event_classes = num_event_classes
+        self.MODEL = {
+            "max_seq_len": max_seq_len,
+            "model_dim": model_dim,
+            "num_event_classes": num_event_classes,
+        }
+        
         self.data_dir = Path(path)
         if not self.data_dir.exists():
             raise FileNotFoundError(f"Data directory not found: {self.data_dir.resolve()}")
