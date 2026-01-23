@@ -3,8 +3,15 @@ import ast
 from pathlib import Path
 
 class Encoder:
-    def __init__(self, player_vocab_path: str | Path = "./vocabs/player_vocab.json"):
-        self.player_vocab = Vocab(["PAD"], player_vocab_path)
+    def __init__(self):
+        self.player_vocab = Vocab(["PAD", "start", "end"], "/vocabs/player_vocab.json")
+        self.event_vocab = Vocab(["PAD", "start", "end"], "/vocabs/event_vocab.json")
+        self.result_vocab = Vocab(["PAD", "start", "end"], "/vocabs/result_vocab")
+        self.season_vocab = Vocab(["PAD"], "/vocabs/season_vocab")
+
+    # ========================
+    # --- Encoding Functions ---
+    # ========================
 
     def encode_roster(self, roster):
         encoded_roster = set()
@@ -13,6 +20,15 @@ class Encoder:
             encoded_roster.add(self.player_vocab.encode(player))
         return encoded_roster
 
+    def encode_player(self, player):
+        return self.player_vocab.encode(player)
+
+    def encode_event(self, event):
+        return self.event_vocab.encode(event)
+
+    def encode_season(self, season):
+        return self.season_vocab.encode(season)
+    
 
     # ========================
     # --- Helper Functions ---
