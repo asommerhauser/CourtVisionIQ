@@ -6,12 +6,13 @@ class Encoder:
     def __init__(self):
         self.player_vocab = Vocab(["PAD", "start", "end"], "/vocabs/player_vocab.json")
         self.event_vocab = Vocab(["PAD", "start", "end"], "/vocabs/event_vocab.json")
+        self.type_vocab = Vocab(["PAD", "start", "type"], "/vocab/type_vocab")
         self.result_vocab = Vocab(["PAD", "start", "end"], "/vocabs/result_vocab")
         self.season_vocab = Vocab(["PAD"], "/vocabs/season_vocab")
 
-    # ========================
+    # ==========================
     # --- Encoding Functions ---
-    # ========================
+    # ==========================
 
     def encode_roster(self, roster):
         encoded_roster = set()
@@ -25,6 +26,12 @@ class Encoder:
 
     def encode_event(self, event):
         return self.event_vocab.encode(event)
+
+    def encode_type(self, type_code):
+        return self.type_vocab.encode(type_code)
+
+    def encode_result(self, result):
+        return self.result_vocab.encode(result)
 
     def encode_season(self, season):
         return self.season_vocab.encode(season)

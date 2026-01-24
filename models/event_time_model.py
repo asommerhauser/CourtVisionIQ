@@ -11,7 +11,7 @@ class EventTimeModel:
     The event time model - more to come.
     """
 
-    def __init__(self, encoder: Encoder, roster_parameters: RosterEncoderParams,
+    def __init__(self, encoder: Encoder,
                  sequence_length = MAX_SEQUENCE_LENGTH, 
                  model_dim = 256, 
                  event_classes = 7,
@@ -22,10 +22,6 @@ class EventTimeModel:
         self.sequence_length = sequence_length
         self.model_dimensions = model_dim
         self.event_classes = event_classes
-
-        # -- Roster Enocder ---
-        self.ROSTER = roster_parameters
-        self.roster_set_encoder = RosterSetEncoder(self.ROSTER)
         
         self.data_dir = Path(path)
         if not self.data_dir.exists():
@@ -41,11 +37,26 @@ class EventTimeModel:
             print(f"Processing {csv_path.name}")
             df = pd.read_csv(csv_path)
 
-            df = df[["teammates", "opponents"]]
-
-            df["teammates_encoded"] = df["teammates"].apply(self.encoder.encode_roster)
-            df["opponents_encoded"] = df["opponents"].apply(self.encoder.encode_roster)
+            df["teammates"] = df["teammates"].apply(self.encoder.encode_roster)
+            df["opponents"] = df["opponents"].apply(self.encoder.encode_roster)
+            df["event"] = df["event"].apply(self.encoder.encode_event)
+            df["player"] = df["player"].apply(self.encoder.encode_player)
+            df["type"] = df["type"].apply(self.encoder.encode_type)
+            df["result"] = df["result"].apply(self.encoder.encode_result)
+            df["season"] = df["season"].apply(self.encoder.encode_season)
             print(df)
+
+        # -- Roster Encoder ---
+        ROSTER = RosterEncoderParams(
+            roster_size=5,
+            num_players=self.encoder.player_vocab.next_token,
+            roster_dim=128,
+            num_sab_layers=2,
+            num_heads=4,
+            d_ff=256,
+            dropout=0.1,
+        )
+        self.roster_encoder = RosterSetEncoder(ROSTER)
 
     def model(self):
         """
