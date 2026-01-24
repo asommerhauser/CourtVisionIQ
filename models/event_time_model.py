@@ -20,8 +20,8 @@ class EventTimeModel:
         # Setting up hyper-parameters
         # --- Model ---
         self.sequence_length = sequence_length
-        self.model_dimensions = 256
-        self.event_classes = 7
+        self.model_dimensions = model_dim
+        self.event_classes = event_classes
 
         # -- Roster Enocder ---
         self.ROSTER = roster_parameters
