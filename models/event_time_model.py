@@ -44,6 +44,13 @@ class EventTimeModel:
             df["type"] = df["type"].apply(self.encoder.encode_type)
             df["result"] = df["result"].apply(self.encoder.encode_result)
             df["season"] = df["season"].apply(self.encoder.encode_season)
+
+            df["teammates_tplus1"] = df["teammates"].shift(-1)
+            df["opponents_tplus1"] = df["opponents"].shift(-1)
+            df["event_output"]     = df["event"].shift(-1)
+
+            df["delta_time"] = df["time"] - df["time"].shift(1)
+            df["delta_time"] = df["delta_time"].fillna(0)
             print(df)
 
         # -- Roster Encoder ---
