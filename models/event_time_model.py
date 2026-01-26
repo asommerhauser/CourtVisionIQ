@@ -45,12 +45,57 @@ class EventTimeModel:
             df["result"] = df["result"].apply(self.encoder.encode_result)
             df["season"] = df["season"].apply(self.encoder.encode_season)
 
-            df["teammates_tplus1"] = df["teammates"].shift(-1)
-            df["opponents_tplus1"] = df["opponents"].shift(-1)
+            df["teammates_cur"] = df["teammates"].shift(-1)
+            df["opponents_cur"] = df["opponents"].shift(-1)
             df["event_output"]     = df["event"].shift(-1)
 
             df["delta_time"] = df["time"] - df["time"].shift(1)
             df["delta_time"] = df["delta_time"].fillna(0)
+
+            PAD_EVENT   = self.encoder.encode_event("PAD")
+            PAD_PLAYER  = self.encoder.encode_player("PAD")
+            PAD_TYPE    = self.encoder.encode_type("PAD")
+            PAD_RESULT  = self.encoder.encode_result("PAD")
+            PAD_SEASON  = self.encoder.encode_season("PAD")
+            PAD_ROSTER  = self.encoder.encode_roster([])  # empty roster = PAD
+
+            SEQ_LEN = self.sequence_length
+
+            rows = []
+            current_len = 0
+
+            for _, row in df.iterrows():
+                rows.append(row.to_dict())
+                current_len += 1
+
+                # END TOKEN HIT — PAD OUT TO SEQUENCE_LENGTH
+                if row["event"] == self.encoder.encode_event("end"):
+                    pad_needed = SEQ_LEN - current_len
+
+                    if pad_needed > 0:
+                        pad_block = pd.DataFrame({
+                            "teammates":        [PAD_ROSTER] * pad_needed,
+                            "opponents":        [PAD_ROSTER] * pad_needed,
+                            "event":            [PAD_EVENT] * pad_needed,
+                            "player":           [PAD_PLAYER] * pad_needed,
+                            "type":             [PAD_TYPE] * pad_needed,
+                            "result":           [PAD_RESULT] * pad_needed,
+                            "season":           [PAD_SEASON] * pad_needed,
+                            "teammates_cur":    [PAD_ROSTER] * pad_needed,
+                            "opponents_cur":    [PAD_ROSTER] * pad_needed,
+                            "event_output":     [PAD_EVENT] * pad_needed,
+                            "delta_time":       [0.0] * pad_needed,
+                            "time":             [row["time"]] * pad_needed,
+                        })
+                        rows.extend(pad_block.to_dict("records"))
+
+                    # reset counter for next game
+                    current_len = 0
+
+            df = pd.DataFrame(rows)
+            out_path = csv_path.with_name(csv_path.stem + "_padded.csv")
+            df.to_csv(out_path, index=False)
+            print(f"Saved padded file to {out_path}")
             print(df)
 
         # -- Roster Encoder ---

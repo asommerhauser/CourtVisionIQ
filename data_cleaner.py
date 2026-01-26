@@ -113,15 +113,8 @@ class DataCleaner:
         return (teammates, opponents) where the actor is removed from
         their own roster and the rosters are returned as lists.
         """
-        if actor in roster1:
-            teammates = [p for p in roster1 if p != actor]
-            opponents = list(roster2)
-        elif actor in roster2:
-            teammates = [p for p in roster2 if p != actor]
-            opponents = list(roster1)
-        else:
-            teammates = list(roster1)
-            opponents = list(roster2)
+        teammates = list(roster1)
+        opponents = list(roster2)
         return teammates, opponents
 
     def determine_turnover_type(self, data):
