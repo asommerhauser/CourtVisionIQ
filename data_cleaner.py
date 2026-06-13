@@ -24,9 +24,16 @@ class DataCleaner:
         self.home_players = []
         self.away_players = []
         self.first = True
+        # Monotonic, globally-unique game id (a single raw file may hold >1 game).
+        self.game_id = 0
+        # Last valid cumulative time seen, used to stamp the synthetic "end" event.
+        self.last_time = 0
 
         self.events = []
-        self.output_columns = ["roster1","roster2","time","event","player","type","result","season","playoff"]
+        self.output_columns = [
+            "game_id", "roster_home", "roster_away", "time", "event",
+            "player", "type", "result", "home/away", "season", "playoff",
+        ]
 
     def parse_file(self, csv_path):
         self.events = []
@@ -47,12 +54,18 @@ class DataCleaner:
         for _, row in df.iterrows():
             new_row = self.process_row(row)
             if new_row:
+                # Stamp game_id on any event that didn't set it explicitly.
+                # start/end events set it themselves (correct across a mid-file
+                # game transition); all other events use the current game_id.
+                for evt in new_row:
+                    evt.setdefault("game_id", self.game_id)
                 self.events.extend(new_row)
         
         self.events.append({
-            "teammates": self.home_players,
-            "opponents": self.away_players,
-            "time": 0,
+            "game_id": self.game_id,
+            "roster_home": self.home_players,
+            "roster_away": self.away_players,
+            "time": self.last_time,
             "event": "end",
             "player": "end",
             "type": "end",
@@ -224,9 +237,10 @@ class DataCleaner:
 
             if not self.first:
                 events.append({
-                    "teammates": self.home_players,
-                    "opponents": self.away_players,
-                    "time": 0,
+                    "game_id": self.game_id,
+                    "roster_home": self.home_players,
+                    "roster_away": self.away_players,
+                    "time": self.last_time,
                     "event": "end",
                     "player": "end",
                     "type": "end",
@@ -238,6 +252,9 @@ class DataCleaner:
             else:
                 self.first = False
 
+            # New game begins: bump the global id and reset per-game state.
+            self.game_id += 1
+            self.last_time = 0
             self.home_players = []
             self.away_players = []
 
@@ -246,8 +263,9 @@ class DataCleaner:
             start_away = [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]]
 
             events.append({
-                "teammates": [p for p in start_home if pd.notna(p)],
-                "opponents": [p for p in start_away if pd.notna(p)],
+                "game_id": self.game_id,
+                "roster_home": [p for p in start_home if pd.notna(p)],
+                "roster_away": [p for p in start_away if pd.notna(p)],
                 "time": 0,
                 "event": "start",
                 "player": "start",
@@ -274,6 +292,8 @@ class DataCleaner:
 
         # Common computed values
         time_val = self.convert_time(row["period"], row["elapsed"])
+        if time_val is not None:
+            self.last_time = time_val
         shot_type = ("3pt" if (pd.notna(row["type"]) and str(row["type"]).lower().startswith("3pt"))
                     else ("2pt" if pd.notna(row["type"]) else "null"))
 
@@ -283,8 +303,8 @@ class DataCleaner:
             assist_rosters = self.parse_rosters([row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]], [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]], row["assist"])
 
             events.append({
-                "teammates": assist_rosters[0],
-                "opponents": assist_rosters[1],
+                "roster_home":assist_rosters[0],
+                "roster_away":assist_rosters[1],
                 "time": time_val if time_val is not None else "null",
                 "event": "assist",
                 "player": row["assist"],
@@ -301,8 +321,8 @@ class DataCleaner:
         if row["event_type"] == "shot":
             # SHOT (coerce result to 'blocked' if a block occurred)
             events.append({
-                "teammates": rosters[0],
-                "opponents": rosters[1],
+                "roster_home":rosters[0],
+                "roster_away":rosters[1],
                 "time": time_val if time_val is not None else "null",
                 "event": "shot",
                 "player": row["player"] if pd.notna(row["player"]) else "null",
@@ -317,8 +337,8 @@ class DataCleaner:
                 block_rosters = self.parse_rosters([row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]], [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]], row["block"])
                 
                 events.append({
-                    "teammates": block_rosters[0],
-                    "opponents": block_rosters[1],
+                    "roster_home":block_rosters[0],
+                    "roster_away":block_rosters[1],
                     "time": time_val if time_val is not None else "null",
                     "event": "block",
                     "player": row["block"],                                    # blocker
@@ -332,8 +352,8 @@ class DataCleaner:
         # FREE THROW normalized under shot
         if row["event_type"] == "free throw":
             events.append({
-                "teammates": rosters[0],
-                "opponents": rosters[1],
+                "roster_home":rosters[0],
+                "roster_away":rosters[1],
                 "time": time_val if time_val is not None else "null",
                 "event": "shot",
                 "player": row["player"] if pd.notna(row["player"]) else "null",
@@ -361,8 +381,8 @@ class DataCleaner:
             cop = "cop" if rebound_type == "defensive" else "null"
 
             events.append({
-                "teammates": rosters[0],
-                "opponents": rosters[1],
+                "roster_home":rosters[0],
+                "roster_away":rosters[1],
                 "time": time_val if time_val is not None else "null",
                 "event": "rebound",
                 "player": row["player"] if pd.notna(row["player"]) else "null",
@@ -391,8 +411,8 @@ class DataCleaner:
                 # Steal perspective: same 'event' as old code (turnover),
                 # but result='steal' marks this as the steal event.
                 events.append({
-                    "teammates": steal_rosters[0],
-                    "opponents": steal_rosters[1],
+                    "roster_home":steal_rosters[0],
+                    "roster_away":steal_rosters[1],
                     "time": time_safe,
                     "event": "turnover",
                     "player": steal_player,
@@ -405,8 +425,8 @@ class DataCleaner:
 
                 # Turnover perspective: ballhandler commits a turnover via steal
                 events.append({
-                    "teammates": rosters[0],
-                    "opponents": rosters[1],
+                    "roster_home":rosters[0],
+                    "roster_away":rosters[1],
                     "time": time_safe,
                     "event": "turnover",
                     "player": turnover_player,
@@ -425,8 +445,8 @@ class DataCleaner:
                     return events  # skip this row completely
 
                 events.append({
-                    "teammates": rosters[0],
-                    "opponents": rosters[1],
+                    "roster_home":rosters[0],
+                    "roster_away":rosters[1],
                     "time": time_safe,
                     "event": "turnover",
                     "player": turnover_player,
@@ -445,8 +465,8 @@ class DataCleaner:
             foul_result = self.determine_foul_result(foul_type)
 
             events.append({
-                "teammates": rosters[0],
-                "opponents": rosters[1],
+                "roster_home":rosters[0],
+                "roster_away":rosters[1],
                 "time": time_safe,
                 "event": "foul",
                 "player": row["player"] if pd.notna(row["player"]) else "null",
@@ -467,8 +487,8 @@ class DataCleaner:
                 return events
 
             events.append({
-                "teammates": rosters[0],
-                "opponents": rosters[1],
+                "roster_home":rosters[0],
+                "roster_away":rosters[1],
                 "time": time_val if time_val is not None else "null",
                 "event": "substitution",
                 "player": entered,
