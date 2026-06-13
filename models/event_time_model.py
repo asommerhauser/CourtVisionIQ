@@ -1,167 +1,236 @@
-import tensorflow as tf
-import pandas as pd
-from keras import layers, models, Input
-from config import MAX_SEQUENCE_LENGTH
+import json
 from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from config import MAX_SEQUENCE_LENGTH, ROSTER_SIZE, NORM_STATS_PATH
 from encoder.encoder import Encoder
-from models.roster_set_encoder import RosterSetEncoder, RosterEncoderParams
+
+# Cleaned-data columns the model consumes.
+CATEGORICAL_FIELDS = ["event", "player", "type", "result", "season"]
+ROSTER_COLS = {"home_roster": "roster_home", "away_roster": "roster_away"}
+
 
 class EventTimeModel:
     """
-    The event time model - more to come.
+    Core Event/Time Transformer.
+
+    preprocess() turns cleaned, game-grouped CSV(s) into padded, normalized tensor
+    arrays (one game = one fixed-length sequence) plus the shared vocab "language"
+    and time-normalization stats. model() builds the causal transformer; train()
+    fits it. Encoding is standardized so every downstream model speaks the same
+    token language.
     """
 
     def __init__(self, encoder: Encoder,
-                 sequence_length = MAX_SEQUENCE_LENGTH, 
-                 model_dim = 256, 
-                 event_classes = 7,
-                 path="./data"):
-        
-        # Setting up hyper-parameters
-        # --- Model ---
+                 sequence_length=MAX_SEQUENCE_LENGTH,
+                 model_dim=256,
+                 event_classes=7,
+                 path="./data",
+                 processed_dir="./data/processed"):
+
         self.sequence_length = sequence_length
-        self.model_dimensions = model_dim
+        self.model_dim = model_dim
         self.event_classes = event_classes
-        
+        self.encoder = encoder
+
         self.data_dir = Path(path)
         if not self.data_dir.exists():
             raise FileNotFoundError(f"Data directory not found: {self.data_dir.resolve()}")
-        self.csv_files = list(self.data_dir.glob("*.csv"))
-        self.encoder = encoder
+        self.processed_dir = Path(processed_dir)
 
-    def preprocess(self):
+        self.roster_encoder = None
+        self.norm_stats = None
+
+    # =====================
+    # --- Data Loading  ---
+    # =====================
+
+    def _cleaned_csvs(self):
+        """Cleaned season files only (have game_id + roster columns)."""
+        out = []
+        for p in sorted(self.data_dir.glob("*.csv")):
+            try:
+                cols = pd.read_csv(p, nrows=0).columns
+            except Exception:
+                continue
+            if "game_id" in cols and "roster_home" in cols:
+                out.append(p)
+        return out
+
+    def _load_all(self) -> pd.DataFrame:
+        frames = []
+        offset = 0
+        for p in self._cleaned_csvs():
+            df = pd.read_csv(p)
+            # Keep game_id globally unique across files.
+            df["game_id"] = df["game_id"].astype(int) + offset
+            offset = int(df["game_id"].max()) + 1
+            frames.append(df)
+        if not frames:
+            raise FileNotFoundError(f"No cleaned CSVs found in {self.data_dir.resolve()}")
+        return pd.concat(frames, ignore_index=True)
+
+    # =====================
+    # --- Preprocessing ---
+    # =====================
+
+    def preprocess(self, rebuild_vocabs=True, test_frac=0.2, seed=42):
         """
-        Shape the cleaned data into a form that the model will use for training.
+        Build the model-ready tensor arrays and persist them, the vocabs, and the
+        time-normalization stats. Returns (train, test) dicts of numpy arrays.
         """
-        for csv_path in self.csv_files:
-            print(f"Processing {csv_path.name}")
-            df = pd.read_csv(csv_path)
+        df = self._load_all()
 
-            df["teammates"] = df["teammates"].apply(self.encoder.encode_roster)
-            df["opponents"] = df["opponents"].apply(self.encoder.encode_roster)
-            df["event"] = df["event"].apply(self.encoder.encode_event)
-            df["player"] = df["player"].apply(self.encoder.encode_player)
-            df["type"] = df["type"].apply(self.encoder.encode_type)
-            df["result"] = df["result"].apply(self.encoder.encode_result)
-            df["season"] = df["season"].apply(self.encoder.encode_season)
+        # 1) Build (or load) the shared vocab language, then FREEZE it so token IDs
+        #    are stable and unseen values map to UNK rather than mutating the space.
+        if rebuild_vocabs:
+            for col, src in ROSTER_COLS.items():
+                df[src].apply(self.encoder.encode_roster)
+            for field in CATEGORICAL_FIELDS:
+                df[field].apply(getattr(self.encoder, f"encode_{field}"))
+            self.encoder.save_all()
+        else:
+            self.encoder.load_all()
+        self.encoder.freeze_all()
 
-            df["teammates_cur"] = df["teammates"].shift(-1)
-            df["opponents_cur"] = df["opponents"].shift(-1)
-            df["event_output"]     = df["event"].shift(-1)
+        # 2) Encode every categorical column to ints and rosters to fixed-5 arrays.
+        enc = {f: df[f].apply(getattr(self.encoder, f"encode_{f}")).to_numpy() for f in CATEGORICAL_FIELDS}
+        rosters = {
+            name: np.stack(df[src].apply(self.encoder.encode_roster).to_numpy())
+            for name, src in ROSTER_COLS.items()
+        }  # each (N, 5)
+        time = df["time"].to_numpy(dtype=np.float64)
+        game_id = df["game_id"].to_numpy()
 
-            df["delta_time"] = df["time"] - df["time"].shift(1)
-            df["delta_time"] = df["delta_time"].fillna(0)
-
-            PAD_EVENT   = self.encoder.encode_event("PAD")
-            PAD_PLAYER  = self.encoder.encode_player("PAD")
-            PAD_TYPE    = self.encoder.encode_type("PAD")
-            PAD_RESULT  = self.encoder.encode_result("PAD")
-            PAD_SEASON  = self.encoder.encode_season("PAD")
-            PAD_ROSTER  = self.encoder.encode_roster([])  # empty roster = PAD
-
-            SEQ_LEN = self.sequence_length
-
-            rows = []
-            current_len = 0
-
-            for _, row in df.iterrows():
-                rows.append(row.to_dict())
-                current_len += 1
-
-                # END TOKEN HIT — PAD OUT TO SEQUENCE_LENGTH
-                if row["event"] == self.encoder.encode_event("end"):
-                    pad_needed = SEQ_LEN - current_len
-
-                    if pad_needed > 0:
-                        pad_block = pd.DataFrame({
-                            "teammates":        [PAD_ROSTER] * pad_needed,
-                            "opponents":        [PAD_ROSTER] * pad_needed,
-                            "event":            [PAD_EVENT] * pad_needed,
-                            "player":           [PAD_PLAYER] * pad_needed,
-                            "type":             [PAD_TYPE] * pad_needed,
-                            "result":           [PAD_RESULT] * pad_needed,
-                            "season":           [PAD_SEASON] * pad_needed,
-                            "teammates_cur":    [PAD_ROSTER] * pad_needed,
-                            "opponents_cur":    [PAD_ROSTER] * pad_needed,
-                            "event_output":     [PAD_EVENT] * pad_needed,
-                            "delta_time":       [0.0] * pad_needed,
-                            "time":             [row["time"]] * pad_needed,
-                        })
-                        rows.extend(pad_block.to_dict("records"))
-
-                    # reset counter for next game
-                    current_len = 0
-
-            df = pd.DataFrame(rows)
-            out_path = csv_path.with_name(csv_path.stem + "_padded.csv")
-            df.to_csv(out_path, index=False)
-            print(f"Saved padded file to {out_path}")
-            print(df)
-
-        # -- Roster Encoder ---
-        ROSTER = RosterEncoderParams(
-            roster_size=5,
-            num_players=self.encoder.player_vocab.next_token,
-            roster_dim=128,
-            num_sab_layers=2,
-            num_heads=4,
-            d_ff=256,
-            dropout=0.1,
+        # 3) Per-game delta_time (no cross-game leakage): first row of each game
+        #    gets delta 0; clip guards against any backwards time stamps.
+        delta = (
+            df.groupby("game_id")["time"].diff().fillna(0).clip(lower=0).to_numpy(dtype=np.float64)
         )
-        self.roster_encoder = RosterSetEncoder(ROSTER)
+
+        # 4) Split games into train/test BEFORE computing normalization stats.
+        unique_games = np.unique(game_id)
+        rng = np.random.default_rng(seed)
+        rng.shuffle(unique_games)
+        n_test = max(1, int(round(len(unique_games) * test_frac)))
+        test_games = set(unique_games[:n_test].tolist())
+        train_games = set(unique_games[n_test:].tolist())
+
+        train_mask = np.array([g in train_games for g in game_id])
+
+        # 5) Normalization stats from TRAIN ONLY. time_abs = time/max_time;
+        #    delta standardized. Persist so inference uses identical transforms.
+        max_time = float(time[train_mask].max()) or 1.0
+        train_delta = delta[train_mask]
+        delta_mean = float(train_delta.mean())
+        delta_std = float(train_delta.std()) or 1.0
+        self.norm_stats = {"max_time": max_time, "delta_mean": delta_mean, "delta_std": delta_std}
+
+        time_abs = (time / max_time).astype(np.float32)
+        delta_norm = ((delta - delta_mean) / delta_std).astype(np.float32)
+
+        # 6) Assemble per-game padded sequences for each split.
+        cols = {
+            **{f: enc[f] for f in CATEGORICAL_FIELDS},
+            "home_roster": rosters["home_roster"],
+            "away_roster": rosters["away_roster"],
+            "time_abs": time_abs,
+            "delta_time": delta_norm,
+        }
+        train = self._build_split(cols, game_id, train_games)
+        test = self._build_split(cols, game_id, test_games)
+
+        # 7) Persist.
+        self.processed_dir.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(self.processed_dir / "train.npz", **train)
+        np.savez_compressed(self.processed_dir / "test.npz", **test)
+        Path(NORM_STATS_PATH).parent.mkdir(parents=True, exist_ok=True)
+        Path(NORM_STATS_PATH).write_text(json.dumps(self.norm_stats, indent=2), encoding="utf-8")
+
+        print(f"Preprocessed {len(train_games)} train / {len(test_games)} test games "
+              f"-> {self.processed_dir} (SEQ={self.sequence_length})")
+        return train, test
+
+    def _build_split(self, cols, game_id, games) -> dict:
+        """
+        Pad/truncate each game to sequence_length and stack into batched arrays.
+
+        Produces inputs, shifted targets, and two masks:
+          - pad_mask:  1 for real timesteps (incl. the terminal 'end' row), else 0.
+                       Used to mask attention over padded timesteps.
+          - loss_mask: 1 for real timesteps that have a valid next-step target
+                       (i.e. not the last real row), else 0. Used as sample_weight.
+        """
+        SEQ = self.sequence_length
+        PAD_PLAYER = self.encoder.encode_player("PAD")
+        PAD_EVENT = self.encoder.encode_event("PAD")
+        PAD_TYPE = self.encoder.encode_type("PAD")
+        PAD_RESULT = self.encoder.encode_result("PAD")
+        PAD_SEASON = self.encoder.encode_season("PAD")
+        pad_scalar = {
+            "event": PAD_EVENT, "player": PAD_PLAYER, "type": PAD_TYPE,
+            "result": PAD_RESULT, "season": PAD_SEASON,
+        }
+
+        keys_1d = CATEGORICAL_FIELDS
+        keys_roster = ["home_roster", "away_roster"]
+        keys_cont = ["time_abs", "delta_time"]
+
+        batches = {k: [] for k in (*keys_1d, *keys_roster, *keys_cont,
+                                   "event_target", "time_target", "pad_mask", "loss_mask")}
+
+        game_ids_sorted = [g for g in np.unique(game_id) if g in games]
+        for g in game_ids_sorted:
+            idx = np.where(game_id == g)[0]
+            idx = idx[:SEQ]  # truncate overlong games
+            n = len(idx)
+
+            def pad1d(arr, pad_val, dtype):
+                buf = np.full((SEQ,), pad_val, dtype=dtype)
+                buf[:n] = arr[idx]
+                return buf
+
+            for k in keys_1d:
+                batches[k].append(pad1d(cols[k], pad_scalar[k], np.int32))
+
+            for k in keys_roster:
+                buf = np.full((SEQ, ROSTER_SIZE), PAD_PLAYER, dtype=np.int32)
+                buf[:n] = cols[k][idx]
+                batches[k].append(buf)
+
+            for k in keys_cont:
+                buf = np.zeros((SEQ, 1), dtype=np.float32)
+                buf[:n, 0] = cols[k][idx]
+                batches[k].append(buf)
+
+            # Targets: next-step shift within this game.
+            event_t = np.full((SEQ,), PAD_EVENT, dtype=np.int32)
+            time_t = np.zeros((SEQ, 1), dtype=np.float32)
+            if n > 1:
+                event_t[: n - 1] = cols["event"][idx][1:]
+                time_t[: n - 1, 0] = cols["delta_time"][idx][1:]
+            batches["event_target"].append(event_t)
+            batches["time_target"].append(time_t)
+
+            pad_mask = np.zeros((SEQ,), dtype=np.float32)
+            pad_mask[:n] = 1.0
+            loss_mask = np.zeros((SEQ,), dtype=np.float32)
+            loss_mask[: max(n - 1, 0)] = 1.0  # last real row has no next target
+            batches["pad_mask"].append(pad_mask)
+            batches["loss_mask"].append(loss_mask)
+
+        return {k: np.stack(v) if v else np.empty((0,)) for k, v in batches.items()}
+
+    # =====================
+    # --- Model / Train ---
+    # =====================
 
     def model(self):
-        """
-        Build the keras model.
-        """
+        """Built in Phase 3."""
+        raise NotImplementedError("EventTimeModel.model() not implemented yet")
 
-        # Inputs
-        sequence_input = Input(
-            shape=(self.max_seq_len, self.model_dim),
-            name="sequence_input"
-        )
-
-        teammates_roster_ids = Input(
-            shape=(self.sequence_length, self.ROSTER.roster_size),
-            dtype="int32",
-            name="opponents_roster_ids"
-        )
-
-        opponents_roster_ids = Input(
-            shape=(self.sequence_length, self.ROSTER.roster_size),
-            dtype="int32",
-            name="opponents_roster_ids"
-        )
-
-        # Roster Set Transforming
-        teammates_vec = layers.TimeDistributed(
-            self.roster_encoder,
-            name="teammates_roster_vec"
-        )(teammates_roster_ids)
-
-        opponents_vec = layers.TimeDistributed(
-            self.roster_encoder,
-            name="opponents_roster_vec"
-        )(opponents_roster_ids)
-
-        x = layers.Concatenate(name="concat_tokens_rosters")(
-            [sequence_input, teammates_vec, opponents_vec]
-        )
-
-        # Project to model_dim
-        x = layers.Dense(self.model_dim, activation="relu", name="fusion_projection")(x)
-
-        # Placeholder Transformer Encoder
-        x = layers.Dense(self.model_dim, activation="relu", name="token_mlp")(x)
-
-        # --- Output Heads ---
-        # Event head
-        event_logits = layers.Dense(self.num_event_classes, activation="softmax", name="event_logits")(x)
-
-        # Next-time regression head
-        time_delta = layers.Dense(1, activation="linear", name="time_delta")(x)
-
-        # Build model
-        model = models.Model(inputs=sequence_input, outputs=[event_logits, time_delta], name="EventTimeModel")
-
-        return model
+    def train(self):
+        """Built in Phase 4."""
+        raise NotImplementedError("EventTimeModel.train() not implemented yet")
