@@ -74,8 +74,8 @@ class DataCleaner:
         return base + (hh * 3600) + (mm * 60) + ss
 
     def home_indicator(self, home_roster, player):
-        """Return 1 if player is on the home team, else 0."""
-        return 1 if player in home_roster else 0
+        """Return 1 if player is on the home team, 2 if on away team."""
+        return 1 if player in home_roster else 2
 
     def determine_turnover_type(self, data):
         """
@@ -158,7 +158,7 @@ class DataCleaner:
             "result": "end",
             "home/away": 0,
             "season": self.season,
-            "playoff": self.playoff,
+            "playoff": 2 if self.playoff else 1,
         }
 
     def process_row(self, row):
@@ -198,7 +198,7 @@ class DataCleaner:
                 "result": "start",
                 "home/away": 0,
                 "season": self.season,
-                "playoff": self.playoff,
+                "playoff": 2 if self.playoff else 1,
             })
 
         # ---- CURRENT ON-COURT LINEUPS (NaN-free) ----
@@ -248,7 +248,7 @@ class DataCleaner:
                 "result": "score",
                 "home/away": assist_home,
                 "season": self.season,
-                "playoff": self.playoff,
+                "playoff": 2 if self.playoff else 1,
             })
 
         has_block = pd.notna(row.get("block")) and str(row.get("block")).strip()
@@ -265,7 +265,7 @@ class DataCleaner:
                 "result": "blocked" if has_block else (row["result"] if pd.notna(row["result"]) else "null"),
                 "home/away": home,
                 "season": self.season,
-                "playoff": self.playoff,
+                "playoff": 2 if self.playoff else 1,
             })
 
             if has_block:
@@ -281,7 +281,7 @@ class DataCleaner:
                     "result": "block",
                     "home/away": block_home,
                     "season": self.season,
-                    "playoff": self.playoff,
+                    "playoff": 2 if self.playoff else 1,
                 })
 
         # ---- FREE THROW (normalized under "shot") ----
@@ -296,7 +296,7 @@ class DataCleaner:
                 "result": row["result"] if pd.notna(row["result"]) else "null",
                 "home/away": home,
                 "season": self.season,
-                "playoff": self.playoff,
+                "playoff": 2 if self.playoff else 1,
             })
 
         # ---- REBOUND ----
@@ -319,7 +319,7 @@ class DataCleaner:
                 "result": "cop" if rebound_type == "defensive" else "null",
                 "home/away": home,
                 "season": self.season,
-                "playoff": self.playoff,
+                "playoff": 2 if self.playoff else 1,
             })
 
         # ---- TURNOVER ----
@@ -341,7 +341,7 @@ class DataCleaner:
                     "result": "steal",
                     "home/away": steal_home,
                     "season": self.season,
-                    "playoff": self.playoff,
+                    "playoff": 2 if self.playoff else 1,
                 })
                 events.append({
                     "roster_home": clean_home,
@@ -353,7 +353,7 @@ class DataCleaner:
                     "result": "cop",
                     "home/away": home,
                     "season": self.season,
-                    "playoff": self.playoff,
+                    "playoff": 2 if self.playoff else 1,
                 })
             else:
                 turnover_type = self.determine_turnover_type(row.get("type"))
@@ -369,7 +369,7 @@ class DataCleaner:
                     "result": "cop",
                     "home/away": home,
                     "season": self.season,
-                    "playoff": self.playoff,
+                    "playoff": 2 if self.playoff else 1,
                 })
 
         # ---- FOUL ----
@@ -386,7 +386,7 @@ class DataCleaner:
                 "result": foul_result,
                 "home/away": home,
                 "season": self.season,
-                "playoff": self.playoff,
+                "playoff": 2 if self.playoff else 1,
             })
 
         # ---- SUBSTITUTION ----
@@ -405,7 +405,7 @@ class DataCleaner:
                 "result": "substitution",
                 "home/away": home,
                 "season": self.season,
-                "playoff": self.playoff,
+                "playoff": 2 if self.playoff else 1,
             })
 
         return events
@@ -436,12 +436,12 @@ class DataCleaner:
     def run(self):
         """
         Loop through files in DATA_PATH, parse them, and append cleaned events
-        to ./Data/season<YYYY>.csv (one file per season).
+        to ./data/season<YYYY>.csv (one file per season).
         """
         files = sorted(os.listdir(self.DATA_PATH))
         files = files[self.start:self.end]
 
-        os.makedirs("./Data", exist_ok=True)
+        os.makedirs("./data", exist_ok=True)
 
         for fname in files:
             if not fname.endswith(".csv"):
@@ -462,7 +462,7 @@ class DataCleaner:
 
             _, cleaned_df = self.parse_file(fpath)
 
-            out_path = f"./Data/season{self.season}.csv"
+            out_path = f"./data/season{self.season}.csv"
             write_header = not os.path.exists(out_path)
             cleaned_df.to_csv(out_path, mode="a", header=write_header, index=False)
 
