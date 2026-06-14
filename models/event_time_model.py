@@ -3,9 +3,39 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import tensorflow as tf
+from tensorflow import keras
+from keras import layers, Input
 
 from config import MAX_SEQUENCE_LENGTH, ROSTER_SIZE, NORM_STATS_PATH
 from encoder.encoder import Encoder
+from models.roster_set_encoder import RosterSetEncoder, RosterEncoderParams
+
+# Per-field embedding dimensions (categoricals never enter the model as raw scalars).
+EMBED_DIMS = {"event": 32, "player": 128, "type": 32, "result": 16, "season": 16}
+ROSTER_DIM = 128
+
+
+class AddPositionalEmbedding(layers.Layer):
+    """Add a learned position embedding over [0, seq_len) to a (B, SEQ, D) tensor."""
+
+    def __init__(self, seq_len: int, d_model: int, **kwargs):
+        super().__init__(**kwargs)
+        self.seq_len = seq_len
+        self.d_model = d_model
+        self.pos = layers.Embedding(seq_len, d_model, name="pos_table")
+
+    def call(self, x):
+        positions = tf.range(self.seq_len)          # (SEQ,)
+        return x + self.pos(positions)              # broadcast over batch
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"seq_len": self.seq_len, "d_model": self.d_model})
+        return cfg
 
 # Cleaned-data columns the model consumes.
 CATEGORICAL_FIELDS = ["event", "player", "type", "result", "season"]
@@ -227,9 +257,113 @@ class EventTimeModel:
     # --- Model / Train ---
     # =====================
 
-    def model(self):
-        """Built in Phase 3."""
-        raise NotImplementedError("EventTimeModel.model() not implemented yet")
+    def build_roster_encoder(self) -> RosterSetEncoder:
+        num_players = self.encoder.player_vocab.next_token
+        params = RosterEncoderParams(
+            roster_size=ROSTER_SIZE,
+            num_players=num_players,
+            roster_dim=ROSTER_DIM,
+            num_sab_layers=2,
+            num_heads=4,
+            d_ff=256,
+            dropout=0.1,
+        )
+        return RosterSetEncoder(params)
+
+    def model(self, num_layers=4, num_heads=8, ff_dim=1024, dropout=0.1):
+        """
+        Build the causal Event/Time Transformer.
+
+        Inputs (per timestep, right-padded to sequence_length):
+          event/player/type/result/season ids, home_roster/away_roster (5 slots),
+          time_abs, delta_time, and pad_mask (1 real / 0 pad) for attention masking.
+
+        Outputs:
+          event  -> logits over the full event vocab (softmax via from_logits loss)
+          time   -> scalar next-step normalized delta_time (regression)
+        """
+        SEQ = self.sequence_length
+        D = self.model_dim
+        vocab = self.encoder.vocabs
+        event_vocab_size = self.encoder.event_vocab.next_token
+
+        # Shared roster set-encoder (weight-tied across home/away).
+        self.roster_encoder = self.build_roster_encoder()
+
+        # ---- Inputs ----
+        cat_inputs = {
+            f: Input(shape=(SEQ,), dtype="int32", name=f) for f in CATEGORICAL_FIELDS
+        }
+        home_roster = Input(shape=(SEQ, ROSTER_SIZE), dtype="int32", name="home_roster")
+        away_roster = Input(shape=(SEQ, ROSTER_SIZE), dtype="int32", name="away_roster")
+        time_abs = Input(shape=(SEQ, 1), dtype="float32", name="time_abs")
+        delta_time = Input(shape=(SEQ, 1), dtype="float32", name="delta_time")
+        pad_mask = Input(shape=(SEQ,), dtype="float32", name="pad_mask")
+
+        # ---- Per-field embeddings ----
+        embs = []
+        for f in CATEGORICAL_FIELDS:
+            v = vocab[f]
+            embs.append(
+                layers.Embedding(v.next_token, EMBED_DIMS[f], name=f"emb_{f}")(cat_inputs[f])
+            )
+
+        # ---- Roster encoding across the sequence ----
+        home_vec = layers.TimeDistributed(self.roster_encoder, name="home_roster_vec")(home_roster)
+        away_vec = layers.TimeDistributed(self.roster_encoder, name="away_roster_vec")(away_roster)
+
+        # ---- Continuous projections ----
+        t_abs = layers.Dense(16, name="time_abs_proj")(time_abs)
+        t_delta = layers.Dense(16, name="delta_time_proj")(delta_time)
+
+        # ---- Fusion ----
+        x = layers.Concatenate(axis=-1, name="fusion_concat")(
+            [*embs, home_vec, away_vec, t_abs, t_delta]
+        )
+        x = layers.Dense(D, name="fusion_projection")(x)
+        x = layers.LayerNormalization(epsilon=1e-6, name="fusion_ln")(x)
+
+        # ---- Positional encoding (learned) ----
+        x = AddPositionalEmbedding(SEQ, D, name="positional_embedding")(x)
+        x = layers.Dropout(dropout, name="emb_dropout")(x)
+
+        # ---- Attention mask: (B, 1, SEQ) boolean key-padding mask ----
+        attn_mask = layers.Lambda(
+            lambda m: tf.cast(m, "bool")[:, tf.newaxis, :],
+            name="attn_pad_mask",
+        )(pad_mask)
+
+        # ---- Causal transformer encoder ----
+        for i in range(num_layers):
+            h = layers.LayerNormalization(epsilon=1e-6, name=f"block{i}_ln1")(x)
+            attn = layers.MultiHeadAttention(
+                num_heads=num_heads, key_dim=D // num_heads, dropout=dropout,
+                name=f"block{i}_mha",
+            )(h, h, attention_mask=attn_mask, use_causal_mask=True)
+            x = layers.Add(name=f"block{i}_res1")([x, attn])
+
+            h = layers.LayerNormalization(epsilon=1e-6, name=f"block{i}_ln2")(x)
+            f1 = layers.Dense(ff_dim, activation="gelu", name=f"block{i}_ff1")(h)
+            f1 = layers.Dropout(dropout, name=f"block{i}_ffdrop")(f1)
+            f2 = layers.Dense(D, name=f"block{i}_ff2")(f1)
+            x = layers.Add(name=f"block{i}_res2")([x, f2])
+
+        x = layers.LayerNormalization(epsilon=1e-6, name="final_ln")(x)
+
+        # ---- Output heads (names must not collide with input field names) ----
+        event_logits = layers.Dense(event_vocab_size, name="event_output")(x)  # logits
+        time_delta = layers.Dense(1, activation="linear", name="time_output")(x)
+
+        inputs = {
+            **cat_inputs,
+            "home_roster": home_roster, "away_roster": away_roster,
+            "time_abs": time_abs, "delta_time": delta_time, "pad_mask": pad_mask,
+        }
+        return keras.Model(
+            inputs=inputs,
+            outputs={"event_output": event_logits, "time_output": time_delta},
+            name="EventTimeModel",
+        )
 
     def train(self):
         """Built in Phase 4."""
