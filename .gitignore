@@ -1,11 +1,20 @@
-# Ignore Data folder
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Claude Code
+.claude/
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Data folders
 /Data/
-
-# Ignore Play by Play Logs folder
 /PlayByPlayLogs/
-
-# Ignore Raw Data folder
 /RawData/
-
-# Ignore Play by Play Logs zip file
 /Play by Play Logs.zip
