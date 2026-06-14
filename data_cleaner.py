@@ -1,17 +1,18 @@
 import os
 import pandas as pd
 
+
 class DataCleaner:
     """
-    The DataCleaner class is responsible for converting the raw NBA play-by-play data 
-    into the format that the models will use to train and learn from.
+    Converts raw NBA play-by-play CSVs into the normalized event format consumed
+    by all downstream models.
 
     Parameters
     ----------
     start : int
-        Index to begin processing files from. Defaults to 0 (start at the beginning).
+        Index to begin processing files from. Defaults to 0.
     end : int
-        Index to stop processing files at. If None, goes through the end.
+        Index to stop processing files at. None means process all files.
     """
 
     DATA_PATH = "./RawData/MasterFiles"
@@ -21,12 +22,17 @@ class DataCleaner:
         self.end = end
         self.season = 0
         self.playoff = 0
+        # Per-game cumulative roster (used for end-of-game sentinel event).
         self.home_players = []
         self.away_players = []
+        # Last observed on-court 5-player lineups (NaN-free).
+        self.last_home_five = []
+        self.last_away_five = []
         self.first = True
-        # Monotonic, globally-unique game id (a single raw file may hold >1 game).
+        # Monotonic globally-unique game id (a single raw file may hold >1 game).
         self.game_id = 0
-        # Last valid cumulative time seen, used to stamp the synthetic "end" event.
+        # Last valid cumulative time, used to stamp synthetic "end" events and
+        # as a fallback when a row's time cannot be parsed.
         self.last_time = 0
 
         self.events = []
@@ -35,58 +41,19 @@ class DataCleaner:
             "player", "type", "result", "home/away", "season", "playoff",
         ]
 
-    def parse_file(self, csv_path):
-        self.events = []
+    # ------------------- HELPER METHODS -------------------
 
-        df = pd.read_csv(csv_path, low_memory=False, na_values=["", " "])
+    @staticmethod
+    def _clean_five(five):
+        """Return only the non-NaN entries from a raw h1..h5 / a1..a5 list."""
+        return [p for p in five if pd.notna(p)]
 
-        # normalize column names
-        df.rename(columns=lambda c: c.strip(), inplace=True)
-
-        drop_cols = [
-            "game_id", "away_score", "home_score", "remaining_time",
-            "play_length", "play_id", "team", "outof", "possession", "shot_distance",
-            "original_x", "original_y", "converted_x", "converted_y", "description"
-        ]
-
-        df = df.drop(columns=drop_cols, errors="ignore")
-
-        for _, row in df.iterrows():
-            new_row = self.process_row(row)
-            if new_row:
-                # Stamp game_id on any event that didn't set it explicitly.
-                # start/end events set it themselves (correct across a mid-file
-                # game transition); all other events use the current game_id.
-                for evt in new_row:
-                    evt.setdefault("game_id", self.game_id)
-                self.events.extend(new_row)
-        
-        self.events.append({
-            "game_id": self.game_id,
-            "roster_home": self.home_players,
-            "roster_away": self.away_players,
-            "time": self.last_time,
-            "event": "end",
-            "player": "end",
-            "type": "end",
-            "result": "end",
-            "home/away": 0,
-            "season": self.season,
-            "playoff": self.playoff
-        })
-
-        cleaned_df = pd.DataFrame(self.events)
-
-        return df, cleaned_df
-
-    # ----------------- HELPER FUNCTIONS -----------------
-    
     def convert_time(self, quarter, time_past):
         """
-        Compute cumulative game time in seconds since tipoff.
+        Cumulative game time in seconds since tipoff.
         NBA: Q1–Q4 = 12:00 each; OT periods = 5:00 each.
-        quarter: int-like (1,2,3,4,5=OT1,6=OT2,...)
-        time_past: "H:MM:SS" (hours usually 0)
+        quarter : int-like (1,2,3,4,5=OT1,6=OT2,…)
+        time_past: "H:MM:SS" or "MM:SS" elapsed within the period.
         """
         if pd.isna(quarter) or pd.isna(time_past):
             return None
@@ -95,7 +62,7 @@ class DataCleaner:
             parts = str(time_past).strip().split(":")
             if len(parts) == 3:
                 hh, mm, ss = map(int, parts)
-            elif len(parts) == 2:  # fallback, "MM:SS"
+            elif len(parts) == 2:
                 hh = 0
                 mm, ss = map(int, parts)
             else:
@@ -103,169 +70,127 @@ class DataCleaner:
         except Exception:
             return None
 
-        # Base seconds through the start of this period
-        if q > 4:
-            base = (48 * 60) + ((q - 5) * 5 * 60)
-        else:
-            base = (q - 1) * 12 * 60
-
-        # Add elapsed within the period
+        base = (48 * 60) + ((q - 5) * 5 * 60) if q > 4 else (q - 1) * 12 * 60
         return base + (hh * 3600) + (mm * 60) + ss
-    
+
     def home_indicator(self, home_roster, player):
-        """
-        Given the home roster list and a player name,
-        return 1 if the player is in the home roster,
-        else return 0.
-        """
+        """Return 1 if player is on the home team, else 0."""
         return 1 if player in home_roster else 0
-    
-    def parse_rosters(self, roster1, roster2, actor):
-        """
-        Given two rosters (roster1, roster2) and an actor (player name),
-        return (teammates, opponents) where the actor is removed from
-        their own roster and the rosters are returned as lists.
-        """
-        teammates = list(roster1)
-        opponents = list(roster2)
-        return teammates, opponents
 
     def determine_turnover_type(self, data):
         """
-        Map raw turnover 'type' text into a coarse turnover category.
-
-        Returns one of:
-        - 'violation'
-        - 'error'
-        - 'null'
-        - 'unrecognized'
+        Map raw turnover 'type' text to a coarse category.
+        Returns 'violation', 'error', 'null', or None (skip the event entirely).
         """
-        check_vio = [
-            '3-second violation', 'shot clock', '8-second violation', 'lane violation', 'offensive goaltending',
-            'palming', 'backcourt', '5-second violation', 'double dribble', 'discontinue dribble', 'illegal assist',
-            'jump ball violation', 'offensive foul', 'illegal screen', 'basket from below', 'punched ball',
-            'too many players', 'traveling', 'kicked ball'
-        ]
-        check_error = [
+        check_vio = {
+            '3-second violation', 'shot clock', '8-second violation', 'lane violation',
+            'offensive goaltending', 'palming', 'backcourt', '5-second violation',
+            'double dribble', 'discontinue dribble', 'illegal assist',
+            'jump ball violation', 'offensive foul', 'illegal screen',
+            'basket from below', 'punched ball', 'too many players', 'traveling',
+            'kicked ball',
+        }
+        check_error = {
             'lost ball', 'out of bounds lost ball', 'step out of bounds',
-            'bad pass', 'inbound'
-        ]
-
+            'bad pass', 'inbound',
+        }
         if pd.isna(data):
-            return 'null'  # keep missing data
+            return 'null'
         data = str(data).strip().lower()
-
-        if data == '' or data == 'null':
-            return 'null'  # still keep
-        elif data == 'no turnover':
-            return None  # skip this one completely
-        elif data in check_vio:
+        if data in ('', 'null'):
+            return 'null'
+        if data == 'no turnover':
+            return None
+        if data in check_vio:
             return 'violation'
-        elif data in check_error:
+        if data in check_error:
             return 'error'
-        else:
-            print("FLAG UNRECOGNIZED TURNOVER", data)
-            return None  # skip unrecognized junk
+        print(f"FLAG UNRECOGNIZED TURNOVER: {data}")
+        return None
 
     def determine_foul_type(self, data):
         """
         Normalize raw foul 'type' text.
-
-        - 'offensive charge' -> 'offensive'
-        - '' / NaN -> 'null'
-        - anything ending with 'technical' -> 'technical'
-        - otherwise return original text
+        'offensive charge' → 'offensive'; anything ending in 'technical' → 'technical'.
         """
         if pd.isna(data):
             return "null"
-
         data_str = str(data).strip()
-        if data_str == "":
+        if not data_str:
             return "null"
-
-        # match original behavior
         if data_str == "offensive charge":
             return "offensive"
         if data_str[-9:].lower() == "technical":
             return "technical"
-
         return data_str
 
     def determine_foul_result(self, foul_type):
-        """
-        Map foul type to result category.
+        """Map foul type to a result token."""
+        mapping = {
+            "personal": "nothing",
+            "null": "nothing",
+            "away from play": "nothing",
+            "shooting": "free throw",
+            "technical": "free throw",
+            "personal take": "free throw op",
+            "flagrant-1": "free throw op",
+            "transition take": "free throw op",
+            "offensive": "cop",
+            "loose ball": "op",
+            "flagrant-2": "ejection",
+        }
+        if foul_type not in mapping:
+            raise ValueError(f"Unknown foul type: {foul_type!r}")
+        return mapping[foul_type]
 
-        Matches old behavior:
-        - 'personal' / 'null' / 'away from play' -> 'nothing'
-        - 'shooting' / 'technical' -> 'free throw'
-        - 'personal take' / 'flagrant-1' / 'transition take' -> 'free throw op'
-        - 'offensive' -> 'cop'
-        - 'loose ball' -> 'op'
-        - 'flagrant-2' -> 'ejection'
-        """
-        if foul_type in ("personal", "null", "away from play"):
-            return "nothing"
-        elif foul_type in ("shooting", "technical"):
-            return "free throw"
-        elif foul_type in ("personal take", "flagrant-1", "transition take"):
-            return "free throw op"
-        elif foul_type == "offensive":
-            return "cop"
-        elif foul_type == "loose ball":
-            return "op"
-        elif foul_type == "flagrant-2":
-            return "ejection"
-        else:
-            # keep the old "loud fail" behavior so we notice new types
-            raise ValueError(f"Unknown foul type: {foul_type}")
+    # -------------------------------------------------------
 
+    def _end_event(self):
+        """Build the synthetic end-of-game sentinel event."""
+        return {
+            "game_id": self.game_id,
+            "roster_home": self.last_home_five,
+            "roster_away": self.last_away_five,
+            "time": self.last_time,
+            "event": "end",
+            "player": "end",
+            "type": "end",
+            "result": "end",
+            "home/away": 0,
+            "season": self.season,
+            "playoff": self.playoff,
+        }
 
-    # -----------------------------------------------------
-    
     def process_row(self, row):
         """
-        Takes in a dataframe row and returns a list of one or more
-        normalized event dictionaries.
+        Convert one raw CSV row into a list of 0-or-more normalized event dicts.
         """
         events = []
 
+        # ---- GAME BOUNDARY ----
         if row['event_type'] == "start of period" and row['period'] == 1:
-            if str(row["data_set"])[-1] == "n":
-                self.playoff = 0
-            else:
-                self.playoff = 1
+            self.playoff = 0 if str(row["data_set"])[-1] == "n" else 1
 
             if not self.first:
-                events.append({
-                    "game_id": self.game_id,
-                    "roster_home": self.home_players,
-                    "roster_away": self.away_players,
-                    "time": self.last_time,
-                    "event": "end",
-                    "player": "end",
-                    "type": "end",
-                    "result": "end",
-                    "home/away": 0,
-                    "season": self.season,
-                    "playoff": self.playoff
-                })
+                events.append(self._end_event())
             else:
                 self.first = False
 
-            # New game begins: bump the global id and reset per-game state.
             self.game_id += 1
             self.last_time = 0
             self.home_players = []
             self.away_players = []
-
-            # START EVENT
-            start_home = [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]]
-            start_away = [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]]
+            self.last_home_five = self._clean_five(
+                [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]]
+            )
+            self.last_away_five = self._clean_five(
+                [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]]
+            )
 
             events.append({
                 "game_id": self.game_id,
-                "roster_home": [p for p in start_home if pd.notna(p)],
-                "roster_away": [p for p in start_away if pd.notna(p)],
+                "roster_home": self.last_home_five,
+                "roster_away": self.last_away_five,
                 "time": 0,
                 "event": "start",
                 "player": "start",
@@ -273,200 +198,187 @@ class DataCleaner:
                 "result": "start",
                 "home/away": 0,
                 "season": self.season,
-                "playoff": self.playoff
+                "playoff": self.playoff,
             })
 
+        # ---- CURRENT ON-COURT LINEUPS (NaN-free) ----
         home_five = [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]]
         away_five = [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]]
+        clean_home = self._clean_five(home_five)
+        clean_away = self._clean_five(away_five)
 
-        for p in home_five:
-            if pd.notna(p) and p not in self.home_players:
+        # Keep last-known lineups up to date so the end event is accurate.
+        if clean_home:
+            self.last_home_five = clean_home
+        if clean_away:
+            self.last_away_five = clean_away
+
+        # Track every player who appeared on each side (for historical reference).
+        for p in clean_home:
+            if p not in self.home_players:
                 self.home_players.append(p)
-        for p in away_five:
-            if pd.notna(p) and p not in self.away_players:
+        for p in clean_away:
+            if p not in self.away_players:
                 self.away_players.append(p)
 
-        rosters = self.parse_rosters(home_five, away_five, row["player"])
+        home = self.home_indicator(clean_home, row["player"])
 
-        home = self.home_indicator(home_five, row["player"])
-
-        # Common computed values
+        # Resolve time; fall back to last known time if the row is unparseable.
         time_val = self.convert_time(row["period"], row["elapsed"])
         if time_val is not None:
             self.last_time = time_val
-        shot_type = ("3pt" if (pd.notna(row["type"]) and str(row["type"]).lower().startswith("3pt"))
-                    else ("2pt" if pd.notna(row["type"]) else "null"))
+        time_safe = time_val if time_val is not None else self.last_time
 
-        # ASSIST (only when present; implies made basket)
-        if pd.notna(row["assist"]) and str(row["assist"]).strip() != "":
-            # Parse rosters for the assist action
-            assist_rosters = self.parse_rosters([row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]], [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]], row["assist"])
+        shot_type = (
+            "3pt" if (pd.notna(row["type"]) and str(row["type"]).lower().startswith("3pt"))
+            else ("2pt" if pd.notna(row["type"]) else "null")
+        )
 
+        # ---- ASSIST ----
+        if pd.notna(row["assist"]) and str(row["assist"]).strip():
+            assist_player = str(row["assist"]).strip()
+            assist_home = self.home_indicator(clean_home, assist_player)
             events.append({
-                "roster_home":assist_rosters[0],
-                "roster_away":assist_rosters[1],
-                "time": time_val if time_val is not None else "null",
+                "roster_home": clean_home,
+                "roster_away": clean_away,
+                "time": time_safe,
                 "event": "assist",
-                "player": row["assist"],
-                "type": shot_type,      # 2pt/3pt
+                "player": assist_player,
+                "type": shot_type,
                 "result": "score",
-                "home/away": home,
+                "home/away": assist_home,
                 "season": self.season,
-                "playoff": self.playoff
+                "playoff": self.playoff,
             })
 
-        # BLOCK (when present; paired with a shot that becomes 'blocked')
-        has_block = pd.notna(row.get("block")) and str(row.get("block")).strip() != ""
+        has_block = pd.notna(row.get("block")) and str(row.get("block")).strip()
 
+        # ---- SHOT ----
         if row["event_type"] == "shot":
-            # SHOT (coerce result to 'blocked' if a block occurred)
             events.append({
-                "roster_home":rosters[0],
-                "roster_away":rosters[1],
-                "time": time_val if time_val is not None else "null",
+                "roster_home": clean_home,
+                "roster_away": clean_away,
+                "time": time_safe,
                 "event": "shot",
                 "player": row["player"] if pd.notna(row["player"]) else "null",
-                "type": shot_type,  # 2pt/3pt
-                "result": ("blocked" if has_block else (row["result"] if pd.notna(row["result"]) else "null")),
+                "type": shot_type,
+                "result": "blocked" if has_block else (row["result"] if pd.notna(row["result"]) else "null"),
                 "home/away": home,
                 "season": self.season,
-                "playoff": self.playoff
+                "playoff": self.playoff,
             })
 
             if has_block:
-                block_rosters = self.parse_rosters([row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]], [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]], row["block"])
-                
+                blocker = str(row["block"]).strip()
+                block_home = self.home_indicator(clean_home, blocker)
                 events.append({
-                    "roster_home":block_rosters[0],
-                    "roster_away":block_rosters[1],
-                    "time": time_val if time_val is not None else "null",
+                    "roster_home": clean_home,
+                    "roster_away": clean_away,
+                    "time": time_safe,
                     "event": "block",
-                    "player": row["block"],                                    # blocker
-                    "type": (row["player"] if pd.notna(row["player"]) else "null"),  # victim (shooter), per old file
+                    "player": blocker,
+                    "type": row["player"] if pd.notna(row["player"]) else "null",
                     "result": "block",
-                    "home/away": (0 if home == 1 else 1),
+                    "home/away": block_home,
                     "season": self.season,
-                    "playoff": self.playoff
+                    "playoff": self.playoff,
                 })
 
-        # FREE THROW normalized under shot
+        # ---- FREE THROW (normalized under "shot") ----
         if row["event_type"] == "free throw":
             events.append({
-                "roster_home":rosters[0],
-                "roster_away":rosters[1],
-                "time": time_val if time_val is not None else "null",
+                "roster_home": clean_home,
+                "roster_away": clean_away,
+                "time": time_safe,
                 "event": "shot",
                 "player": row["player"] if pd.notna(row["player"]) else "null",
                 "type": "free throw",
                 "result": row["result"] if pd.notna(row["result"]) else "null",
                 "home/away": home,
                 "season": self.season,
-                "playoff": self.playoff
+                "playoff": self.playoff,
             })
 
-        # REBOUND
+        # ---- REBOUND ----
         if row["event_type"] == "rebound":
-            # skip pure team rebounds
             if row["type"] == "team rebound":
                 return events
 
-            # rebound type: offensive/defensive/etc.
             rebound_type = (
                 "defensive" if row["type"] == "rebound defensive"
                 else "offensive" if row["type"] == "rebound offensive"
                 else "null"
             )
-
-            # 'cop' only for defensive boards
-            cop = "cop" if rebound_type == "defensive" else "null"
-
             events.append({
-                "roster_home":rosters[0],
-                "roster_away":rosters[1],
-                "time": time_val if time_val is not None else "null",
+                "roster_home": clean_home,
+                "roster_away": clean_away,
+                "time": time_safe,
                 "event": "rebound",
                 "player": row["player"] if pd.notna(row["player"]) else "null",
                 "type": rebound_type,
-                "result": cop,
+                "result": "cop" if rebound_type == "defensive" else "null",
                 "home/away": home,
                 "season": self.season,
-                "playoff": self.playoff
+                "playoff": self.playoff,
             })
 
-        # TURNOVER
+        # ---- TURNOVER ----
         if row["event_type"] == "turnover":
-            time_safe = time_val if time_val is not None else "null"
-
             turnover_player = row["player"] if pd.notna(row["player"]) else "null"
             steal_player = row.get("steal")
-            has_steal = pd.notna(steal_player) and str(steal_player).strip() != ""
+            has_steal = pd.notna(steal_player) and str(steal_player).strip()
 
-            # If a steal is credited, create a steal-side event
             if has_steal:
                 steal_player = str(steal_player).strip()
-
-                steal_rosters = self.parse_rosters(home_five, away_five, steal_player)
-                steal_home = self.home_indicator(home_five, steal_player)
-
-                # Steal perspective: same 'event' as old code (turnover),
-                # but result='steal' marks this as the steal event.
+                steal_home = self.home_indicator(clean_home, steal_player)
                 events.append({
-                    "roster_home":steal_rosters[0],
-                    "roster_away":steal_rosters[1],
+                    "roster_home": clean_home,
+                    "roster_away": clean_away,
                     "time": time_safe,
                     "event": "turnover",
                     "player": steal_player,
-                    "type": "steal",      # keep simple; detailed cause not needed here
-                    "result": "steal",    # steal marker
+                    "type": "steal",
+                    "result": "steal",
                     "home/away": steal_home,
                     "season": self.season,
-                    "playoff": self.playoff
+                    "playoff": self.playoff,
                 })
-
-                # Turnover perspective: ballhandler commits a turnover via steal
                 events.append({
-                    "roster_home":rosters[0],
-                    "roster_away":rosters[1],
+                    "roster_home": clean_home,
+                    "roster_away": clean_away,
                     "time": time_safe,
                     "event": "turnover",
                     "player": turnover_player,
-                    "type": "steal",      # turnover caused by a steal
-                    "result": "cop",      # change of possession
-                    "home/away": home,
-                    "season": self.season,
-                    "playoff": self.playoff
-                })
-
-            else:
-                # No steal recorded -> classify as violation/error/etc
-                turnover_type = self.determine_turnover_type(row.get("type"))
-
-                if turnover_type is None:
-                    return events  # skip this row completely
-
-                events.append({
-                    "roster_home":rosters[0],
-                    "roster_away":rosters[1],
-                    "time": time_safe,
-                    "event": "turnover",
-                    "player": turnover_player,
-                    "type": turnover_type,  # 'violation', 'error', or 'null'
+                    "type": "steal",
                     "result": "cop",
                     "home/away": home,
                     "season": self.season,
-                    "playoff": self.playoff
+                    "playoff": self.playoff,
+                })
+            else:
+                turnover_type = self.determine_turnover_type(row.get("type"))
+                if turnover_type is None:
+                    return events
+                events.append({
+                    "roster_home": clean_home,
+                    "roster_away": clean_away,
+                    "time": time_safe,
+                    "event": "turnover",
+                    "player": turnover_player,
+                    "type": turnover_type,
+                    "result": "cop",
+                    "home/away": home,
+                    "season": self.season,
+                    "playoff": self.playoff,
                 })
 
-        # FOUL
+        # ---- FOUL ----
         if row["event_type"] == "foul":
-            time_safe = time_val if time_val is not None else "null"
-
             foul_type = self.determine_foul_type(row.get("type"))
             foul_result = self.determine_foul_result(foul_type)
-
             events.append({
-                "roster_home":rosters[0],
-                "roster_away":rosters[1],
+                "roster_home": clean_home,
+                "roster_away": clean_away,
                 "time": time_safe,
                 "event": "foul",
                 "player": row["player"] if pd.notna(row["player"]) else "null",
@@ -474,37 +386,57 @@ class DataCleaner:
                 "result": foul_result,
                 "home/away": home,
                 "season": self.season,
-                "playoff": self.playoff
+                "playoff": self.playoff,
             })
 
-        # SUBSTITUTION
+        # ---- SUBSTITUTION ----
         if row["event_type"] == "substitution":
             entered = row["entered"]
             left = row["left"]
-
-            # if both missing, skip
             if pd.isna(entered) and pd.isna(left):
                 return events
-
             events.append({
-                "roster_home":rosters[0],
-                "roster_away":rosters[1],
-                "time": time_val if time_val is not None else "null",
+                "roster_home": clean_home,
+                "roster_away": clean_away,
+                "time": time_safe,
                 "event": "substitution",
-                "player": entered,
-                "type": left,
+                "player": entered if pd.notna(entered) else "null",
+                "type": left if pd.notna(left) else "null",
                 "result": "substitution",
                 "home/away": home,
                 "season": self.season,
-                "playoff": self.playoff
+                "playoff": self.playoff,
             })
 
         return events
 
+    def parse_file(self, csv_path):
+        self.events = []
+
+        df = pd.read_csv(csv_path, low_memory=False, na_values=["", " "])
+        df.rename(columns=lambda c: c.strip(), inplace=True)
+        df = df.drop(columns=[
+            "game_id", "away_score", "home_score", "remaining_time",
+            "play_length", "play_id", "team", "outof", "possession", "shot_distance",
+            "original_x", "original_y", "converted_x", "converted_y", "description",
+        ], errors="ignore")
+
+        for _, row in df.iterrows():
+            new_row = self.process_row(row)
+            if new_row:
+                for evt in new_row:
+                    evt.setdefault("game_id", self.game_id)
+                self.events.extend(new_row)
+
+        # Synthetic end event for the last game in this file.
+        self.events.append(self._end_event())
+
+        return df, pd.DataFrame(self.events)
+
     def run(self):
         """
         Loop through files in DATA_PATH, parse them, and append cleaned events
-        into ./Data/season<season>.csv (one file per season).
+        to ./Data/season<YYYY>.csv (one file per season).
         """
         files = sorted(os.listdir(self.DATA_PATH))
         files = files[self.start:self.end]
@@ -515,42 +447,25 @@ class DataCleaner:
             if not fname.endswith(".csv"):
                 continue
 
-            # establish path to the raw file
             fpath = os.path.join(self.DATA_PATH, fname)
 
-            # reset per-file state
+            # Reset per-file state (game_id persists for global uniqueness).
             self.first = True
             self.home_players = []
             self.away_players = []
+            self.last_home_five = []
+            self.last_away_five = []
 
-            # peek first row to get season
             temp_df = pd.read_csv(fpath, nrows=1)
             dataset_val = str(temp_df.iloc[0]["data_set"])
             self.season = int(dataset_val[:4]) + 1
 
-            # parse the file -> cleaned_df for THIS game only
             _, cleaned_df = self.parse_file(fpath)
 
-            # output path: one CSV per season
             out_path = f"./Data/season{self.season}.csv"
-
-            # append if file exists, otherwise write with header
             write_header = not os.path.exists(out_path)
-            cleaned_df.to_csv(
-                out_path,
-                mode="a",
-                header=write_header,
-                index=False
-            )
-
-            # # optional debug
-            # cols = ["teammates", "opponents", "event", "player", "type"]
-            # print(f"Appended {len(cleaned_df)} rows to {out_path} from {fname}")
-            # print(cleaned_df[cols].head(5))
-            # print(cleaned_df[cols].tail(5))
-            
+            cleaned_df.to_csv(out_path, mode="a", header=write_header, index=False)
 
 
 if __name__ == "__main__":
-    cleaner = DataCleaner()
-    cleaner.run()
+    DataCleaner().run()
