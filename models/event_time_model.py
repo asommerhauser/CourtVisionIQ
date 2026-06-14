@@ -351,8 +351,9 @@ class EventTimeModel:
         x = layers.LayerNormalization(epsilon=1e-6, name="final_ln")(x)
 
         # ---- Output heads (names must not collide with input field names) ----
-        event_logits = layers.Dense(event_vocab_size, name="event_output")(x)  # logits
-        time_delta = layers.Dense(1, activation="linear", name="time_output")(x)
+        # dtype float32 keeps logits/regression stable under mixed_float16.
+        event_logits = layers.Dense(event_vocab_size, dtype="float32", name="event_output")(x)
+        time_delta = layers.Dense(1, activation="linear", dtype="float32", name="time_output")(x)
 
         inputs = {
             **cat_inputs,
@@ -399,15 +400,43 @@ class EventTimeModel:
             ds = ds.shuffle(buffer_size=min(len(mask), 1024), reshuffle_each_iteration=True)
         return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
+    @staticmethod
+    def configure_gpu(mixed_precision: bool = True):
+        """
+        Place training on CUDA when a GPU is visible. Enables per-GPU memory
+        growth (so TF doesn't grab all VRAM up front) and, on GPU, the
+        mixed_float16 policy (Tensor Cores -> faster training, less VRAM).
+
+        Returns the list of visible GPUs (empty on a CPU-only build, e.g. native
+        Windows TF >= 2.11, where the 4070 is invisible and training falls back
+        to CPU). Output heads are forced to float32 so from_logits softmax stays
+        numerically stable under mixed precision.
+        """
+        gpus = tf.config.list_physical_devices("GPU")
+        for gpu in gpus:
+            try:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            except Exception:
+                pass
+        if gpus and mixed_precision:
+            keras.mixed_precision.set_global_policy("mixed_float16")
+        return gpus
+
     def train(self, epochs=50, batch_size=64, lr=3e-4, time_loss_weight=0.25,
-              patience=6, save_dir="./artifacts/event_time"):
+              patience=6, save_dir="./artifacts/event_time",
+              mixed_precision=True, jit_compile=False):
         """
         Fit the Event/Time model on the preprocessed train split, validating on
         test. Multi-task masked loss: SparseCCE(from_logits) on the event head +
         MAE on the time head, with loss_mask as sample_weight so PAD/no-next
         steps contribute zero loss. Saves the trained model alongside the vocabs
         and norm stats (the full reusable artifact).
+
+        Runs on CUDA automatically when a GPU is visible (see configure_gpu);
+        otherwise falls back to CPU.
         """
+        gpus = self.configure_gpu(mixed_precision=mixed_precision)
+        print(f"Training on {'GPU x' + str(len(gpus)) if gpus else 'CPU (no visible GPU)'}")
         # Ensure the shared language is loaded + frozen (no-op if preprocess() just
         # ran in this session) so embedding sizes match the saved token IDs.
         if not self.encoder.player_vocab.frozen:
@@ -437,6 +466,7 @@ class EventTimeModel:
                 "event_output": [keras.metrics.SparseCategoricalAccuracy(name="acc")],
                 "time_output": [keras.metrics.MeanAbsoluteError(name="mae")],
             },
+            jit_compile=jit_compile,
         )
 
         callbacks = [
