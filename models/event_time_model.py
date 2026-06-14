@@ -365,6 +365,101 @@ class EventTimeModel:
             name="EventTimeModel",
         )
 
-    def train(self):
-        """Built in Phase 4."""
-        raise NotImplementedError("EventTimeModel.train() not implemented yet")
+    # =====================
+    # --- Training      ---
+    # =====================
+
+    INPUT_KEYS = (
+        "event", "player", "type", "result", "season",
+        "home_roster", "away_roster", "time_abs", "delta_time", "pad_mask",
+    )
+
+    def _load_processed(self, name: str) -> dict:
+        path = self.processed_dir / name
+        if not path.exists():
+            raise FileNotFoundError(
+                f"{path} not found; run preprocess() before train()."
+            )
+        with np.load(path) as data:
+            return {k: data[k] for k in data.files}
+
+    def _make_dataset(self, split: dict, batch_size: int, shuffle: bool) -> tf.data.Dataset:
+        """Yield (inputs, targets, sample_weights) with PAD steps zero-weighted."""
+        inputs = {k: split[k] for k in self.INPUT_KEYS}
+        targets = {
+            "event_output": split["event_target"],
+            "time_output": split["time_target"],
+        }
+        # loss_mask zeroes the loss on PAD steps and on the final (no-next) step.
+        mask = split["loss_mask"]
+        sample_weights = {"event_output": mask, "time_output": mask}
+
+        ds = tf.data.Dataset.from_tensor_slices((inputs, targets, sample_weights))
+        if shuffle:
+            ds = ds.shuffle(buffer_size=min(len(mask), 1024), reshuffle_each_iteration=True)
+        return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    def train(self, epochs=50, batch_size=64, lr=3e-4, time_loss_weight=0.25,
+              patience=6, save_dir="./artifacts/event_time"):
+        """
+        Fit the Event/Time model on the preprocessed train split, validating on
+        test. Multi-task masked loss: SparseCCE(from_logits) on the event head +
+        MAE on the time head, with loss_mask as sample_weight so PAD/no-next
+        steps contribute zero loss. Saves the trained model alongside the vocabs
+        and norm stats (the full reusable artifact).
+        """
+        # Ensure the shared language is loaded + frozen (no-op if preprocess() just
+        # ran in this session) so embedding sizes match the saved token IDs.
+        if not self.encoder.player_vocab.frozen:
+            self.encoder.load_all()
+            self.encoder.freeze_all()
+        if self.norm_stats is None and Path(NORM_STATS_PATH).exists():
+            self.norm_stats = json.loads(Path(NORM_STATS_PATH).read_text(encoding="utf-8"))
+
+        train_split = self._load_processed("train.npz")
+        test_split = self._load_processed("test.npz")
+
+        train_ds = self._make_dataset(train_split, batch_size, shuffle=True)
+        val_ds = self._make_dataset(test_split, batch_size, shuffle=False)
+
+        model = self.model()
+        optimizer = keras.optimizers.AdamW(
+            learning_rate=lr, weight_decay=1e-4, clipnorm=1.0,
+        )
+        model.compile(
+            optimizer=optimizer,
+            loss={
+                "event_output": keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+                "time_output": keras.losses.MeanAbsoluteError(),
+            },
+            loss_weights={"event_output": 1.0, "time_output": time_loss_weight},
+            metrics={
+                "event_output": [keras.metrics.SparseCategoricalAccuracy(name="acc")],
+                "time_output": [keras.metrics.MeanAbsoluteError(name="mae")],
+            },
+        )
+
+        callbacks = [
+            keras.callbacks.ReduceLROnPlateau(
+                monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6,
+            ),
+            keras.callbacks.EarlyStopping(
+                monitor="val_loss", patience=patience, restore_best_weights=True,
+            ),
+        ]
+
+        history = model.fit(
+            train_ds, validation_data=val_ds, epochs=epochs, callbacks=callbacks,
+        )
+
+        # Persist the full reusable artifact: weights + vocabs + norm stats.
+        save_path = Path(save_dir)
+        save_path.mkdir(parents=True, exist_ok=True)
+        model.save(save_path / "event_time_model.keras")
+        self.encoder.save_all()
+        if self.norm_stats is not None:
+            (save_path / "norm_stats.json").write_text(
+                json.dumps(self.norm_stats, indent=2), encoding="utf-8"
+            )
+        print(f"Saved trained model + vocabs + norm stats -> {save_path.resolve()}")
+        return model, history

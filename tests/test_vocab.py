@@ -85,6 +85,39 @@ def test_load_requires_existing_file(tmp_path):
         v.load(missing)
 
 
+def test_freeze_maps_unseen_to_unk():
+    v = Vocab(["PAD", "UNK"])
+    a = v.encode("A")
+    v.freeze()
+    assert v.encode("NEVER_SEEN") == v.encode("UNK")
+    assert v.encode("A") == a  # known values still resolve
+    assert "NEVER_SEEN" not in v.string_to_token  # frozen vocab does not grow
+
+
+def test_freeze_without_unk_raises():
+    v = Vocab(["PAD"])
+    with pytest.raises(ValueError):
+        v.freeze()
+
+
+def test_frozen_flag_persists_through_save_load(tmp_path):
+    path = tmp_path / "vocab.json"
+    v1 = Vocab(["PAD", "UNK"], path=path)
+    v1.encode("A")
+    v1.freeze()
+    v1.save()
+
+    v2 = Vocab(["PAD", "UNK"], path=path)
+    assert v2.frozen is True
+    assert v2.encode("NEW") == v2.encode("UNK")  # stays frozen after load
+
+
+def test_encode_coerces_non_string_values():
+    v = Vocab(["PAD"])
+    t = v.encode(2003)
+    assert v.encode("2003") == t  # int and its str form share one token
+
+
 def test_save_writes_expected_json_shape(tmp_path):
     path = tmp_path / "vocab.json"
 
