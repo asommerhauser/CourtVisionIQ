@@ -23,6 +23,8 @@ def main():
                         help="First raw-file index to clean (with --clean).")
     parser.add_argument("--clean-end", type=int, default=None,
                         help="Last raw-file index to clean (with --clean).")
+    parser.add_argument("--raw-dir", default=None,
+                        help="Directory of raw master files to clean (default: ./RawData/MasterFiles).")
     parser.add_argument("--data-dir", default="./data",
                         help="Directory of cleaned season CSVs.")
     parser.add_argument("--train", action="store_true",
@@ -41,22 +43,28 @@ def main():
 
     # 1) Clean raw data into season CSVs (optional; expensive).
     if args.clean:
-        DataCleaner(start=args.clean_start, end=args.clean_end).run()
+        DataCleaner(
+            start=args.clean_start, end=args.clean_end, data_path=args.raw_dir,
+        ).run()
 
-    # 2) Build the shared encoding "language" + model-ready tensors (skip with --skip-preprocess).
+    # Independent stages: clean / preprocess / train can each run on their own.
+    # train() loads vocabs + processed tensors from disk, so --skip-preprocess
+    # --train trains on already-preprocessed data without redoing preprocessing.
+    encoder = Encoder()
+    model = EventTimeModel(encoder, path=args.data_dir)
+
+    # 2) Build the shared encoding "language" + model-ready tensors.
     if not args.skip_preprocess:
-        encoder = Encoder()
-        model = EventTimeModel(encoder, path=args.data_dir)
         model.preprocess(rebuild_vocabs=args.rebuild_vocabs)
 
-        # 3) Train the Event/Time transformer (if --train flag is provided).
-        if args.train:
-            model.train(
-                epochs=args.epochs,
-                batch_size=args.batch_size,
-                report=not args.no_report,
-                run_name=args.run_name,
-            )
+    # 3) Train the Event/Time transformer (if --train flag is provided).
+    if args.train:
+        model.train(
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            report=not args.no_report,
+            run_name=args.run_name,
+        )
 
 
 if __name__ == "__main__":

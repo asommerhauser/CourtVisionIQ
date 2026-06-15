@@ -152,6 +152,67 @@ def test_end_event_roster_is_last_known_lineup(tmp_path):
     assert "Alice" not in home_roster
 
 
+# ---------------------------------------------------------------------------
+# run(): file discovery (ignore filtering) + idempotent output
+# ---------------------------------------------------------------------------
+
+def _write_raw(dir_path, name, rows=None):
+    """Write a synthetic raw master CSV (one game) into dir_path/name."""
+    start_row = {**_DEFAULT_ROW, "event_type": "start of period", "period": 1, "elapsed": "0:00:00"}
+    full_rows = [start_row] + [{**_DEFAULT_ROW, **r} for r in (rows or [])]
+    path = dir_path / name
+    pd.DataFrame(full_rows).to_csv(path, index=False)
+    return path
+
+
+def test_input_files_excludes_truncated(tmp_path):
+    """Sample/Truncated files and non-CSVs are filtered out of the input set."""
+    (tmp_path / "master.csv").write_text("x")
+    (tmp_path / "master Truncated.csv").write_text("x")
+    (tmp_path / "notes.txt").write_text("x")
+    dc = DataCleaner(data_path=str(tmp_path))
+    assert dc._input_files() == ["master.csv"]
+
+
+def test_input_files_filters_before_slicing(tmp_path):
+    """start/end index into the meaningful files (after ignore-filtering)."""
+    for n in ("a.csv", "b.csv", "c.csv", "b Truncated.csv"):
+        (tmp_path / n).write_text("x")
+    dc = DataCleaner(start=1, data_path=str(tmp_path))
+    assert dc._input_files() == ["b.csv", "c.csv"]
+
+
+def test_run_is_idempotent(tmp_path, monkeypatch):
+    """Re-running clean regenerates the season file instead of duplicating it."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    _write_raw(raw, "master.csv", [{"event_type": "shot", "result": "made"}])
+    monkeypatch.chdir(tmp_path)  # run() writes to ./data relative to cwd
+
+    DataCleaner(data_path=str(raw)).run()
+    out = tmp_path / "data" / "season2003.csv"
+    n1 = len(pd.read_csv(out))
+
+    DataCleaner(data_path=str(raw)).run()
+    n2 = len(pd.read_csv(out))
+
+    assert n1 == n2 and n1 > 0  # second run overwrote, did not append
+
+
+def test_run_excludes_truncated_within_a_run(tmp_path, monkeypatch):
+    """A Truncated sample beside the master file is not processed (no dup games)."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    _write_raw(raw, "master.csv", [{"event_type": "shot", "result": "made"}])
+    _write_raw(raw, "master Truncated.csv", [{"event_type": "shot", "result": "made"}])
+    monkeypatch.chdir(tmp_path)
+
+    DataCleaner(data_path=str(raw)).run()
+    cleaned = pd.read_csv(tmp_path / "data" / "season2003.csv")
+    # One master file = one game; if Truncated were processed there'd be two.
+    assert cleaned["game_id"].nunique() == 1
+
+
 def test_end_event_roster_never_exceeds_five(tmp_path):
     """Even if many subs occur, end-event roster is at most 5 players."""
     # All subs happen after the start; last lineup is still max 5.
