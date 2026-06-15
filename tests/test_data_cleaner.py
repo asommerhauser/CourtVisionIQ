@@ -97,7 +97,7 @@ def _roster_list(cell):
 def test_output_columns_present(tmp_path):
     cleaned = _parse(tmp_path, [])
     expected = {"game_id", "roster_home", "roster_away", "time", "event",
-                "player", "type", "result", "home/away", "season", "playoff"}
+                "player", "type", "result", "secondary_player", "home/away", "season", "playoff"}
     assert expected.issubset(set(cleaned.columns))
 
 
@@ -322,7 +322,8 @@ def test_block_creates_shot_and_block_events(tmp_path):
 
     assert shot["result"] == "blocked"
     assert block["player"] == "Frank"
-    assert block["type"] == "Alice"          # victim stored in type
+    assert block["type"] == "2pt"              # shot sub-type (not the victim's name)
+    assert block["secondary_player"] == "Alice"  # blocked shooter goes here
     assert block["result"] == "block"
 
 
@@ -434,7 +435,8 @@ def test_substitution_one_player_included(tmp_path):
     cleaned = _parse(tmp_path, [row])
     sub = cleaned[cleaned["event"] == "substitution"].iloc[0]
     assert sub["player"] == "Zach"
-    assert sub["type"] == "null"
+    assert sub["type"] == "substitution"        # clean type (not the leaving player)
+    assert sub["secondary_player"] == "none"    # no one left → "none" token
 
 
 # ---------------------------------------------------------------------------

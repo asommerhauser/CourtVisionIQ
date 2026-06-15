@@ -70,7 +70,8 @@ class KeyPaddingMask(layers.Layer):
 
 
 # Cleaned-data columns the model consumes.
-CATEGORICAL_FIELDS = ["event", "player", "type", "result", "season"]
+# secondary_player shares the player embedding table (weight-tied) — see model().
+CATEGORICAL_FIELDS = ["event", "player", "type", "result", "season", "secondary_player"]
 ROSTER_COLS = {"home_roster": "roster_home", "away_roster": "roster_away"}
 
 
@@ -234,9 +235,10 @@ class EventTimeModel:
         PAD_TYPE = self.encoder.encode_type("PAD")
         PAD_RESULT = self.encoder.encode_result("PAD")
         PAD_SEASON = self.encoder.encode_season("PAD")
+        PAD_SECONDARY = self.encoder.encode_secondary_player("PAD")
         pad_scalar = {
             "event": PAD_EVENT, "player": PAD_PLAYER, "type": PAD_TYPE,
-            "result": PAD_RESULT, "season": PAD_SEASON,
+            "result": PAD_RESULT, "season": PAD_SEASON, "secondary_player": PAD_SECONDARY,
         }
 
         keys_1d = CATEGORICAL_FIELDS
@@ -338,12 +340,19 @@ class EventTimeModel:
         pad_mask = Input(shape=(SEQ,), dtype="float32", name="pad_mask")
 
         # ---- Per-field embeddings ----
+        # player and secondary_player share one Embedding table (weight-tied): same
+        # entity, same representation, regardless of which role they play in the event.
+        player_vocab_size = self.encoder.player_vocab.next_token
+        player_emb_layer = layers.Embedding(player_vocab_size, EMBED_DIMS["player"], name="emb_player")
         embs = []
         for f in CATEGORICAL_FIELDS:
-            v = vocab[f]
-            embs.append(
-                layers.Embedding(v.next_token, EMBED_DIMS[f], name=f"emb_{f}")(cat_inputs[f])
-            )
+            if f in ("player", "secondary_player"):
+                embs.append(player_emb_layer(cat_inputs[f]))
+            else:
+                v = vocab[f]
+                embs.append(
+                    layers.Embedding(v.next_token, EMBED_DIMS[f], name=f"emb_{f}")(cat_inputs[f])
+                )
 
         # ---- Roster encoding across the sequence ----
         # One shared SequenceRosterEncoder applied to both rosters: weight-ties
@@ -407,7 +416,7 @@ class EventTimeModel:
     # =====================
 
     INPUT_KEYS = (
-        "event", "player", "type", "result", "season",
+        "event", "player", "type", "result", "season", "secondary_player",
         "home_roster", "away_roster", "time_abs", "delta_time", "pad_mask",
     )
 

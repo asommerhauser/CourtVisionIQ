@@ -48,7 +48,7 @@ class DataCleaner:
         self.events = []
         self.output_columns = [
             "game_id", "roster_home", "roster_away", "time", "event",
-            "player", "type", "result", "home/away", "season", "playoff",
+            "player", "type", "result", "secondary_player", "home/away", "season", "playoff",
         ]
 
     # ------------------- HELPER METHODS -------------------
@@ -166,6 +166,7 @@ class DataCleaner:
             "player": "end",
             "type": "end",
             "result": "end",
+            "secondary_player": "none",
             "home/away": 0,
             "season": self.season,
             "playoff": 2 if self.playoff else 1,
@@ -206,6 +207,7 @@ class DataCleaner:
                 "player": "start",
                 "type": "start",
                 "result": "start",
+                "secondary_player": "none",
                 "home/away": 0,
                 "season": self.season,
                 "playoff": 2 if self.playoff else 1,
@@ -256,6 +258,7 @@ class DataCleaner:
                 "player": assist_player,
                 "type": shot_type,
                 "result": "score",
+                "secondary_player": "none",
                 "home/away": assist_home,
                 "season": self.season,
                 "playoff": 2 if self.playoff else 1,
@@ -273,6 +276,7 @@ class DataCleaner:
                 "player": row["player"] if pd.notna(row["player"]) else "null",
                 "type": shot_type,
                 "result": "blocked" if has_block else (row["result"] if pd.notna(row["result"]) else "null"),
+                "secondary_player": "none",
                 "home/away": home,
                 "season": self.season,
                 "playoff": 2 if self.playoff else 1,
@@ -281,14 +285,16 @@ class DataCleaner:
             if has_block:
                 blocker = str(row["block"]).strip()
                 block_home = self.home_indicator(clean_home, blocker)
+                blocked_shooter = row["player"] if pd.notna(row["player"]) else "null"
                 events.append({
                     "roster_home": clean_home,
                     "roster_away": clean_away,
                     "time": time_safe,
                     "event": "block",
                     "player": blocker,
-                    "type": row["player"] if pd.notna(row["player"]) else "null",
+                    "type": shot_type,
                     "result": "block",
+                    "secondary_player": blocked_shooter,
                     "home/away": block_home,
                     "season": self.season,
                     "playoff": 2 if self.playoff else 1,
@@ -304,6 +310,7 @@ class DataCleaner:
                 "player": row["player"] if pd.notna(row["player"]) else "null",
                 "type": "free throw",
                 "result": row["result"] if pd.notna(row["result"]) else "null",
+                "secondary_player": "none",
                 "home/away": home,
                 "season": self.season,
                 "playoff": 2 if self.playoff else 1,
@@ -327,6 +334,7 @@ class DataCleaner:
                 "player": row["player"] if pd.notna(row["player"]) else "null",
                 "type": rebound_type,
                 "result": "cop" if rebound_type == "defensive" else "null",
+                "secondary_player": "none",
                 "home/away": home,
                 "season": self.season,
                 "playoff": 2 if self.playoff else 1,
@@ -349,6 +357,7 @@ class DataCleaner:
                     "player": steal_player,
                     "type": "steal",
                     "result": "steal",
+                    "secondary_player": "none",
                     "home/away": steal_home,
                     "season": self.season,
                     "playoff": 2 if self.playoff else 1,
@@ -361,6 +370,7 @@ class DataCleaner:
                     "player": turnover_player,
                     "type": "steal",
                     "result": "cop",
+                    "secondary_player": "none",
                     "home/away": home,
                     "season": self.season,
                     "playoff": 2 if self.playoff else 1,
@@ -377,6 +387,7 @@ class DataCleaner:
                     "player": turnover_player,
                     "type": turnover_type,
                     "result": "cop",
+                    "secondary_player": "none",
                     "home/away": home,
                     "season": self.season,
                     "playoff": 2 if self.playoff else 1,
@@ -394,6 +405,7 @@ class DataCleaner:
                 "player": row["player"] if pd.notna(row["player"]) else "null",
                 "type": foul_type,
                 "result": foul_result,
+                "secondary_player": "none",
                 "home/away": home,
                 "season": self.season,
                 "playoff": 2 if self.playoff else 1,
@@ -411,8 +423,9 @@ class DataCleaner:
                 "time": time_safe,
                 "event": "substitution",
                 "player": entered if pd.notna(entered) else "null",
-                "type": left if pd.notna(left) else "null",
+                "type": "substitution",
                 "result": "substitution",
+                "secondary_player": left if pd.notna(left) else "none",
                 "home/away": home,
                 "season": self.season,
                 "playoff": 2 if self.playoff else 1,
