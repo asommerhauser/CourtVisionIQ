@@ -15,6 +15,8 @@ from models.roster_set_encoder import (
     RosterEncoderParams,
     SequenceRosterEncoder,
 )
+from reporting import ReportCollector, RunConfig
+from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
 
 # Per-field embedding dimensions (categoricals never enter the model as raw scalars).
 EMBED_DIMS = {"event": 32, "player": 128, "type": 32, "result": 16, "season": 16}
@@ -458,13 +460,20 @@ class EventTimeModel:
 
     def train(self, epochs=50, batch_size=64, lr=3e-4, time_loss_weight=0.25,
               patience=6, artifacts_root=DEFAULT_ARTIFACTS_ROOT,
-              mixed_precision=True, jit_compile=False):
+              mixed_precision=True, jit_compile=False,
+              report=True, run_name=None, reports_root=DEFAULT_REPORTS_ROOT):
         """
         Fit the Event/Time model on the preprocessed train split, validating on
         test. Multi-task masked loss: SparseCCE(from_logits) on the event head +
         MAE on the time head, with loss_mask as sample_weight so PAD/no-next
         steps contribute zero loss. Saves the trained model alongside the vocabs
         and norm stats (the full reusable artifact).
+
+        When ``report`` is set (default), a standardized training/testing report
+        is emitted to ``reports_root`` via the shared reporting layer: a
+        self-contained HTML report with per-epoch loss/metric graphs plus a
+        queryable Parquet data model (see the reporting package). ``run_name`` is
+        an optional human label folded into the run id.
 
         Runs on CUDA automatically when a GPU is visible (see configure_gpu);
         otherwise falls back to CPU.
@@ -512,12 +521,58 @@ class EventTimeModel:
             ),
         ]
 
-        history = model.fit(
-            train_ds, validation_data=val_ds, epochs=epochs, callbacks=callbacks,
-        )
+        # Standardized reporting: capture config/env/data/model, attach the
+        # per-epoch callback, and emit the report in finally so even a crash
+        # leaves a status="failed" record.
+        collector = None
+        if report:
+            cfg = RunConfig(
+                model_key=self.KEY, epochs_planned=epochs, batch_size=batch_size,
+                lr=lr, time_loss_weight=time_loss_weight, patience=patience,
+                mixed_precision=mixed_precision, jit_compile=jit_compile,
+                arch={
+                    "model_dim": self.model_dim,
+                    "sequence_length": self.sequence_length,
+                    "embed_dims": EMBED_DIMS,
+                    "roster_dim": ROSTER_DIM,
+                },
+            )
+            collector = ReportCollector(cfg, run_name=run_name, reports_root=reports_root)
+            collector.capture_data(
+                train_games=int(train_split["pad_mask"].shape[0]),
+                test_games=int(test_split["pad_mask"].shape[0]),
+                sequence_length=self.sequence_length,
+                vocab_sizes={n: v.next_token for n, v in self.encoder.vocabs.items()},
+                norm_stats=self.norm_stats,
+            )
+            collector.capture_model(model)
+            callbacks.append(collector.callback)
+
+        status = "completed"
+        history = None
+        try:
+            history = model.fit(
+                train_ds, validation_data=val_ds, epochs=epochs, callbacks=callbacks,
+            )
+            if len(history.epoch) < epochs:
+                status = "early_stopped"
+        except Exception:
+            status = "failed"
+            if collector is not None:
+                collector.finalize(status=status)
+            raise
 
         # Persist the full reusable artifact: model + weights + vocabs + norm stats.
         self.save_artifacts(model, root=artifacts_root)
+
+        if collector is not None:
+            # Final test pass on the (best-weights-restored) model for the report.
+            test_metrics = model.evaluate(val_ds, return_dict=True, verbose=0)
+            arts = collector.finalize(
+                status=status,
+                final_test_metrics={k: float(v) for k, v in test_metrics.items()},
+            )
+            print(f"Report '{self.KEY}/{arts.run_id}' -> {arts.run_dir.resolve()}")
         return model, history
 
     # =====================

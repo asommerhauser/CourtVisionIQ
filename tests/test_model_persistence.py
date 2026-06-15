@@ -136,6 +136,7 @@ def _train_tiny(adapter: ModelTestAdapter, tmp_path: Path):
         batch_size=2,
         artifacts_root=str(artifacts_root),
         mixed_precision=False,  # CPU-friendly, deterministic dtype
+        report=False,           # persistence test: don't emit/pollute reports
     )
     return artifacts_root, vocab_dir, data_dir, processed_dir
 

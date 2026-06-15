@@ -1,5 +1,13 @@
 import argparse
 
+# Import TensorFlow before pandas-using project modules. On Windows, importing
+# pandas first can break TF's native DLL initialization ("DLL load failed while
+# importing _pywrap_tensorflow_internal"). Loading TF first makes it robust.
+try:  # noqa: SIM105
+    import tensorflow  # noqa: F401
+except Exception:
+    pass
+
 from data_cleaner import DataCleaner
 from encoder.encoder import Encoder
 from models.event_time_model import EventTimeModel
@@ -25,6 +33,10 @@ def main():
                         help="Rebuild vocabs from data instead of loading from disk.")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--no-report", action="store_true",
+                        help="Disable the standardized training/testing report.")
+    parser.add_argument("--run-name", default=None,
+                        help="Optional human label folded into the report run id.")
     args = parser.parse_args()
 
     # 1) Clean raw data into season CSVs (optional; expensive).
@@ -39,7 +51,12 @@ def main():
 
         # 3) Train the Event/Time transformer (if --train flag is provided).
         if args.train:
-            model.train(epochs=args.epochs, batch_size=args.batch_size)
+            model.train(
+                epochs=args.epochs,
+                batch_size=args.batch_size,
+                report=not args.no_report,
+                run_name=args.run_name,
+            )
 
 
 if __name__ == "__main__":
