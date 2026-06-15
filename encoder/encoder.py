@@ -7,7 +7,8 @@ from config import VOCAB_DIR, ROSTER_SIZE
 
 # Reserved special tokens, in the order that fixes their integer IDs.
 # PAD must be id 0 (used for padding + roster slot masking).
-SPECIALS = ["PAD", "UNK", "start", "end"]
+# "none" = real event with no secondary participant (distinct from PAD = padded position).
+SPECIALS = ["PAD", "UNK", "start", "end", "none"]
 SEASON_SPECIALS = ["PAD", "UNK"]
 
 # Cleaned-data column -> the vocab that encodes it.
@@ -76,6 +77,9 @@ class Encoder:
 
     def encode_season(self, season) -> int:
         return self.season_vocab.encode(season)
+
+    def encode_secondary_player(self, player) -> int:
+        return self.player_vocab.encode(player)
 
     # =============================
     # --- Build / Persist / Lock ---

@@ -1,7 +1,8 @@
 from __future__ import annotations
-from tensorflow import keras
+import keras
 
 
+@keras.saving.register_keras_serializable(package="cviq")
 class RowFF(keras.layers.Layer):
     """
     Row-wise FeedForward network (rFF) from the Set Transformer paper.

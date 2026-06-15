@@ -1,11 +1,12 @@
 # layers/mab.py
 from __future__ import annotations
 
-from tensorflow import keras
+import keras
 
 from .row_ff import RowFF
 
 
+@keras.saving.register_keras_serializable(package="cviq")
 class MAB(keras.layers.Layer):
     """
     Multihead Attention Block (MAB) from the Set Transformer paper.

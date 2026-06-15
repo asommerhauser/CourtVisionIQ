@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import tensorflow as tf
-from tensorflow import keras
+import keras
 
 from .mab import MAB
 from .row_ff import RowFF
 
 
+@keras.saving.register_keras_serializable(package="cviq")
 class PMA(keras.layers.Layer):
     """
     Pooling by Multihead Attention (PMA).
@@ -49,14 +50,6 @@ class PMA(keras.layers.Layer):
         self.ln_eps = ln_eps
         self.return_pooled_vector = return_pooled_vector
 
-        # Learnable seed vectors S: (K, D)
-        self.seeds = self.add_weight(
-            name="seed_vectors",
-            shape=(k_seeds, d_model),
-            initializer="glorot_uniform",
-            trainable=True,
-        )
-
         # rFF(X) before pooling (matches the paper)
         self.pre_ff = RowFF(d_model=d_model, d_ff=d_ff, dropout=dropout, name="pre_rff")
 
@@ -69,6 +62,17 @@ class PMA(keras.layers.Layer):
             ln_eps=ln_eps,
             name="mab",
         )
+
+    def build(self, input_shape):
+        # Learnable seed vectors S: (K, D). Created in build() (not __init__) so the
+        # weight is registered against a built layer and serializes/reloads cleanly.
+        self.seeds = self.add_weight(
+            name="seed_vectors",
+            shape=(self.k_seeds, self.d_model),
+            initializer="glorot_uniform",
+            trainable=True,
+        )
+        super().build(input_shape)
 
     def call(self, X, training: bool = False, attention_mask=None):
         # X: (B, N, D)

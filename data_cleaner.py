@@ -10,16 +10,26 @@ class DataCleaner:
     Parameters
     ----------
     start : int
-        Index to begin processing files from. Defaults to 0.
+        Index to begin processing files from (after filtering). Defaults to 0.
     end : int
         Index to stop processing files at. None means process all files.
+    data_path : str | None
+        Directory of raw master files. Defaults to DATA_PATH.
+    ignore : Iterable[str] | None
+        Filename substrings to skip (e.g. sample/Truncated files). Defaults to
+        IGNORE_SUBSTRINGS.
     """
 
     DATA_PATH = "./RawData/MasterFiles"
+    # Raw files whose names contain any of these are skipped (samples/subsets that
+    # would duplicate games already present in the full master file).
+    IGNORE_SUBSTRINGS = ("Truncated",)
 
-    def __init__(self, start=0, end=None):
+    def __init__(self, start=0, end=None, data_path=None, ignore=None):
         self.start = start
         self.end = end
+        self.data_path = data_path or self.DATA_PATH
+        self.ignore = tuple(ignore) if ignore is not None else self.IGNORE_SUBSTRINGS
         self.season = 0
         self.playoff = 0
         # Per-game cumulative roster (used for end-of-game sentinel event).
@@ -38,7 +48,7 @@ class DataCleaner:
         self.events = []
         self.output_columns = [
             "game_id", "roster_home", "roster_away", "time", "event",
-            "player", "type", "result", "home/away", "season", "playoff",
+            "player", "type", "result", "secondary_player", "home/away", "season", "playoff",
         ]
 
     # ------------------- HELPER METHODS -------------------
@@ -156,6 +166,7 @@ class DataCleaner:
             "player": "end",
             "type": "end",
             "result": "end",
+            "secondary_player": "none",
             "home/away": 0,
             "season": self.season,
             "playoff": 2 if self.playoff else 1,
@@ -196,6 +207,7 @@ class DataCleaner:
                 "player": "start",
                 "type": "start",
                 "result": "start",
+                "secondary_player": "none",
                 "home/away": 0,
                 "season": self.season,
                 "playoff": 2 if self.playoff else 1,
@@ -246,6 +258,7 @@ class DataCleaner:
                 "player": assist_player,
                 "type": shot_type,
                 "result": "score",
+                "secondary_player": "none",
                 "home/away": assist_home,
                 "season": self.season,
                 "playoff": 2 if self.playoff else 1,
@@ -263,6 +276,7 @@ class DataCleaner:
                 "player": row["player"] if pd.notna(row["player"]) else "null",
                 "type": shot_type,
                 "result": "blocked" if has_block else (row["result"] if pd.notna(row["result"]) else "null"),
+                "secondary_player": "none",
                 "home/away": home,
                 "season": self.season,
                 "playoff": 2 if self.playoff else 1,
@@ -271,14 +285,16 @@ class DataCleaner:
             if has_block:
                 blocker = str(row["block"]).strip()
                 block_home = self.home_indicator(clean_home, blocker)
+                blocked_shooter = row["player"] if pd.notna(row["player"]) else "null"
                 events.append({
                     "roster_home": clean_home,
                     "roster_away": clean_away,
                     "time": time_safe,
                     "event": "block",
                     "player": blocker,
-                    "type": row["player"] if pd.notna(row["player"]) else "null",
+                    "type": shot_type,
                     "result": "block",
+                    "secondary_player": blocked_shooter,
                     "home/away": block_home,
                     "season": self.season,
                     "playoff": 2 if self.playoff else 1,
@@ -294,6 +310,7 @@ class DataCleaner:
                 "player": row["player"] if pd.notna(row["player"]) else "null",
                 "type": "free throw",
                 "result": row["result"] if pd.notna(row["result"]) else "null",
+                "secondary_player": "none",
                 "home/away": home,
                 "season": self.season,
                 "playoff": 2 if self.playoff else 1,
@@ -317,6 +334,7 @@ class DataCleaner:
                 "player": row["player"] if pd.notna(row["player"]) else "null",
                 "type": rebound_type,
                 "result": "cop" if rebound_type == "defensive" else "null",
+                "secondary_player": "none",
                 "home/away": home,
                 "season": self.season,
                 "playoff": 2 if self.playoff else 1,
@@ -339,6 +357,7 @@ class DataCleaner:
                     "player": steal_player,
                     "type": "steal",
                     "result": "steal",
+                    "secondary_player": "none",
                     "home/away": steal_home,
                     "season": self.season,
                     "playoff": 2 if self.playoff else 1,
@@ -351,6 +370,7 @@ class DataCleaner:
                     "player": turnover_player,
                     "type": "steal",
                     "result": "cop",
+                    "secondary_player": "none",
                     "home/away": home,
                     "season": self.season,
                     "playoff": 2 if self.playoff else 1,
@@ -367,6 +387,7 @@ class DataCleaner:
                     "player": turnover_player,
                     "type": turnover_type,
                     "result": "cop",
+                    "secondary_player": "none",
                     "home/away": home,
                     "season": self.season,
                     "playoff": 2 if self.playoff else 1,
@@ -384,6 +405,7 @@ class DataCleaner:
                 "player": row["player"] if pd.notna(row["player"]) else "null",
                 "type": foul_type,
                 "result": foul_result,
+                "secondary_player": "none",
                 "home/away": home,
                 "season": self.season,
                 "playoff": 2 if self.playoff else 1,
@@ -401,8 +423,9 @@ class DataCleaner:
                 "time": time_safe,
                 "event": "substitution",
                 "player": entered if pd.notna(entered) else "null",
-                "type": left if pd.notna(left) else "null",
+                "type": "substitution",
                 "result": "substitution",
+                "secondary_player": left if pd.notna(left) else "none",
                 "home/away": home,
                 "season": self.season,
                 "playoff": 2 if self.playoff else 1,
@@ -433,21 +456,35 @@ class DataCleaner:
 
         return df, pd.DataFrame(self.events)
 
+    def _input_files(self):
+        """Resolved raw files to process: *.csv, ignore-filtered, sorted, sliced.
+
+        Filtering happens before slicing so --clean-start/--clean-end index into
+        the meaningful master files (not the skipped samples).
+        """
+        files = sorted(
+            f for f in os.listdir(self.data_path)
+            if f.endswith(".csv") and not any(s in f for s in self.ignore)
+        )
+        return files[self.start:self.end]
+
     def run(self):
         """
-        Loop through files in DATA_PATH, parse them, and append cleaned events
-        to ./data/season<YYYY>.csv (one file per season).
+        Loop through the resolved master files, parse them, and write cleaned
+        events to ./data/season<YYYY>.csv (one file per season).
+
+        Idempotent within a run: the first time a season file is written this run
+        it is overwritten fresh (header + mode "w"); additional master files for
+        the same season append. So re-running clean regenerates the season files
+        instead of duplicating onto stale output.
         """
-        files = sorted(os.listdir(self.DATA_PATH))
-        files = files[self.start:self.end]
+        files = self._input_files()
 
         os.makedirs("./data", exist_ok=True)
+        written = set()  # season output paths already (re)started this run
 
         for fname in files:
-            if not fname.endswith(".csv"):
-                continue
-
-            fpath = os.path.join(self.DATA_PATH, fname)
+            fpath = os.path.join(self.data_path, fname)
 
             # Reset per-file state (game_id persists for global uniqueness).
             self.first = True
@@ -463,8 +500,14 @@ class DataCleaner:
             _, cleaned_df = self.parse_file(fpath)
 
             out_path = f"./data/season{self.season}.csv"
-            write_header = not os.path.exists(out_path)
-            cleaned_df.to_csv(out_path, mode="a", header=write_header, index=False)
+            first_write = out_path not in written
+            written.add(out_path)
+            cleaned_df.to_csv(
+                out_path,
+                mode="w" if first_write else "a",
+                header=first_write,
+                index=False,
+            )
 
 
 if __name__ == "__main__":

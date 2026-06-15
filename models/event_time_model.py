@@ -4,18 +4,26 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from tensorflow import keras
+import keras
 from keras import layers, Input
 
 from config import MAX_SEQUENCE_LENGTH, ROSTER_SIZE, NORM_STATS_PATH
 from encoder.encoder import Encoder
-from models.roster_set_encoder import RosterSetEncoder, RosterEncoderParams
+from models.artifacts import ModelArtifacts, DEFAULT_ARTIFACTS_ROOT
+from models.roster_set_encoder import (
+    RosterSetEncoder,
+    RosterEncoderParams,
+    SequenceRosterEncoder,
+)
+from reporting import ReportCollector, RunConfig
+from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
 
 # Per-field embedding dimensions (categoricals never enter the model as raw scalars).
 EMBED_DIMS = {"event": 32, "player": 128, "type": 32, "result": 16, "season": 16}
 ROSTER_DIM = 128
 
 
+@keras.saving.register_keras_serializable(package="cviq")
 class AddPositionalEmbedding(layers.Layer):
     """Add a learned position embedding over [0, seq_len) to a (B, SEQ, D) tensor."""
 
@@ -23,11 +31,20 @@ class AddPositionalEmbedding(layers.Layer):
         super().__init__(**kwargs)
         self.seq_len = seq_len
         self.d_model = d_model
-        self.pos = layers.Embedding(seq_len, d_model, name="pos_table")
+
+    def build(self, input_shape):
+        # Own variable (created in build, not a nested Embedding) so it serializes
+        # and reloads cleanly. Shape (SEQ, D) broadcasts over the batch axis.
+        self.pos = self.add_weight(
+            name="pos_table",
+            shape=(self.seq_len, self.d_model),
+            initializer="uniform",
+            trainable=True,
+        )
+        super().build(input_shape)
 
     def call(self, x):
-        positions = tf.range(self.seq_len)          # (SEQ,)
-        return x + self.pos(positions)              # broadcast over batch
+        return x + self.pos                         # (SEQ, D) broadcasts over (B, SEQ, D)
 
     def compute_output_shape(self, input_shape):
         return input_shape
@@ -37,8 +54,24 @@ class AddPositionalEmbedding(layers.Layer):
         cfg.update({"seq_len": self.seq_len, "d_model": self.d_model})
         return cfg
 
+@keras.saving.register_keras_serializable(package="cviq")
+class KeyPaddingMask(layers.Layer):
+    """Turn a (B, SEQ) float pad-mask into a (B, 1, SEQ) boolean key-padding mask.
+
+    A registered layer (rather than a Lambda) so the full .keras model reloads
+    under Keras 3 safe mode without custom code execution.
+    """
+
+    def call(self, m):
+        return tf.cast(m, "bool")[:, tf.newaxis, :]
+
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0], 1, input_shape[1])
+
+
 # Cleaned-data columns the model consumes.
-CATEGORICAL_FIELDS = ["event", "player", "type", "result", "season"]
+# secondary_player shares the player embedding table (weight-tied) — see model().
+CATEGORICAL_FIELDS = ["event", "player", "type", "result", "season", "secondary_player"]
 ROSTER_COLS = {"home_roster": "roster_home", "away_roster": "roster_away"}
 
 
@@ -52,6 +85,9 @@ class EventTimeModel:
     fits it. Encoding is standardized so every downstream model speaks the same
     token language.
     """
+
+    # Stable key used for the on-disk artifact layout and the model registry.
+    KEY = "event_time"
 
     def __init__(self, encoder: Encoder,
                  sequence_length=MAX_SEQUENCE_LENGTH,
@@ -199,9 +235,10 @@ class EventTimeModel:
         PAD_TYPE = self.encoder.encode_type("PAD")
         PAD_RESULT = self.encoder.encode_result("PAD")
         PAD_SEASON = self.encoder.encode_season("PAD")
+        PAD_SECONDARY = self.encoder.encode_secondary_player("PAD")
         pad_scalar = {
             "event": PAD_EVENT, "player": PAD_PLAYER, "type": PAD_TYPE,
-            "result": PAD_RESULT, "season": PAD_SEASON,
+            "result": PAD_RESULT, "season": PAD_SEASON, "secondary_player": PAD_SECONDARY,
         }
 
         keys_1d = CATEGORICAL_FIELDS
@@ -257,7 +294,7 @@ class EventTimeModel:
     # --- Model / Train ---
     # =====================
 
-    def build_roster_encoder(self) -> RosterSetEncoder:
+    def build_roster_encoder(self) -> SequenceRosterEncoder:
         num_players = self.encoder.player_vocab.next_token
         params = RosterEncoderParams(
             roster_size=ROSTER_SIZE,
@@ -268,7 +305,9 @@ class EventTimeModel:
             d_ff=256,
             dropout=0.1,
         )
-        return RosterSetEncoder(params)
+        # Applies the shared set-encoder across the time axis via reshape (not
+        # TimeDistributed, which unrolls SEQ in graph mode and exhausts memory).
+        return SequenceRosterEncoder(params, name="roster_vec")
 
     def model(self, num_layers=4, num_heads=8, ff_dim=1024, dropout=0.1):
         """
@@ -301,16 +340,25 @@ class EventTimeModel:
         pad_mask = Input(shape=(SEQ,), dtype="float32", name="pad_mask")
 
         # ---- Per-field embeddings ----
+        # player and secondary_player share one Embedding table (weight-tied): same
+        # entity, same representation, regardless of which role they play in the event.
+        player_vocab_size = self.encoder.player_vocab.next_token
+        player_emb_layer = layers.Embedding(player_vocab_size, EMBED_DIMS["player"], name="emb_player")
         embs = []
         for f in CATEGORICAL_FIELDS:
-            v = vocab[f]
-            embs.append(
-                layers.Embedding(v.next_token, EMBED_DIMS[f], name=f"emb_{f}")(cat_inputs[f])
-            )
+            if f in ("player", "secondary_player"):
+                embs.append(player_emb_layer(cat_inputs[f]))
+            else:
+                v = vocab[f]
+                embs.append(
+                    layers.Embedding(v.next_token, EMBED_DIMS[f], name=f"emb_{f}")(cat_inputs[f])
+                )
 
         # ---- Roster encoding across the sequence ----
-        home_vec = layers.TimeDistributed(self.roster_encoder, name="home_roster_vec")(home_roster)
-        away_vec = layers.TimeDistributed(self.roster_encoder, name="away_roster_vec")(away_roster)
+        # One shared SequenceRosterEncoder applied to both rosters: weight-ties
+        # home/away and encodes all timesteps in a single reshaped pass.
+        home_vec = self.roster_encoder(home_roster)
+        away_vec = self.roster_encoder(away_roster)
 
         # ---- Continuous projections ----
         t_abs = layers.Dense(16, name="time_abs_proj")(time_abs)
@@ -328,10 +376,7 @@ class EventTimeModel:
         x = layers.Dropout(dropout, name="emb_dropout")(x)
 
         # ---- Attention mask: (B, 1, SEQ) boolean key-padding mask ----
-        attn_mask = layers.Lambda(
-            lambda m: tf.cast(m, "bool")[:, tf.newaxis, :],
-            name="attn_pad_mask",
-        )(pad_mask)
+        attn_mask = KeyPaddingMask(name="attn_pad_mask")(pad_mask)
 
         # ---- Causal transformer encoder ----
         for i in range(num_layers):
@@ -371,7 +416,7 @@ class EventTimeModel:
     # =====================
 
     INPUT_KEYS = (
-        "event", "player", "type", "result", "season",
+        "event", "player", "type", "result", "season", "secondary_player",
         "home_roster", "away_roster", "time_abs", "delta_time", "pad_mask",
     )
 
@@ -423,14 +468,21 @@ class EventTimeModel:
         return gpus
 
     def train(self, epochs=50, batch_size=64, lr=3e-4, time_loss_weight=0.25,
-              patience=6, save_dir="./artifacts/event_time",
-              mixed_precision=True, jit_compile=False):
+              patience=6, artifacts_root=DEFAULT_ARTIFACTS_ROOT,
+              mixed_precision=True, jit_compile=False,
+              report=True, run_name=None, reports_root=DEFAULT_REPORTS_ROOT):
         """
         Fit the Event/Time model on the preprocessed train split, validating on
         test. Multi-task masked loss: SparseCCE(from_logits) on the event head +
         MAE on the time head, with loss_mask as sample_weight so PAD/no-next
         steps contribute zero loss. Saves the trained model alongside the vocabs
         and norm stats (the full reusable artifact).
+
+        When ``report`` is set (default), a standardized training/testing report
+        is emitted to ``reports_root`` via the shared reporting layer: a
+        self-contained HTML report with per-epoch loss/metric graphs plus a
+        queryable Parquet data model (see the reporting package). ``run_name`` is
+        an optional human label folded into the run id.
 
         Runs on CUDA automatically when a GPU is visible (see configure_gpu);
         otherwise falls back to CPU.
@@ -478,18 +530,113 @@ class EventTimeModel:
             ),
         ]
 
-        history = model.fit(
-            train_ds, validation_data=val_ds, epochs=epochs, callbacks=callbacks,
-        )
+        # Standardized reporting: capture config/env/data/model, attach the
+        # per-epoch callback, and emit the report in finally so even a crash
+        # leaves a status="failed" record.
+        collector = None
+        if report:
+            cfg = RunConfig(
+                model_key=self.KEY, epochs_planned=epochs, batch_size=batch_size,
+                lr=lr, time_loss_weight=time_loss_weight, patience=patience,
+                mixed_precision=mixed_precision, jit_compile=jit_compile,
+                arch={
+                    "model_dim": self.model_dim,
+                    "sequence_length": self.sequence_length,
+                    "embed_dims": EMBED_DIMS,
+                    "roster_dim": ROSTER_DIM,
+                },
+            )
+            collector = ReportCollector(cfg, run_name=run_name, reports_root=reports_root)
+            collector.capture_data(
+                train_games=int(train_split["pad_mask"].shape[0]),
+                test_games=int(test_split["pad_mask"].shape[0]),
+                sequence_length=self.sequence_length,
+                vocab_sizes={n: v.next_token for n, v in self.encoder.vocabs.items()},
+                norm_stats=self.norm_stats,
+            )
+            collector.capture_model(model)
+            callbacks.append(collector.callback)
 
-        # Persist the full reusable artifact: weights + vocabs + norm stats.
-        save_path = Path(save_dir)
-        save_path.mkdir(parents=True, exist_ok=True)
-        model.save(save_path / "event_time_model.keras")
+        status = "completed"
+        history = None
+        try:
+            history = model.fit(
+                train_ds, validation_data=val_ds, epochs=epochs, callbacks=callbacks,
+            )
+            if len(history.epoch) < epochs:
+                status = "early_stopped"
+        except Exception:
+            status = "failed"
+            if collector is not None:
+                collector.finalize(status=status)
+            raise
+
+        # Persist the full reusable artifact: model + weights + vocabs + norm stats.
+        self.save_artifacts(model, root=artifacts_root)
+
+        if collector is not None:
+            # Final test pass on the (best-weights-restored) model for the report.
+            test_metrics = model.evaluate(val_ds, return_dict=True, verbose=0)
+            arts = collector.finalize(
+                status=status,
+                final_test_metrics={k: float(v) for k, v in test_metrics.items()},
+            )
+            print(f"Report '{self.KEY}/{arts.run_id}' -> {arts.run_dir.resolve()}")
+        return model, history
+
+    # =====================
+    # --- Persistence   ---
+    # =====================
+    #
+    # Contract shared by every model wrapper (so ModelBundle can load them all the
+    # same way): save_artifacts() writes the standard layout, from_artifacts()
+    # rebuilds the graph and restores weights. See models/artifacts.py.
+
+    def save_artifacts(self, model, root=DEFAULT_ARTIFACTS_ROOT) -> ModelArtifacts:
+        """
+        Persist the trained model under <root>/<KEY>/ using the shared layout:
+        a full <KEY>.keras, a weights-only <KEY>.weights.h5, and norm_stats.json,
+        plus the shared vocabs. Returns the resolved ModelArtifacts.
+        """
+        arts = ModelArtifacts.for_key(self.KEY, root)
+        arts.ensure_dir()
+        model.save(arts.keras_path)
+        model.save_weights(arts.weights_path)
         self.encoder.save_all()
         if self.norm_stats is not None:
-            (save_path / "norm_stats.json").write_text(
+            arts.norm_stats_path.write_text(
                 json.dumps(self.norm_stats, indent=2), encoding="utf-8"
             )
-        print(f"Saved trained model + vocabs + norm stats -> {save_path.resolve()}")
-        return model, history
+        print(f"Saved '{self.KEY}': model + weights + vocabs + norm stats "
+              f"-> {arts.model_dir.resolve()}")
+        return arts
+
+    @classmethod
+    def from_artifacts(cls, root=DEFAULT_ARTIFACTS_ROOT, encoder=None, **kwargs):
+        """
+        Reload a trained model from <root>/<KEY>/ (robust path: rebuild the graph
+        from the frozen vocabs, then restore weights — no custom-object
+        deserialization needed). Returns (instance, model) ready for inference.
+
+        Pass `encoder` to point at a specific vocab dir; otherwise a default
+        Encoder is created. Extra kwargs (e.g. path=, sequence_length=) flow to
+        the EventTimeModel constructor.
+        """
+        arts = ModelArtifacts.for_key(cls.KEY, root)
+        if not arts.weights_path.exists():
+            raise FileNotFoundError(
+                f"No weights for '{cls.KEY}' at {arts.weights_path.resolve()}; "
+                f"train the model first."
+            )
+        if encoder is None:
+            encoder = Encoder()
+        encoder.load_all()
+        encoder.freeze_all()
+
+        inst = cls(encoder, **kwargs)
+        if arts.norm_stats_path.exists():
+            inst.norm_stats = json.loads(arts.norm_stats_path.read_text(encoding="utf-8"))
+
+        model = inst.model()
+        model.load_weights(arts.weights_path)
+        return inst, model

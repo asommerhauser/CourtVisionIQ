@@ -24,6 +24,7 @@ def _make_cleaned_csv(path):
                 "player": "A",
                 "type": "t",
                 "result": "r",
+                "secondary_player": "none",
                 "season": "2003",
             })
     pd.DataFrame(rows).to_csv(path, index=False)
