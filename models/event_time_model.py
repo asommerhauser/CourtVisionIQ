@@ -470,6 +470,7 @@ class EventTimeModel:
     def train(self, epochs=50, batch_size=64, lr=3e-4, time_loss_weight=0.25,
               patience=6, artifacts_root=DEFAULT_ARTIFACTS_ROOT,
               mixed_precision=True, jit_compile=False,
+              num_layers=4, num_heads=8, ff_dim=1024, dropout=0.1,
               report=True, run_name=None, reports_root=DEFAULT_REPORTS_ROOT):
         """
         Fit the Event/Time model on the preprocessed train split, validating on
@@ -503,7 +504,8 @@ class EventTimeModel:
         train_ds = self._make_dataset(train_split, batch_size, shuffle=True)
         val_ds = self._make_dataset(test_split, batch_size, shuffle=False)
 
-        model = self.model()
+        model = self.model(num_layers=num_layers, num_heads=num_heads,
+                           ff_dim=ff_dim, dropout=dropout)
         optimizer = keras.optimizers.AdamW(
             learning_rate=lr, weight_decay=1e-4, clipnorm=1.0,
         )
@@ -542,6 +544,10 @@ class EventTimeModel:
                 arch={
                     "model_dim": self.model_dim,
                     "sequence_length": self.sequence_length,
+                    "num_layers": num_layers,
+                    "num_heads": num_heads,
+                    "ff_dim": ff_dim,
+                    "dropout": dropout,
                     "embed_dims": EMBED_DIMS,
                     "roster_dim": ROSTER_DIM,
                 },

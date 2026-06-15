@@ -69,6 +69,7 @@ class ReportCollector:
                  run_name: str | None = None,
                  reports_root: str = DEFAULT_REPORTS_ROOT):
         self.config = config
+        self.run_name = run_name or ""
         self.run_id = run_id or new_run_id(run_name)
         self.artifacts = ReportArtifacts.for_run(
             config.model_key, self.run_id, reports_root
@@ -126,6 +127,7 @@ class ReportCollector:
         report = TrainingReport(
             run_id=self.run_id,
             model_key=self.config.model_key,
+            run_name=self.run_name,
             status=status,
             started_at=self._started.isoformat(timespec="seconds"),
             ended_at=ended.isoformat(timespec="seconds"),

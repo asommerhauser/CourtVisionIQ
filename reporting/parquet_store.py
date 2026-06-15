@@ -28,36 +28,91 @@ from reporting.schema import TrainingReport
 
 
 def run_summary_row(report: TrainingReport) -> dict:
-    """Flatten a report into the single row stored in run.parquet."""
+    """Flatten a report into the single row stored in run.parquet.
+
+    Every field that could drive a comparison query is a native typed column.
+    The *_json blobs remain for lossless round-trips and future fields.
+    """
     cfg = report.config
     env = report.environment
     data = report.data
     minfo = report.model
+    arch = (cfg.arch or {}) if cfg else {}
+    vocab = (data.vocab_sizes or {}) if data else {}
+    norm = (data.norm_stats or {}) if data else {}
+    tm = report.final_test_metrics or {}
+
     return {
+        # --- identity ---
         "run_id": report.run_id,
+        "run_name": report.run_name,
         "model_key": report.model_key,
         "status": report.status,
         "started_at": report.started_at,
         "ended_at": report.ended_at,
         "duration_sec": report.duration_sec,
+        "git_commit": env.git_commit if env else None,
+
+        # --- training outcome ---
         "epochs_planned": cfg.epochs_planned if cfg else None,
         "epochs_run": report.epochs_run,
         "best_epoch": report.best_epoch,
         "best_val_loss": report.best_val_loss,
-        "batch_size": cfg.batch_size if cfg else None,
+
+        # --- optimizer / schedule hyperparameters ---
         "lr": cfg.lr if cfg else None,
+        "batch_size": cfg.batch_size if cfg else None,
         "time_loss_weight": cfg.time_loss_weight if cfg else None,
-        "device": env.device if env else None,
-        "git_commit": env.git_commit if env else None,
+        "patience": cfg.patience if cfg else None,
+        "mixed_precision": cfg.mixed_precision if cfg else None,
+        "jit_compile": cfg.jit_compile if cfg else None,
+
+        # --- architecture hyperparameters ---
+        "model_dim": arch.get("model_dim"),
+        "num_layers": arch.get("num_layers"),
+        "num_heads": arch.get("num_heads"),
+        "ff_dim": arch.get("ff_dim"),
+        "dropout": arch.get("dropout"),
+        "sequence_length": arch.get("sequence_length"),
+        "roster_dim": arch.get("roster_dim"),
+
+        # --- model size ---
         "total_params": minfo.total_params if minfo else None,
+        "trainable_params": minfo.trainable_params if minfo else None,
+        "non_trainable_params": minfo.non_trainable_params if minfo else None,
+
+        # --- data split ---
         "train_games": data.train_games if data else None,
         "test_games": data.test_games if data else None,
-        # Full nested state preserved as JSON so the row schema stays flat/stable.
+
+        # --- vocab sizes (flat, for spotting data-scale differences) ---
+        "vocab_event": vocab.get("event"),
+        "vocab_player": vocab.get("player"),
+        "vocab_type": vocab.get("type"),
+        "vocab_result": vocab.get("result"),
+        "vocab_season": vocab.get("season"),
+
+        # --- time normalization stats ---
+        "norm_max_time": norm.get("max_time"),
+        "norm_delta_mean": norm.get("delta_mean"),
+        "norm_delta_std": norm.get("delta_std"),
+
+        # --- hardware ---
+        "device": env.device if env else None,
+
+        # --- final held-out test metrics (flat for leaderboard queries) ---
+        "test_loss": tm.get("loss"),
+        "test_event_loss": tm.get("event_output_loss"),
+        "test_time_loss": tm.get("time_output_loss"),
+        "test_event_acc": tm.get("event_output_acc"),
+        "test_time_mae": tm.get("time_output_mae"),
+
+        # --- full nested state (lossless; schema-stable escape hatch) ---
         "config_json": json.dumps(cfg.to_dict()) if cfg else None,
         "environment_json": json.dumps(env.to_dict()) if env else None,
         "data_json": json.dumps(data.to_dict()) if data else None,
         "model_json": json.dumps(minfo.to_dict()) if minfo else None,
-        "final_test_metrics_json": json.dumps(report.final_test_metrics),
+        "final_test_metrics_json": json.dumps(tm),
     }
 
 

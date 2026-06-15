@@ -117,9 +117,10 @@ def render(report: TrainingReport) -> str:
     data = report.data
     minfo = report.model
 
+    name_part = f" · <b>{_esc(report.run_name)}</b>" if report.run_name else ""
     header = (
         f"<h1>{_esc(report.model_key)} — training report</h1>"
-        f"<p class='sub'>Run <code>{_esc(report.run_id)}</code> · "
+        f"<p class='sub'>Run <code>{_esc(report.run_id)}</code>{name_part} · "
         f"<span class='badge {_esc(report.status)}'>{_esc(report.status)}</span> · "
         f"{_esc(report.started_at)} → {_esc(report.ended_at)}</p>"
     )

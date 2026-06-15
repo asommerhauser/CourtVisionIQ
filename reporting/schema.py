@@ -103,6 +103,7 @@ class TrainingReport:
 
     run_id: str
     model_key: str
+    run_name: str = ""               # optional human label passed via --run-name
     status: str = "completed"        # completed | early_stopped | failed
     started_at: str = ""
     ended_at: str = ""
@@ -121,6 +122,7 @@ class TrainingReport:
         return {
             "run_id": self.run_id,
             "model_key": self.model_key,
+            "run_name": self.run_name,
             "status": self.status,
             "started_at": self.started_at,
             "ended_at": self.ended_at,
@@ -148,6 +150,7 @@ class TrainingReport:
         return cls(
             run_id=d["run_id"],
             model_key=d["model_key"],
+            run_name=d.get("run_name", ""),
             status=d.get("status", "completed"),
             started_at=d.get("started_at", ""),
             ended_at=d.get("ended_at", ""),
