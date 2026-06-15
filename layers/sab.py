@@ -1,8 +1,9 @@
 from __future__ import annotations
-from tensorflow import keras
+import keras
 from .mab import MAB
 
 
+@keras.saving.register_keras_serializable(package="cviq")
 class SAB(keras.layers.Layer):
     """
     Set Attention Block (SAB).
