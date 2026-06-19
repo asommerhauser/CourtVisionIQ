@@ -10,13 +10,15 @@ except Exception:
 
 from data_cleaner import DataCleaner
 from encoder.encoder import Encoder
-from models.event_time_model import EventTimeModel
+from models.registry import MODEL_REGISTRY
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="CourtVisionIQ pipeline: clean -> preprocess -> train the Event/Time model."
+        description="CourtVisionIQ pipeline: clean -> preprocess -> train a registered model."
     )
+    parser.add_argument("--model", default="event_time", choices=sorted(MODEL_REGISTRY),
+                        help="Which registered model to preprocess/train (default: event_time).")
     parser.add_argument("--clean", action="store_true",
                         help="Re-run raw play-by-play cleaning into ./data first.")
     parser.add_argument("--clean-start", type=int, default=0,
@@ -51,7 +53,7 @@ def main():
     # train() loads vocabs + processed tensors from disk, so --skip-preprocess
     # --train trains on already-preprocessed data without redoing preprocessing.
     encoder = Encoder()
-    model = EventTimeModel(encoder, path=args.data_dir)
+    model = MODEL_REGISTRY[args.model](encoder, path=args.data_dir)
 
     # 2) Build the shared encoding "language" + model-ready tensors.
     if not args.skip_preprocess:

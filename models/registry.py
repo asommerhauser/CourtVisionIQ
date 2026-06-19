@@ -13,8 +13,10 @@ Each registered class must implement the persistence contract:
 from __future__ import annotations
 
 from models.event_time_model import EventTimeModel
+from models.player_model import PlayerModel
 
 # key -> model wrapper class
 MODEL_REGISTRY: dict[str, type] = {
     EventTimeModel.KEY: EventTimeModel,
+    PlayerModel.KEY: PlayerModel,
 }

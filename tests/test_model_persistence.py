@@ -27,6 +27,7 @@ from encoder.encoder import Encoder
 from models.artifacts import ModelArtifacts
 from models.event_time_model import EventTimeModel
 from models.model_bundle import ModelBundle
+from models.player_model import PlayerModel
 
 # Tiny config so the round trip runs fast on CPU.
 TEST_SEQ_LEN = 16
@@ -111,8 +112,68 @@ EVENT_TIME_ADAPTER = ModelTestAdapter(
     assert_outputs=_event_time_assert,
 )
 
+# --------------------------------------------------------------------------- #
+# Player model adapter
+# --------------------------------------------------------------------------- #
+
+def _player_csv(path: Path) -> None:
+    """Three short games; vary the player per row so the player vocab is non-trivial."""
+    players = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+    rows = []
+    for gid, n in [(1, 5), (2, 4), (3, 4)]:
+        for i in range(n):
+            rows.append({
+                "game_id": gid,
+                "roster_home": _roster(["A", "B", "C", "D", "E"]),
+                "roster_away": _roster(["F", "G", "H", "I", "J"]),
+                "time": i * 10,
+                "event": f"ev{gid}_{i}",
+                "player": players[(gid + i) % len(players)],
+                "type": "t",
+                "result": "r",
+                "secondary_player": "none",
+                "season": "2003",
+            })
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def _player_build(encoder, data_dir, processed_dir):
+    return PlayerModel(
+        encoder,
+        sequence_length=TEST_SEQ_LEN,
+        path=str(data_dir),
+        processed_dir=str(processed_dir),
+    )
+
+
+def _player_forward(inst, model) -> dict:
+    split = inst._load_processed("player_test.npz")
+    inputs = {k: split[k] for k in PlayerModel.INPUT_KEYS}
+    out = model(inputs, training=False)
+    return {k: np.asarray(v) for k, v in out.items()}
+
+
+def _player_assert(inst, outputs) -> None:
+    assert set(outputs.keys()) == {"player_output"}
+    player_vocab = inst.encoder.player_vocab.next_token
+    pl = outputs["player_output"]
+    assert pl.ndim == 3 and pl.shape[1] == TEST_SEQ_LEN and pl.shape[2] == player_vocab
+    assert pl.shape[0] >= 1
+    assert np.isfinite(pl).all()
+
+
+PLAYER_ADAPTER = ModelTestAdapter(
+    key=PlayerModel.KEY,
+    model_cls=PlayerModel,
+    seq_len=TEST_SEQ_LEN,
+    make_csv=_player_csv,
+    build=_player_build,
+    forward=_player_forward,
+    assert_outputs=_player_assert,
+)
+
 # New models: append their adapter here to inherit the round-trip coverage below.
-MODEL_TEST_ADAPTERS = [EVENT_TIME_ADAPTER]
+MODEL_TEST_ADAPTERS = [EVENT_TIME_ADAPTER, PLAYER_ADAPTER]
 
 
 # --------------------------------------------------------------------------- #
