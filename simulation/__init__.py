@@ -10,6 +10,13 @@ Monte-Carlo harness (see docs/technical_specs.md → Evaluation Strategy).
 # (see main.py) — keep it first so importing the package never loads pandas ahead of TF.
 from simulation.game_simulator import GameSimulator
 from simulation.box_score import BoxScore, PlayerLine, box_score_for_game, generate_box_score
+from simulation.game_input import (
+    GameInput,
+    extract_game_input,
+    game_input_for_game,
+    holdout_game_inputs,
+    write_holdout_inputs,
+)
 
 __all__ = [
     "GameSimulator",
@@ -17,4 +24,9 @@ __all__ = [
     "PlayerLine",
     "generate_box_score",
     "box_score_for_game",
+    "GameInput",
+    "extract_game_input",
+    "game_input_for_game",
+    "holdout_game_inputs",
+    "write_holdout_inputs",
 ]
