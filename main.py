@@ -8,6 +8,7 @@ try:  # noqa: SIM105
 except Exception:
     pass
 
+from config import HOLDOUT_FRAC
 from data_cleaner import DataCleaner
 from encoder.encoder import Encoder
 from models.registry import MODEL_REGISTRY
@@ -35,6 +36,9 @@ def main():
                         help="Skip preprocessing step (useful when cleaning only).")
     parser.add_argument("--rebuild-vocabs", action="store_true",
                         help="Rebuild vocabs from data instead of loading from disk.")
+    parser.add_argument("--holdout-frac", type=float, default=HOLDOUT_FRAC,
+                        help="Fraction of games fully reserved as a real-game holdout "
+                             "(never trained on or used for early stopping).")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--no-report", action="store_true",
@@ -57,7 +61,7 @@ def main():
 
     # 2) Build the shared encoding "language" + model-ready tensors.
     if not args.skip_preprocess:
-        model.preprocess(rebuild_vocabs=args.rebuild_vocabs)
+        model.preprocess(rebuild_vocabs=args.rebuild_vocabs, holdout_frac=args.holdout_frac)
 
     # 3) Train the Event/Time transformer (if --train flag is provided).
     if args.train:

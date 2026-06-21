@@ -7,7 +7,11 @@ import tensorflow as tf
 import keras
 from keras import layers, Input
 
-from config import MAX_SEQUENCE_LENGTH, ROSTER_SIZE, NORM_STATS_PATH
+from config import (
+    MAX_SEQUENCE_LENGTH, ROSTER_SIZE, NORM_STATS_PATH,
+    SEED, TEST_FRAC, HOLDOUT_FRAC, HOLDOUT_MANIFEST_NAME,
+)
+from data_loading import load_all_cleaned, split_games
 from encoder.encoder import Encoder
 from models.artifacts import ModelArtifacts, DEFAULT_ARTIFACTS_ROOT
 from models.roster_set_encoder import (
@@ -69,6 +73,30 @@ class KeyPaddingMask(layers.Layer):
         return (input_shape[0], 1, input_shape[1])
 
 
+@keras.saving.register_keras_serializable(package="cviq")
+class DeltaSecondsMAE(keras.metrics.MeanAbsoluteError):
+    """Time-head MAE expressed in real seconds.
+
+    The time head predicts standardized deltas ((delta - mean) / std), so the
+    normalized MAE is unit-less. Absolute error scales linearly, so seconds error
+    is just the normalized MAE multiplied by the training delta_std. Subclassing
+    MeanAbsoluteError reuses its accumulation + sample_weight (loss mask) handling
+    so this metric masks PAD/no-next steps exactly like the time loss.
+    """
+
+    def __init__(self, delta_std: float = 1.0, name: str = "mae_sec", **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.delta_std = float(delta_std)
+
+    def result(self):
+        return super().result() * self.delta_std
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"delta_std": self.delta_std})
+        return cfg
+
+
 # Cleaned-data columns the model consumes.
 # secondary_player shares the player embedding table (weight-tied) — see model().
 CATEGORICAL_FIELDS = ["event", "player", "type", "result", "season", "secondary_player"]
@@ -113,39 +141,29 @@ class EventTimeModel:
     # --- Data Loading  ---
     # =====================
 
-    def _cleaned_csvs(self):
-        """Cleaned season files only (have game_id + roster columns)."""
-        out = []
-        for p in sorted(self.data_dir.glob("*.csv")):
-            try:
-                cols = pd.read_csv(p, nrows=0).columns
-            except Exception:
-                continue
-            if "game_id" in cols and "roster_home" in cols:
-                out.append(p)
-        return out
-
     def _load_all(self) -> pd.DataFrame:
-        frames = []
-        offset = 0
-        for p in self._cleaned_csvs():
-            df = pd.read_csv(p)
-            # Keep game_id globally unique across files.
-            df["game_id"] = df["game_id"].astype(int) + offset
-            offset = int(df["game_id"].max()) + 1
-            frames.append(df)
-        if not frames:
-            raise FileNotFoundError(f"No cleaned CSVs found in {self.data_dir.resolve()}")
-        return pd.concat(frames, ignore_index=True)
+        """Cleaned season files concatenated with globally-unique game_id.
+
+        Delegates to the shared loader so the box-score validation and every model see the
+        same games under the same numbering.
+        """
+        return load_all_cleaned(self.data_dir)
 
     # =====================
     # --- Preprocessing ---
     # =====================
 
-    def preprocess(self, rebuild_vocabs=True, test_frac=0.2, seed=42):
+    def preprocess(self, rebuild_vocabs=True, test_frac=TEST_FRAC,
+                   holdout_frac=HOLDOUT_FRAC, seed=SEED):
         """
         Build the model-ready tensor arrays and persist them, the vocabs, and the
         time-normalization stats. Returns (train, test) dicts of numpy arrays.
+
+        Games are partitioned three ways (see ``data_loading.split_games``): ``train``,
+        ``test`` (the early-stopping validation split), and ``holdout`` — a fully reserved
+        batch of real games the model never sees, for unbiased real-game testing. The
+        holdout game ids are written to a manifest so the box-score validation can find
+        exactly those games.
         """
         df = self._load_all()
 
@@ -176,13 +194,11 @@ class EventTimeModel:
             df.groupby("game_id")["time"].diff().fillna(0).clip(lower=0).to_numpy(dtype=np.float64)
         )
 
-        # 4) Split games into train/test BEFORE computing normalization stats.
-        unique_games = np.unique(game_id)
-        rng = np.random.default_rng(seed)
-        rng.shuffle(unique_games)
-        n_test = max(1, int(round(len(unique_games) * test_frac)))
-        test_games = set(unique_games[:n_test].tolist())
-        train_games = set(unique_games[n_test:].tolist())
+        # 4) Split games into train/test/holdout BEFORE computing normalization stats.
+        #    The holdout is carved off first and excluded from both train and test.
+        train_games, test_games, holdout_games = split_games(
+            np.unique(game_id), seed=seed, test_frac=test_frac, holdout_frac=holdout_frac,
+        )
 
         train_mask = np.array([g in train_games for g in game_id])
 
@@ -207,16 +223,23 @@ class EventTimeModel:
         }
         train = self._build_split(cols, game_id, train_games)
         test = self._build_split(cols, game_id, test_games)
+        holdout = self._build_split(cols, game_id, holdout_games)
 
-        # 7) Persist.
+        # 7) Persist. Holdout tensors enable event-level eval; the manifest of holdout
+        #    game ids is the contract the box-score validation reads to load real games.
         self.processed_dir.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(self.processed_dir / "train.npz", **train)
         np.savez_compressed(self.processed_dir / "test.npz", **test)
+        np.savez_compressed(self.processed_dir / "holdout.npz", **holdout)
+        (self.processed_dir / HOLDOUT_MANIFEST_NAME).write_text(
+            json.dumps(sorted(int(g) for g in holdout_games), indent=2), encoding="utf-8"
+        )
         Path(NORM_STATS_PATH).parent.mkdir(parents=True, exist_ok=True)
         Path(NORM_STATS_PATH).write_text(json.dumps(self.norm_stats, indent=2), encoding="utf-8")
 
-        print(f"Preprocessed {len(train_games)} train / {len(test_games)} test games "
-              f"-> {self.processed_dir} (SEQ={self.sequence_length})")
+        print(f"Preprocessed {len(train_games)} train / {len(test_games)} test / "
+              f"{len(holdout_games)} holdout games -> {self.processed_dir} "
+              f"(SEQ={self.sequence_length})")
         return train, test
 
     def _build_split(self, cols, game_id, games) -> dict:
@@ -294,7 +317,7 @@ class EventTimeModel:
     # --- Model / Train ---
     # =====================
 
-    def build_roster_encoder(self) -> SequenceRosterEncoder:
+    def build_roster_encoder(self, dropout: float = 0.1) -> SequenceRosterEncoder:
         num_players = self.encoder.player_vocab.next_token
         params = RosterEncoderParams(
             roster_size=ROSTER_SIZE,
@@ -303,13 +326,13 @@ class EventTimeModel:
             num_sab_layers=2,
             num_heads=4,
             d_ff=256,
-            dropout=0.1,
+            dropout=dropout,
         )
         # Applies the shared set-encoder across the time axis via reshape (not
         # TimeDistributed, which unrolls SEQ in graph mode and exhausts memory).
         return SequenceRosterEncoder(params, name="roster_vec")
 
-    def model(self, num_layers=4, num_heads=8, ff_dim=1024, dropout=0.1):
+    def model(self, num_layers=4, num_heads=8, ff_dim=1024, dropout=0.2):
         """
         Build the causal Event/Time Transformer.
 
@@ -327,7 +350,7 @@ class EventTimeModel:
         event_vocab_size = self.encoder.event_vocab.next_token
 
         # Shared roster set-encoder (weight-tied across home/away).
-        self.roster_encoder = self.build_roster_encoder()
+        self.roster_encoder = self.build_roster_encoder(dropout=dropout)
 
         # ---- Inputs ----
         cat_inputs = {
@@ -468,9 +491,10 @@ class EventTimeModel:
         return gpus
 
     def train(self, epochs=50, batch_size=64, lr=3e-4, time_loss_weight=0.25,
-              patience=6, artifacts_root=DEFAULT_ARTIFACTS_ROOT,
+              patience=10, artifacts_root=DEFAULT_ARTIFACTS_ROOT,
               mixed_precision=True, jit_compile=False,
-              num_layers=4, num_heads=8, ff_dim=1024, dropout=0.1,
+              num_layers=4, num_heads=8, ff_dim=1024, dropout=0.2,
+              warmup_epochs=1, lr_alpha=0.05,
               report=True, run_name=None, reports_root=DEFAULT_REPORTS_ROOT):
         """
         Fit the Event/Time model on the preprocessed train split, validating on
@@ -506,9 +530,32 @@ class EventTimeModel:
 
         model = self.model(num_layers=num_layers, num_heads=num_heads,
                            ff_dim=ff_dim, dropout=dropout)
-        optimizer = keras.optimizers.AdamW(
-            learning_rate=lr, weight_decay=1e-4, clipnorm=1.0,
+        # Print the per-layer table + Total/Trainable/Non-trainable params to the
+        # console each run (the report also records these in its Model size table).
+        model.summary()
+
+        # Warmup + cosine-decay LR schedule. The old ReduceLROnPlateau collapsed the
+        # LR once loss flattened, stalling learning while the curve was still flat;
+        # a warmup-then-cosine schedule keeps the LR meaningful across the whole run
+        # and is the cleaner fix for an early plateau. (A schedule and plateau-based
+        # reduction don't compose, so ReduceLROnPlateau is dropped.)
+        steps_per_epoch = int(np.ceil(train_split["pad_mask"].shape[0] / batch_size))
+        total_steps = steps_per_epoch * epochs
+        warmup_steps = steps_per_epoch * warmup_epochs
+        decay_steps = max(1, total_steps - warmup_steps)
+        lr_schedule = keras.optimizers.schedules.CosineDecay(
+            initial_learning_rate=0.0,   # start of linear warmup
+            warmup_target=lr,            # peak LR reached after warmup
+            warmup_steps=warmup_steps,
+            decay_steps=decay_steps,     # cosine decay phase after warmup
+            alpha=lr_alpha,              # floor = lr_alpha * lr
         )
+        optimizer = keras.optimizers.AdamW(
+            learning_rate=lr_schedule, weight_decay=1e-4, clipnorm=1.0,
+        )
+        # Time head is trained on standardized deltas; mae_sec reports the same error
+        # in real seconds (normalized MAE * delta_std) so convergence is readable.
+        delta_std = float((self.norm_stats or {}).get("delta_std", 1.0) or 1.0)
         model.compile(
             optimizer=optimizer,
             loss={
@@ -518,15 +565,15 @@ class EventTimeModel:
             loss_weights={"event_output": 1.0, "time_output": time_loss_weight},
             metrics={
                 "event_output": [keras.metrics.SparseCategoricalAccuracy(name="acc")],
-                "time_output": [keras.metrics.MeanAbsoluteError(name="mae")],
+                "time_output": [
+                    keras.metrics.MeanAbsoluteError(name="mae"),
+                    DeltaSecondsMAE(delta_std, name="mae_sec"),
+                ],
             },
             jit_compile=jit_compile,
         )
 
         callbacks = [
-            keras.callbacks.ReduceLROnPlateau(
-                monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6,
-            ),
             keras.callbacks.EarlyStopping(
                 monitor="val_loss", patience=patience, restore_best_weights=True,
             ),
@@ -550,6 +597,9 @@ class EventTimeModel:
                     "dropout": dropout,
                     "embed_dims": EMBED_DIMS,
                     "roster_dim": ROSTER_DIM,
+                    "lr_schedule": "warmup_cosine",
+                    "warmup_epochs": warmup_epochs,
+                    "lr_alpha": lr_alpha,
                 },
             )
             collector = ReportCollector(cfg, run_name=run_name, reports_root=reports_root)

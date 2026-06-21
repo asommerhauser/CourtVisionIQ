@@ -7,7 +7,11 @@ import tensorflow as tf
 import keras
 from keras import layers, Input
 
-from config import MAX_SEQUENCE_LENGTH, ROSTER_SIZE, NORM_STATS_PATH
+from config import (
+    MAX_SEQUENCE_LENGTH, ROSTER_SIZE, NORM_STATS_PATH,
+    SEED, TEST_FRAC, HOLDOUT_FRAC, HOLDOUT_MANIFEST_NAME,
+)
+from data_loading import load_all_cleaned, split_games
 from encoder.encoder import Encoder
 from models.artifacts import ModelArtifacts, DEFAULT_ARTIFACTS_ROOT
 from models.event_time_model import (
@@ -77,41 +81,24 @@ class PlayerModel:
     # Identical loader to EventTimeModel: cleaned season files (game_id + roster cols),
     # game_id kept globally unique across files.
 
-    def _cleaned_csvs(self):
-        out = []
-        for p in sorted(self.data_dir.glob("*.csv")):
-            try:
-                cols = pd.read_csv(p, nrows=0).columns
-            except Exception:
-                continue
-            if "game_id" in cols and "roster_home" in cols:
-                out.append(p)
-        return out
-
     def _load_all(self) -> pd.DataFrame:
-        frames = []
-        offset = 0
-        for p in self._cleaned_csvs():
-            df = pd.read_csv(p)
-            df["game_id"] = df["game_id"].astype(int) + offset
-            offset = int(df["game_id"].max()) + 1
-            frames.append(df)
-        if not frames:
-            raise FileNotFoundError(f"No cleaned CSVs found in {self.data_dir.resolve()}")
-        return pd.concat(frames, ignore_index=True)
+        """Cleaned season files concatenated with globally-unique game_id (shared loader)."""
+        return load_all_cleaned(self.data_dir)
 
     # =====================
     # --- Preprocessing ---
     # =====================
 
-    def preprocess(self, rebuild_vocabs=False, test_frac=0.2, seed=42):
+    def preprocess(self, rebuild_vocabs=False, test_frac=TEST_FRAC,
+                   holdout_frac=HOLDOUT_FRAC, seed=SEED):
         """
         Build the model-ready tensor arrays and persist them + the time-norm stats.
 
-        Same loader / encoding / Δt normalization / train-test game split (same
-        ``seed`` + ``test_frac`` as EventTimeModel, so the split and norm_stats line
-        up). ``rebuild_vocabs`` defaults to False because the shared vocab language is
-        already built + frozen by the Event/Time model; we just load + freeze it.
+        Same loader / encoding / Δt normalization / train-val-holdout game split (same
+        ``seed`` + ``test_frac`` + ``holdout_frac`` as EventTimeModel, so the splits and
+        norm_stats line up exactly). ``rebuild_vocabs`` defaults to False because the
+        shared vocab language is already built + frozen by the Event/Time model; we just
+        load + freeze it.
 
         Adds, vs EventTimeModel: the conditioning inputs ``next_event`` /
         ``next_delta_time`` and the ``player_target`` (all the next-step shift).
@@ -143,13 +130,11 @@ class PlayerModel:
             df.groupby("game_id")["time"].diff().fillna(0).clip(lower=0).to_numpy(dtype=np.float64)
         )
 
-        # Split games train/test BEFORE computing normalization stats.
-        unique_games = np.unique(game_id)
-        rng = np.random.default_rng(seed)
-        rng.shuffle(unique_games)
-        n_test = max(1, int(round(len(unique_games) * test_frac)))
-        test_games = set(unique_games[:n_test].tolist())
-        train_games = set(unique_games[n_test:].tolist())
+        # Split games train/test/holdout BEFORE computing normalization stats (shared
+        # logic + same seed/fracs as EventTimeModel, so the partitions line up exactly).
+        train_games, test_games, holdout_games = split_games(
+            np.unique(game_id), seed=seed, test_frac=test_frac, holdout_frac=holdout_frac,
+        )
 
         train_mask = np.array([g in train_games for g in game_id])
 
@@ -172,13 +157,21 @@ class PlayerModel:
         }
         train = self._build_split(cols, game_id, train_games)
         test = self._build_split(cols, game_id, test_games)
+        holdout = self._build_split(cols, game_id, holdout_games)
 
         self.processed_dir.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(self.processed_dir / "player_train.npz", **train)
         np.savez_compressed(self.processed_dir / "player_test.npz", **test)
+        np.savez_compressed(self.processed_dir / "player_holdout.npz", **holdout)
+        # Identical (deterministic) holdout manifest as EventTimeModel — write it so a
+        # Player-only preprocess still leaves the contract in place.
+        (self.processed_dir / HOLDOUT_MANIFEST_NAME).write_text(
+            json.dumps(sorted(int(g) for g in holdout_games), indent=2), encoding="utf-8"
+        )
 
-        print(f"Preprocessed {len(train_games)} train / {len(test_games)} test games "
-              f"-> {self.processed_dir} (SEQ={self.sequence_length})")
+        print(f"Preprocessed {len(train_games)} train / {len(test_games)} test / "
+              f"{len(holdout_games)} holdout games -> {self.processed_dir} "
+              f"(SEQ={self.sequence_length})")
         return train, test
 
     def _build_split(self, cols, game_id, games) -> dict:
