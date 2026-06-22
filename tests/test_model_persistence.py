@@ -29,6 +29,11 @@ from models.conditional_type_model import _PROCESSED, CONDITIONAL_MODEL_CLASSES
 from models.event_time_model import EventTimeModel
 from models.model_bundle import ModelBundle
 from models.player_model import PlayerModel
+from models.substitution_model import (
+    _PROCESSED as _SUB_PROCESSED,
+    SUB_EVENT,
+    SubstitutionModel,
+)
 
 # Tiny config so the round trip runs fast on CPU.
 TEST_SEQ_LEN = 16
@@ -252,10 +257,76 @@ def _conditional_adapter(model_cls) -> ModelTestAdapter:
     )
 
 
+# --------------------------------------------------------------------------- #
+# Substitution head (predicts the incoming player; openers synthesized in-preprocess)
+# --------------------------------------------------------------------------- #
+
+def _substitution_csv(path: Path) -> None:
+    """Three short games with a start frame + real subs, so each game yields opening
+    subs (synthesized in preprocess) and in-game sub placements for the masked loss."""
+    home, away = ["A", "B", "C", "D", "E"], ["F", "G", "H", "I", "J"]
+    bench = {"A": "K", "F": "L", "B": "M"}  # outgoing -> incoming for in-game subs
+    rows = []
+    for gid, subs in [(1, [("A", "K"), ("F", "L")]), (2, [("B", "M")]), (3, [("A", "K")])]:
+        rows.append({
+            "game_id": gid, "roster_home": _roster(home), "roster_away": _roster(away),
+            "time": 0, "event": "start", "player": "start", "type": "start",
+            "result": "start", "secondary_player": "none", "season": "2003", "playoff": 1,
+        })
+        rows.append({
+            "game_id": gid, "roster_home": _roster(home), "roster_away": _roster(away),
+            "time": 10, "event": "shot", "player": "A", "type": "2pt", "result": "made",
+            "secondary_player": "none", "season": "2003", "playoff": 1,
+        })
+        for j, (out, inc) in enumerate(subs):
+            rows.append({
+                "game_id": gid, "roster_home": _roster(home), "roster_away": _roster(away),
+                "time": 20 + j * 10, "event": SUB_EVENT, "player": out, "type": SUB_EVENT,
+                "result": SUB_EVENT, "secondary_player": inc, "season": "2003", "playoff": 1,
+            })
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def _substitution_build(encoder, data_dir, processed_dir):
+    return SubstitutionModel(
+        encoder,
+        sequence_length=TEST_SEQ_LEN,
+        path=str(data_dir),
+        processed_dir=str(processed_dir),
+    )
+
+
+def _substitution_forward(inst, model) -> dict:
+    split = inst._load_processed(_SUB_PROCESSED["test"])
+    inputs = {k: split[k] for k in inst.INPUT_KEYS}
+    out = model(inputs, training=False)
+    return {k: np.asarray(v) for k, v in out.items()}
+
+
+def _substitution_assert(inst, outputs) -> None:
+    assert set(outputs.keys()) == {inst.output_name}
+    player_vocab = inst.encoder.player_vocab.next_token
+    o = outputs[inst.output_name]
+    assert o.ndim == 3 and o.shape[1] == TEST_SEQ_LEN and o.shape[2] == player_vocab
+    assert o.shape[0] >= 1
+    assert np.isfinite(o).all()
+
+
+SUBSTITUTION_ADAPTER = ModelTestAdapter(
+    key=SubstitutionModel.KEY,
+    model_cls=SubstitutionModel,
+    seq_len=TEST_SEQ_LEN,
+    make_csv=_substitution_csv,
+    build=_substitution_build,
+    forward=_substitution_forward,
+    assert_outputs=_substitution_assert,
+)
+
+
 # New models: append their adapter here to inherit the round-trip coverage below.
 MODEL_TEST_ADAPTERS = [EVENT_TIME_ADAPTER, PLAYER_ADAPTER] + [
     _conditional_adapter(cls) for cls in CONDITIONAL_MODEL_CLASSES
-]
+] + [SUBSTITUTION_ADAPTER]
 
 
 # --------------------------------------------------------------------------- #

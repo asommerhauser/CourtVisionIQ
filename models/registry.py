@@ -15,6 +15,7 @@ from __future__ import annotations
 from models.conditional_type_model import CONDITIONAL_MODEL_CLASSES
 from models.event_time_model import EventTimeModel
 from models.player_model import PlayerModel
+from models.substitution_model import SubstitutionModel
 
 # key -> model wrapper class
 MODEL_REGISTRY: dict[str, type] = {
@@ -23,4 +24,6 @@ MODEL_REGISTRY: dict[str, type] = {
     # Conditional type/result heads (shot_type, shot_result, assist_type,
     # turnover_type, foul_type) — each a spec-bound ConditionalTypeModel subclass.
     **{cls.KEY: cls for cls in CONDITIONAL_MODEL_CLASSES},
+    # Substitution head: predicts the incoming player of a substitution.
+    SubstitutionModel.KEY: SubstitutionModel,
 }

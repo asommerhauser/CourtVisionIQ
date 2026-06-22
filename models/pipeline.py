@@ -27,6 +27,7 @@ from models.conditional_type_model import CONDITIONAL_MODEL_CLASSES
 from models.event_time_model import EventTimeModel
 from models.model_bundle import ModelBundle
 from models.player_model import PlayerModel
+from models.substitution_model import SubstitutionModel
 
 
 def run_all(data_dir: str = "./data", artifacts_root: str = DEFAULT_ARTIFACTS_ROOT,
@@ -69,6 +70,15 @@ def run_all(data_dir: str = "./data", artifacts_root: str = DEFAULT_ARTIFACTS_RO
             model.preprocess(rebuild_vocabs=False, holdout_frac=holdout_frac)
         if train:
             _train(model, cls.KEY)
+
+    # 4) Substitution head — self-contained preprocess (own sub_*.npz, with the
+    # synthesized opening subs), then train.
+    sub = SubstitutionModel(Encoder(), path=data_dir)
+    if not skip_preprocess:
+        print("[pipeline] preprocess 'substitution' (sub_*.npz w/ opening subs)")
+        sub.preprocess(rebuild_vocabs=False, holdout_frac=holdout_frac)
+    if train:
+        _train(sub, SubstitutionModel.KEY)
 
     if train:
         print(f"\n[pipeline] all models trained -> loading bundle from {artifacts_root}")
