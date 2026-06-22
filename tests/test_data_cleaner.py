@@ -430,13 +430,45 @@ def test_substitution_both_nan_skipped(tmp_path):
     assert cleaned[cleaned["event"] == "substitution"].empty
 
 
-def test_substitution_one_player_included(tmp_path):
+def test_substitution_player_is_outgoing_secondary_is_incoming(tmp_path):
+    """Convention: `player` = outgoing (left), `secondary_player` = incoming (entered)."""
+    row = {"event_type": "substitution", "entered": "Zach", "left": "Alice",
+           "h1": "Zach", "h2": HOME[1], "h3": HOME[2], "h4": HOME[3], "h5": HOME[4]}
+    cleaned = _parse(tmp_path, [row])
+    sub = cleaned[cleaned["event"] == "substitution"].iloc[0]
+    assert sub["player"] == "Alice"             # outgoing player
+    assert sub["secondary_player"] == "Zach"    # incoming player
+    assert sub["type"] == "substitution"
+    assert sub["result"] == "substitution"
+
+
+def test_substitution_home_away_identifies_team(tmp_path):
+    """home/away identifies the substituting team via the incoming player, who is on
+    the post-sub five (the outgoing player has already left it). Home sub → 1."""
+    row = {"event_type": "substitution", "entered": "Zach", "left": "Alice",
+           "h1": "Zach", "h2": HOME[1], "h3": HOME[2], "h4": HOME[3], "h5": HOME[4]}
+    cleaned = _parse(tmp_path, [row])
+    sub = cleaned[cleaned["event"] == "substitution"].iloc[0]
+    assert sub["home/away"] == 1
+
+
+def test_substitution_only_incoming_present(tmp_path):
+    """Only `entered` present: outgoing unknown → player='null', incoming kept."""
     row = {"event_type": "substitution", "entered": "Zach", "left": None}
     cleaned = _parse(tmp_path, [row])
     sub = cleaned[cleaned["event"] == "substitution"].iloc[0]
-    assert sub["player"] == "Zach"
+    assert sub["player"] == "null"              # no outgoing → "null" token
     assert sub["type"] == "substitution"        # clean type (not the leaving player)
-    assert sub["secondary_player"] == "none"    # no one left → "none" token
+    assert sub["secondary_player"] == "Zach"    # incoming player
+
+
+def test_substitution_only_outgoing_present(tmp_path):
+    """Only `left` present: incoming unknown → secondary_player='none'."""
+    row = {"event_type": "substitution", "entered": None, "left": "Alice"}
+    cleaned = _parse(tmp_path, [row])
+    sub = cleaned[cleaned["event"] == "substitution"].iloc[0]
+    assert sub["player"] == "Alice"             # outgoing player
+    assert sub["secondary_player"] == "none"    # no one entered → "none" token
 
 
 # ---------------------------------------------------------------------------

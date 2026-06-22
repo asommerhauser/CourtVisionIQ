@@ -413,20 +413,27 @@ class DataCleaner:
 
         # ---- SUBSTITUTION ----
         if row["event_type"] == "substitution":
-            entered = row["entered"]
-            left = row["left"]
+            entered = row["entered"]  # incoming player (off the bench)
+            left = row["left"]        # outgoing player (on the active five)
             if pd.isna(entered) and pd.isna(left):
                 return events
+            # Convention: `player` is the OUTGOING player (predicted by the Player
+            # model, sampled from the active roster) and `secondary_player` is the
+            # INCOMING player (predicted by the Substitution model, sampled from the
+            # bench). The sub row's lineups are post-substitution, so home/away keys
+            # off the INCOMING player (who is on the resulting five); the outgoing
+            # player has already left it. Fall back to the outgoing if no one entered.
+            sub_ref = entered if pd.notna(entered) else left
             events.append({
                 "roster_home": clean_home,
                 "roster_away": clean_away,
                 "time": time_safe,
                 "event": "substitution",
-                "player": entered if pd.notna(entered) else "null",
+                "player": left if pd.notna(left) else "null",
                 "type": "substitution",
                 "result": "substitution",
-                "secondary_player": left if pd.notna(left) else "none",
-                "home/away": home,
+                "secondary_player": entered if pd.notna(entered) else "none",
+                "home/away": self.home_indicator(clean_home, sub_ref),
                 "season": self.season,
                 "playoff": 2 if self.playoff else 1,
             })
