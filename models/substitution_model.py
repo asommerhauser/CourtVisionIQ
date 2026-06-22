@@ -123,29 +123,31 @@ class SubstitutionModel:
         rows: list[dict] = []
         for k in range(1, len(home_starters) + 1):
             rows.append(self._sub_row(start_row, home_starters[k - 1],
-                                      home_roster=home_starters[:k], away_roster=[], home_away=1))
+                                      home_roster=home_starters[:k], away_roster=[]))
         for k in range(1, len(away_starters) + 1):
             rows.append(self._sub_row(start_row, away_starters[k - 1],
-                                      home_roster=home_starters, away_roster=away_starters[:k],
-                                      home_away=2))
+                                      home_roster=home_starters, away_roster=away_starters[:k]))
         return rows
 
-    def _sub_row(self, start_row, incoming, home_roster, away_roster, home_away) -> dict:
-        """One synthetic opening sub: outgoing = ``"start"``, incoming = a starter, time 0."""
-        return {
-            "game_id": start_row["game_id"],
+    def _sub_row(self, start_row, incoming, home_roster, away_roster) -> dict:
+        """One synthetic opening sub: outgoing = ``"start"``, incoming = a starter, time 0.
+
+        Inherits all columns from the game's ``start`` row (game_id, season, playoff, …)
+        and overrides only the substitution-specific fields, so the synthetic rows align
+        exactly with the cleaned-data columns regardless of which are present.
+        """
+        row = start_row.to_dict()
+        row.update({
             "roster_home": list(home_roster),
             "roster_away": list(away_roster),
             "time": 0,
             "event": SUB_EVENT,
-            OUTGOING_FIELD: START_TOKEN,
+            OUTGOING_FIELD: START_TOKEN,  # outgoing = "start"
             "type": SUB_EVENT,
             "result": SUB_EVENT,
-            INCOMING_FIELD: incoming,
-            "home/away": home_away,
-            "season": start_row["season"],
-            "playoff": start_row["playoff"],
-        }
+            INCOMING_FIELD: incoming,     # incoming = a starter
+        })
+        return row
 
     def _augment_with_opening_subs(self, df: pd.DataFrame) -> pd.DataFrame:
         """Insert the synthetic opening subs after each game's ``start`` frame.
