@@ -12,6 +12,7 @@ Each registered class must implement the persistence contract:
 """
 from __future__ import annotations
 
+from models.conditional_type_model import CONDITIONAL_MODEL_CLASSES
 from models.event_time_model import EventTimeModel
 from models.player_model import PlayerModel
 
@@ -19,4 +20,7 @@ from models.player_model import PlayerModel
 MODEL_REGISTRY: dict[str, type] = {
     EventTimeModel.KEY: EventTimeModel,
     PlayerModel.KEY: PlayerModel,
+    # Conditional type/result heads (shot_type, shot_result, assist_type,
+    # turnover_type, foul_type) — each a spec-bound ConditionalTypeModel subclass.
+    **{cls.KEY: cls for cls in CONDITIONAL_MODEL_CLASSES},
 }

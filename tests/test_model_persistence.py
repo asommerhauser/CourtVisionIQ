@@ -25,6 +25,7 @@ import pytest
 
 from encoder.encoder import Encoder
 from models.artifacts import ModelArtifacts
+from models.conditional_type_model import _PROCESSED, CONDITIONAL_MODEL_CLASSES
 from models.event_time_model import EventTimeModel
 from models.model_bundle import ModelBundle
 from models.player_model import PlayerModel
@@ -172,8 +173,89 @@ PLAYER_ADAPTER = ModelTestAdapter(
     assert_outputs=_player_assert,
 )
 
+# --------------------------------------------------------------------------- #
+# Conditional type/result heads (shot_type, shot_result, assist_type, ...)
+# --------------------------------------------------------------------------- #
+
+def _conditional_csv(path: Path) -> None:
+    """Three short games whose rows exercise every conditional head's event.
+
+    Each game interleaves shot / rebound / assist / turnover / foul with varied
+    type+result values, so each head sees its event followed by a next step (a valid
+    masked target) and the type/result vocabs are non-trivial.
+    """
+    players = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+    home, away = ["A", "B", "C", "D", "E"], ["F", "G", "H", "I", "J"]
+    # (event, type, result) templates cycled through each game.
+    plays = [
+        ("shot", "2pt", "made"),
+        ("rebound", "defensive", "cop"),
+        ("shot", "3pt", "missed"),
+        ("assist", "2pt", "score"),
+        ("turnover", "steal", "cop"),
+        ("foul", "shooting", "free throw"),
+        ("shot", "free throw", "made"),
+        ("turnover", "violation", "cop"),
+        ("foul", "personal", "nothing"),
+        ("assist", "3pt", "score"),
+    ]
+    rows = []
+    for gid, n in [(1, 10), (2, 9), (3, 9)]:
+        rows.append({
+            "game_id": gid, "roster_home": _roster(home), "roster_away": _roster(away),
+            "time": 0, "event": "start", "player": "start", "type": "start",
+            "result": "start", "secondary_player": "none", "season": "2003",
+        })
+        for i in range(n):
+            ev, tp, rs = plays[i % len(plays)]
+            rows.append({
+                "game_id": gid, "roster_home": _roster(home), "roster_away": _roster(away),
+                "time": (i + 1) * 10, "event": ev, "player": players[(gid + i) % len(players)],
+                "type": tp, "result": rs, "secondary_player": "none", "season": "2003",
+            })
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def _conditional_adapter(model_cls) -> ModelTestAdapter:
+    """Build a round-trip adapter for one spec-bound ConditionalTypeModel subclass."""
+
+    def build(encoder, data_dir, processed_dir):
+        return model_cls(
+            encoder,
+            sequence_length=TEST_SEQ_LEN,
+            path=str(data_dir),
+            processed_dir=str(processed_dir),
+        )
+
+    def forward(inst, model) -> dict:
+        split = inst._load_processed(_PROCESSED["test"])
+        inputs = {k: split[k] for k in inst.INPUT_KEYS}
+        out = model(inputs, training=False)
+        return {k: np.asarray(v) for k, v in out.items()}
+
+    def assert_outputs(inst, outputs) -> None:
+        assert set(outputs.keys()) == {inst.output_name}
+        target_vocab = inst.encoder.vocabs[inst.spec.target_field].next_token
+        o = outputs[inst.output_name]
+        assert o.ndim == 3 and o.shape[1] == TEST_SEQ_LEN and o.shape[2] == target_vocab
+        assert o.shape[0] >= 1
+        assert np.isfinite(o).all()
+
+    return ModelTestAdapter(
+        key=model_cls.KEY,
+        model_cls=model_cls,
+        seq_len=TEST_SEQ_LEN,
+        make_csv=_conditional_csv,
+        build=build,
+        forward=forward,
+        assert_outputs=assert_outputs,
+    )
+
+
 # New models: append their adapter here to inherit the round-trip coverage below.
-MODEL_TEST_ADAPTERS = [EVENT_TIME_ADAPTER, PLAYER_ADAPTER]
+MODEL_TEST_ADAPTERS = [EVENT_TIME_ADAPTER, PLAYER_ADAPTER] + [
+    _conditional_adapter(cls) for cls in CONDITIONAL_MODEL_CLASSES
+]
 
 
 # --------------------------------------------------------------------------- #
