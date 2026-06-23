@@ -88,13 +88,12 @@ pip install --upgrade pip
 ## 4. Install GPU TensorFlow + repo deps
 
 ```bash
-pip install "tensorflow[and-cuda]==2.20.0"  # CUDA + cuDNN bundled via pip
-pip install pandas numpy pytest             # repo runtime deps
+pip install -r requirements-gpu.txt   # all deps + tensorflow[and-cuda] (CUDA + cuDNN via pip)
 ```
 
-> Pinned to 2.20.0 to match `keras==3.12.0`. If you let `[and-cuda]` float to a
-> different 2.x minor, keep it on a Keras-3 release and re-run `pytest` to confirm
-> parity.
+> `requirements-gpu.txt` is identical to `requirements.txt` except `tensorflow==2.20.0`
+> is replaced with `tensorflow[and-cuda]==2.20.0`. The Windows wheel is CPU-only; the
+> `[and-cuda]` extra is the Linux/WSL GPU path. Pinned to 2.20.0 to match `keras==3.12.0`.
 
 ## 5. Confirm the GPU is visible to TF
 

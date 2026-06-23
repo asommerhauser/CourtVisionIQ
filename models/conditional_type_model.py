@@ -62,6 +62,13 @@ from models.roster_set_encoder import (
     RosterEncoderParams,
     SequenceRosterEncoder,
 )
+from models.season_features import (
+    SEASON_INPUT_KEYS,
+    merge_season_features,
+    append_season_batches,
+    make_season_inputs,
+    season_team_projections,
+)
 from reporting import ReportCollector, RunConfig
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
 
@@ -81,13 +88,18 @@ class TypeGenSpec:
     condition_fields: tuple        # extra decided fields, e.g. ("player",) or ("player", "type")
 
 
-# The learned set (exactly the prior solution's, minus the deterministic-result heads).
+# The learned set (the prior solution's, minus the deterministic-result heads, plus the
+# rebound-type head). ``rebound_type`` carries NO ``condition_fields``: the off/def split is
+# decided from history alone (``next_event`` / ``next_delta_time``) *before* the rebounder is
+# picked, so it does not condition on ``next_player`` — the controller samples the type first,
+# then the rebounder from the team that type implies.
 TYPE_GEN_SPECS: dict[str, TypeGenSpec] = {
     "shot_type":     TypeGenSpec("shot_type",     "shot",     "type",   ("player",)),
     "shot_result":   TypeGenSpec("shot_result",   "shot",     "result", ("player", "type")),
     "assist_type":   TypeGenSpec("assist_type",   "assist",   "type",   ("player",)),
     "turnover_type": TypeGenSpec("turnover_type", "turnover", "type",   ("player",)),
     "foul_type":     TypeGenSpec("foul_type",     "foul",     "type",   ("player",)),
+    "rebound_type":  TypeGenSpec("rebound_type",  "rebound",  "type",   ()),
 }
 
 # Shared family file names: one preprocess feeds every head (see module docstring).
@@ -96,7 +108,8 @@ _PROCESSED = {"train": "cond_train.npz", "test": "cond_test.npz", "holdout": "co
 # Base history inputs (the Event/Time inputs); conditioning inputs are appended per-spec.
 _BASE_INPUT_KEYS = (
     "event", "player", "type", "result", "season", "secondary_player",
-    "home_roster", "away_roster", "time_abs", "delta_time", "pad_mask",
+    "home_roster", "away_roster", "time_abs", "delta_time",
+    *SEASON_INPUT_KEYS, "pad_mask",
 )
 
 
@@ -216,6 +229,9 @@ class ConditionalTypeModel:
             "time_abs": time_abs,
             "delta_time": delta_norm,
         }
+        merge_season_features(
+            df, cols, rosters, self.encoder.encode_player("PAD"), train_mask, self.norm_stats
+        )
         train = self._build_split(cols, game_id, train_games)
         test = self._build_split(cols, game_id, test_games)
         holdout = self._build_split(cols, game_id, holdout_games)
@@ -274,7 +290,7 @@ class ConditionalTypeModel:
         keys_cont = ["time_abs", "delta_time"]
         keys_next_cat = ["next_event", "next_player", "next_type", "next_result"]
 
-        batches = {k: [] for k in (*keys_1d, *keys_roster, *keys_cont,
+        batches = {k: [] for k in (*keys_1d, *keys_roster, *keys_cont, *SEASON_INPUT_KEYS,
                                    *keys_next_cat, "next_delta_time",
                                    "pad_mask", "loss_mask")}
 
@@ -301,6 +317,8 @@ class ConditionalTypeModel:
                 buf = np.zeros((SEQ, 1), dtype=np.float32)
                 buf[:n, 0] = cols[k][idx]
                 batches[k].append(buf)
+
+            append_season_batches(batches, cols, idx, n, SEQ)
 
             # Conditioning / target arrays: next-step shift within this game.
             for k in keys_next_cat:
@@ -368,6 +386,7 @@ class ConditionalTypeModel:
         away_roster = Input(shape=(SEQ, ROSTER_SIZE), dtype="int32", name="away_roster")
         time_abs = Input(shape=(SEQ, 1), dtype="float32", name="time_abs")
         delta_time = Input(shape=(SEQ, 1), dtype="float32", name="delta_time")
+        rest_home, rest_away, team_inputs = make_season_inputs(SEQ)
         next_event = Input(shape=(SEQ,), dtype="int32", name="next_event")
         next_delta_time = Input(shape=(SEQ, 1), dtype="float32", name="next_delta_time")
         pad_mask = Input(shape=(SEQ,), dtype="float32", name="pad_mask")
@@ -401,18 +420,19 @@ class ConditionalTypeModel:
                 layers.Embedding(type_vocab_size, EMBED_DIMS["type"], name="emb_next_type")(cond_inputs["next_type"])
             )
 
-        # ---- Roster encoding across the sequence (shared home/away) ----
-        home_vec = self.roster_encoder(home_roster)
-        away_vec = self.roster_encoder(away_roster)
+        # ---- Roster encoding across the sequence (shared home/away, with per-player rest) ----
+        home_vec = self.roster_encoder([home_roster, rest_home])
+        away_vec = self.roster_encoder([away_roster, rest_away])
 
         # ---- Continuous projections ----
         t_abs = layers.Dense(16, name="time_abs_proj")(time_abs)
         t_delta = layers.Dense(16, name="delta_time_proj")(delta_time)
         t_next_delta = layers.Dense(16, name="next_delta_time_proj")(next_delta_time)
+        t_team = season_team_projections(team_inputs)  # games-played + team rest per side
 
         # ---- Fusion ----
         x = layers.Concatenate(axis=-1, name="fusion_concat")(
-            [*embs, *cond_vecs, home_vec, away_vec, t_abs, t_delta, t_next_delta]
+            [*embs, *cond_vecs, home_vec, away_vec, t_abs, t_delta, t_next_delta, *t_team]
         )
         x = layers.Dense(D, name="fusion_projection")(x)
         x = layers.LayerNormalization(epsilon=1e-6, name="fusion_ln")(x)
@@ -448,6 +468,7 @@ class ConditionalTypeModel:
             **cat_inputs,
             "home_roster": home_roster, "away_roster": away_roster,
             "time_abs": time_abs, "delta_time": delta_time,
+            "rest_home": rest_home, "rest_away": rest_away, **team_inputs,
             "next_event": next_event, "next_delta_time": next_delta_time,
             **cond_inputs,
             "pad_mask": pad_mask,

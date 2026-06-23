@@ -36,14 +36,19 @@ class RosterSetEncoder(keras.layers.Layer):
     """
     Encodes a roster (fixed-length list of player IDs) into a single vector.
 
-    Input:  (B, roster_size) int32 player IDs, PAD-filled (pad_token) for empty slots
+    Input:  [ids, rest] where
+              ids  : (B, roster_size) int32 player IDs, PAD-filled (pad_token) for empties
+              rest : (B, roster_size) float per-player days-since-last-game (season context)
     Output: (B, roster_dim) float roster vector
 
-    The encoder derives its own slot mask from `ids != pad_token` and threads it
-    into every SAB (so PAD slots don't contaminate set self-attention) and into the
-    PMA pooling seed (so the pooled vector ignores PAD players). This keeps the call
-    signature single-input, so it can be wrapped directly in TimeDistributed to run
-    across a (B, SEQ, roster_size) sequence.
+    Per-player rest is projected and added to the player embedding before the set
+    transformer, so freshness rides along with each player's representation (and, since the
+    same encoder feeds every head, influences player selection too). PAD slots are masked
+    out of attention/pooling regardless of their rest value.
+
+    The encoder derives its own slot mask from `ids != pad_token` and threads it into every
+    SAB (so PAD slots don't contaminate set self-attention) and into the PMA pooling seed
+    (so the pooled vector ignores PAD players).
 
     Permutation invariance comes from the Set Transformer architecture, not from any
     ordering of the input ids.
@@ -61,6 +66,9 @@ class RosterSetEncoder(keras.layers.Layer):
             output_dim=params.roster_dim,
             name="player_embedding",
         )
+        # Projects the per-player rest scalar up to roster_dim so it can be added to the
+        # player embedding (mirrors the Dense projections of the model's other scalars).
+        self.rest_proj = layers.Dense(params.roster_dim, name="rest_proj")
         self.sabs = [
             SAB(
                 d_model=params.roster_dim,
@@ -83,37 +91,42 @@ class RosterSetEncoder(keras.layers.Layer):
         self.out_ln = layers.LayerNormalization(epsilon=1e-6, name="out_ln")
 
     def build(self, input_shape):
-        # Force the whole subtree (embedding + SABs + PMA + out_ln) to create its
-        # variables now, by running one dummy pass through the same calls as call().
+        # Force the whole subtree (embedding + rest_proj + SABs + PMA + out_ln) to create
+        # its variables now, by running one dummy pass through the same calls as call().
         # Without this the children build lazily on first call and are "never built"
         # at load time, so saved weights have nowhere to land. (Keras requires a
         # parent build() to create ALL child state.)
         dummy = tf.zeros((1, self.params.roster_size), dtype="int32")
+        dummy_rest = tf.zeros((1, self.params.roster_size, 1), dtype="float32")
         mask = tf.ones((1, 1, self.params.roster_size), dtype="bool")
-        x = self.embed(dummy)
+        x = self.embed(dummy) + self.rest_proj(dummy_rest)
         for sab in self.sabs:
             x = sab(x, attention_mask=mask)
         v = self.pma(x, attention_mask=mask)
         self.out_ln(v)
         super().build(input_shape)
 
-    def call(self, ids, training: bool = False):
-        # ids: (B, roster_size) int32
+    def call(self, inputs, training: bool = False):
+        # inputs: [ids (B, N) int32, rest (B, N) float per-player days-since-last-game]
+        ids, rest = inputs
         # Per-slot validity: True where a real player sits, False for PAD.
         slot_valid = tf.not_equal(ids, self.params.pad_token)          # (B, N) bool
         # Attention mask shaped (B, 1, N): queries (rows / seed) may attend only to
         # valid key slots. Broadcasts over the query axis and over heads.
         attn_mask = slot_valid[:, tf.newaxis, :]                       # (B, 1, N)
 
-        x = self.embed(ids)                                            # (B, N, D)
+        emb = self.embed(ids)                                          # (B, N, D)
+        rest = tf.cast(rest, emb.dtype)[..., tf.newaxis]               # (B, N, 1)
+        x = emb + self.rest_proj(rest)                                 # (B, N, D)
         for sab in self.sabs:
             x = sab(x, training=training, attention_mask=attn_mask)    # (B, N, D)
         v = self.pma(x, training=training, attention_mask=attn_mask)   # (B, D)
         return self.out_ln(v)
 
     def compute_output_shape(self, input_shape):
-        # (B, roster_size) -> (B, roster_dim); lets TimeDistributed build the SEQ axis.
-        return (input_shape[0], self.params.roster_dim)
+        # [ (B, N), (B, N) ] -> (B, roster_dim).
+        ids_shape = input_shape[0]
+        return (ids_shape[0], self.params.roster_dim)
 
     def get_config(self):
         # Flatten the frozen RosterEncoderParams dataclass so Keras can serialize it.
@@ -171,7 +184,8 @@ class SequenceRosterEncoder(keras.layers.Layer):
     """
     Apply a (shared) RosterSetEncoder across a time axis.
 
-    Input:  (B, SEQ, roster_size) int32 player IDs
+    Input:  [rosters (B, SEQ, roster_size) int32 player IDs,
+             rest    (B, SEQ, roster_size) float per-player days-since-last-game]
     Output: (B, SEQ, roster_dim)  float
 
     Implemented with an explicit reshape -> encode -> reshape instead of
@@ -188,19 +202,24 @@ class SequenceRosterEncoder(keras.layers.Layer):
         self.encoder = RosterSetEncoder(params)
 
     def build(self, input_shape):
-        # Build the inner encoder for a (·, roster_size) batch so its weights exist
+        # Build the inner encoder for [ (·, N) ids, (·, N) rest ] so its weights exist
         # before any weight load.
-        self.encoder.build((None, self.params.roster_size))
+        n = self.params.roster_size
+        self.encoder.build([(None, n), (None, n)])
         super().build(input_shape)
 
-    def call(self, rosters, training: bool = False):
+    def call(self, inputs, training: bool = False):
+        rosters, rest = inputs                                  # each (B, SEQ, N)
+        n = self.params.roster_size
         s = tf.shape(rosters)                                   # (B, SEQ, N)
-        flat = tf.reshape(rosters, (-1, self.params.roster_size))   # (B*SEQ, N)
-        v = self.encoder(flat, training=training)              # (B*SEQ, D)
+        flat_ids = tf.reshape(rosters, (-1, n))                 # (B*SEQ, N)
+        flat_rest = tf.reshape(rest, (-1, n))                   # (B*SEQ, N)
+        v = self.encoder([flat_ids, flat_rest], training=training)  # (B*SEQ, D)
         return tf.reshape(v, (s[0], s[1], self.params.roster_dim))  # (B, SEQ, D)
 
     def compute_output_shape(self, input_shape):
-        return (input_shape[0], input_shape[1], self.params.roster_dim)
+        rosters_shape = input_shape[0]
+        return (rosters_shape[0], rosters_shape[1], self.params.roster_dim)
 
     def get_config(self):
         cfg = super().get_config()

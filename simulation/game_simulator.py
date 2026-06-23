@@ -38,13 +38,22 @@ from __future__ import annotations
 
 import numpy as np
 
-from config import MAX_SEQUENCE_LENGTH, ROSTER_SIZE
+from config import (
+    MAX_SEQUENCE_LENGTH, RESULT_TEMPERATURE, ROSTER_SIZE, SUB_TEMPERATURE, TYPE_TEMPERATURE,
+)
 from encoder.encoder import Encoder
 from models.artifacts import DEFAULT_ARTIFACTS_ROOT
 from models.event_time_model import CATEGORICAL_FIELDS, EventTimeModel
 from models.model_bundle import ModelBundle
 from models.player_model import PlayerModel
+from models.season_features import (
+    DEFAULT_REST_DAYS, REST_CLIP_DAYS, TEAM_SCALAR_COLS,
+)
 from models.substitution_model import START_TOKEN, SUB_EVENT, SubstitutionModel
+
+# Neutral default for a hand-built matchup with no schedule given: treat both teams as
+# mid-season (real-game predictions read the actual value from the GameInput).
+DEFAULT_GAMES_PLAYED = 0.5
 
 # result outcomes that hand the ball to the other team. The model does not consume
 # possession; we track it for downstream use (and the future Controller will own the
@@ -54,6 +63,24 @@ from models.substitution_model import START_TOKEN, SUB_EVENT, SubstitutionModel
 POSSESSION_FLIP_RESULTS = {"cop", "steal"}
 
 HOME, AWAY = "home", "away"
+
+# Cleaned CSV uses the literal string "null" (e.g. an offensive rebound's result, a missing
+# player). pandas' default CSV read coerces "null" -> NaN, so at TRAIN time those cells were
+# encoded as str(NaN) == "nan" (a real token in the type/result vocabs; UNK in player/event).
+# The simulator builds rows in memory and never goes through pandas, so we reproduce that one
+# coercion here to keep generated rows on the model's training distribution.
+_NULL_STRINGS = {"null"}
+
+
+def _norm_cat(value):
+    """Mirror pandas' CSV null coercion for a single categorical value before encoding."""
+    if value is None:
+        return "nan"
+    if isinstance(value, float) and np.isnan(value):
+        return "nan"
+    if isinstance(value, str) and value.strip().lower() in _NULL_STRINGS:
+        return "nan"
+    return value
 
 
 class GameSimulator:
@@ -80,6 +107,15 @@ class GameSimulator:
         self.away_full: list[str] = []
         self.possession: str = HOME
         self.season: str = ""
+        # --- Season context (pre-game givens; constant across the game) ---
+        # Per-team season progress (games played / 82) and days of rest, plus per-player
+        # days-since-last-game maps. Set from the GameInput at start; defaulted otherwise.
+        self.home_games_played: float = DEFAULT_GAMES_PLAYED
+        self.away_games_played: float = DEFAULT_GAMES_PLAYED
+        self.home_days_rest: float = DEFAULT_REST_DAYS
+        self.away_days_rest: float = DEFAULT_REST_DAYS
+        self.home_rest: dict[str, float] = {}
+        self.away_rest: dict[str, float] = {}
         # Growing sequence of event rows; each carries its own post-update roster
         # snapshot + absolute time. This list IS the model's input context.
         self.history: list[dict] = []
@@ -115,16 +151,39 @@ class GameSimulator:
     # ===================================================================== #
 
     def reset(self) -> None:
-        """Clear all per-game state (rosters, possession, history)."""
+        """Clear all per-game state (rosters, possession, season context, history)."""
         self.home_roster, self.away_roster = [], []
         self.home_full, self.away_full = [], []
         self.possession = HOME
         self.season = ""
+        self.home_games_played = DEFAULT_GAMES_PLAYED
+        self.away_games_played = DEFAULT_GAMES_PLAYED
+        self.home_days_rest = DEFAULT_REST_DAYS
+        self.away_days_rest = DEFAULT_REST_DAYS
+        self.home_rest, self.away_rest = {}, {}
         self.history = []
+
+    def _set_season_context(self, ctx: dict | None) -> None:
+        """Apply a pre-game season-context dict (from GameInput.season_context()).
+
+        Keys (all optional; defaults when absent): ``home_games_played`` /
+        ``away_games_played`` (fraction of an 82-game season), ``home_days_rest`` /
+        ``away_days_rest`` (team rest in days), and ``home_rest`` / ``away_rest`` (per-player
+        days-since-last-game maps, covering bench players who may be subbed in).
+        """
+        if not ctx:
+            return
+        self.home_games_played = float(ctx.get("home_games_played", DEFAULT_GAMES_PLAYED))
+        self.away_games_played = float(ctx.get("away_games_played", DEFAULT_GAMES_PLAYED))
+        self.home_days_rest = float(ctx.get("home_days_rest", DEFAULT_REST_DAYS))
+        self.away_days_rest = float(ctx.get("away_days_rest", DEFAULT_REST_DAYS))
+        self.home_rest = dict(ctx.get("home_rest", {}) or {})
+        self.away_rest = dict(ctx.get("away_rest", {}) or {})
 
     def start_game(self, home_roster: list[str], away_roster: list[str],
                    possession: str = HOME, season: str = "2003",
-                   seed_event: dict | None = None, tipoff_time: float = 0.0) -> "GameSimulator":
+                   seed_event: dict | None = None, tipoff_time: float = 0.0,
+                   season_context: dict | None = None) -> "GameSimulator":
         """
         Initialize game state and seed the input with the opening row.
 
@@ -132,13 +191,15 @@ class GameSimulator:
         categorical fields = ``"start"``, ``secondary_player="none"``, time 0) carrying
         the tip-off rosters, so the default seed reproduces exactly that in-distribution
         first timestep. Pass ``seed_event`` to override (e.g. to resume from a real
-        partial game); it is a dict of the categorical fields below.
+        partial game); it is a dict of the categorical fields below. ``season_context``
+        carries the pre-game rest / games-played givens (see ``_set_season_context``).
         """
         self.reset()
         self.home_roster = list(home_roster)
         self.away_roster = list(away_roster)
         self.possession = possession
         self.season = str(season)
+        self._set_season_context(season_context)
 
         seed = {"event": "start", "player": "start", "type": "start",
                 "result": "start", "secondary_player": "none"}
@@ -214,51 +275,83 @@ class GameSimulator:
     # --- Constrained sampling of substitution players                     --
     # ===================================================================== #
 
-    def _constrained_sample(self, logits: np.ndarray, candidates: list[str],
-                            *, greedy: bool = False) -> str:
-        """Pick a player from ``candidates`` by restricting ``logits`` to their token ids.
+    def _masked_sample(self, logits: np.ndarray, candidates: list[str], encode,
+                       *, greedy: bool = False, temperature: float = 1.0,
+                       bias: dict[str, float] | None = None) -> str:
+        """Pick a token from ``candidates`` by restricting ``logits`` to their vocab ids.
 
-        The heads emit a distribution over the whole player vocab; legality (which players
-        are actually eligible — the bench, the active five, the remaining starters) is a
-        sampling-time constraint applied here. Renormalizes over the candidate ids and
-        either samples (default) or takes the argmax (``greedy``, for deterministic tests).
+        A head emits a distribution over its whole vocab; legality (which tokens are actually
+        eligible — the bench/active five for players, ``{2pt, 3pt}`` for a live shot type,
+        made/missed for a free throw) is a sampling-time constraint applied here. ``encode``
+        maps a candidate string to its vocab id. Renormalizes over the candidate ids and either
+        samples (default) or takes the argmax (``greedy``, for deterministic tests).
+
+        ``temperature`` (>1 flattens, <1 sharpens) scales the logits before the softmax; 1.0 is
+        the raw model. ``bias`` adds a per-candidate logit offset before sampling (e.g. a fatigue
+        nudge on the outgoing-sub pick). Both are ignored under ``greedy`` argmax except that the
+        bias still applies (it can change which candidate is the max).
         """
         if not candidates:
-            raise ValueError("no candidate players to sample from")
-        ids = [self.encoder.encode_player(p) for p in candidates]
-        sub = np.asarray(logits)[ids]
+            raise ValueError("no candidates to sample from")
+        ids = [encode(c) for c in candidates]
+        sub = np.asarray(logits)[ids].astype(np.float64)
+        if bias:
+            sub = sub + np.array([bias.get(c, 0.0) for c in candidates], dtype=np.float64)
         if greedy:
             choice = int(np.argmax(sub))
         else:
-            probs = _softmax(sub)
+            probs = _softmax(sub, temperature=temperature)
             choice = int(self.rng.choice(len(ids), p=probs))
         return candidates[choice]
 
-    def _next_step_inputs(self, *, outgoing: str | None, delta_seconds: float) -> dict:
+    def _constrained_sample(self, logits: np.ndarray, candidates: list[str],
+                            *, greedy: bool = False, temperature: float = 1.0,
+                            bias: dict[str, float] | None = None) -> str:
+        """Player-vocab specialization of :meth:`_masked_sample` (the bench/active five)."""
+        return self._masked_sample(logits, candidates, self.encoder.encode_player,
+                                   greedy=greedy, temperature=temperature, bias=bias)
+
+    def _conditioned_inputs(self, *, next_event: str, delta_seconds: float,
+                            next_player: str | None = None,
+                            next_type: str | None = None) -> dict:
         """Base history inputs + the next-step conditioning a downstream head reads.
 
-        Adds ``next_event`` (= ``substitution``) / ``next_delta_time`` at the decision
-        position (the last real step), plus ``next_player`` (the decided outgoing player)
-        when ``outgoing`` is given (the substitution head). Mirrors the per-head INPUT_KEYS.
+        Every head conditions on ``next_event`` / ``next_delta_time`` at the decision position
+        (the last real step ``n-1``); the player head needs nothing more, the type heads add
+        ``next_player`` (the decided actor), and the result head also adds ``next_type`` (the
+        type the shot is about to be). Only the requested conditioning is attached, so a head
+        is never handed an input it doesn't define. A head ignores any *extra* keys, so the
+        shared ``base`` is safe to pass to all of them.
         """
         base = self.build_model_inputs()
         SEQ = self.sequence_length
         n = min(len(self.history), SEQ)
         enc = self.encoder
 
-        next_event = np.full((1, SEQ), enc.encode_event("PAD"), dtype=np.int32)
-        next_event[0, n - 1] = enc.encode_event(SUB_EVENT)
+        def _col(encode, value) -> np.ndarray:
+            arr = np.full((1, SEQ), encode("PAD"), dtype=np.int32)
+            arr[0, n - 1] = encode(_norm_cat(value))
+            return arr
+
         delta_mean = float(self.norm_stats.get("delta_mean", 0.0))
         delta_std = float(self.norm_stats.get("delta_std", 1.0)) or 1.0
         next_delta = np.zeros((1, SEQ, 1), dtype=np.float32)
         next_delta[0, n - 1, 0] = (delta_seconds - delta_mean) / delta_std
 
-        inputs = {**base, "next_event": next_event, "next_delta_time": next_delta}
-        if outgoing is not None:
-            next_player = np.full((1, SEQ), enc.encode_player("PAD"), dtype=np.int32)
-            next_player[0, n - 1] = enc.encode_player(outgoing)
-            inputs["next_player"] = next_player
+        inputs = {**base,
+                  "next_event": _col(enc.encode_event, next_event),
+                  "next_delta_time": next_delta}
+        if next_player is not None:
+            inputs["next_player"] = _col(enc.encode_player, next_player)
+        if next_type is not None:
+            inputs["next_type"] = _col(enc.encode_type, next_type)
         return inputs
+
+    def _next_step_inputs(self, *, outgoing: str | None, delta_seconds: float) -> dict:
+        """Substitution-head conditioning (``next_event`` = ``substitution`` + the outgoing
+        player). Thin wrapper over :meth:`_conditioned_inputs` kept for the sub helpers."""
+        return self._conditioned_inputs(next_event=SUB_EVENT, delta_seconds=delta_seconds,
+                                        next_player=outgoing)
 
     def _head_logits(self, key: str, output_name: str, inputs: dict) -> np.ndarray:
         """Run a loaded head and return its logits at the decision position (n-1)."""
@@ -272,26 +365,36 @@ class GameSimulator:
         return np.asarray(out[output_name])[0, n - 1]
 
     def predict_outgoing(self, candidates: list[str], *, delta_seconds: float = 0.0,
-                         greedy: bool = False) -> str:
-        """Sample the outgoing player from ``candidates`` (the active roster) via PlayerModel."""
+                         greedy: bool = False, temperature: float = SUB_TEMPERATURE,
+                         outgoing_bias: dict[str, float] | None = None) -> str:
+        """Sample the outgoing player from ``candidates`` (the active roster) via PlayerModel.
+
+        ``outgoing_bias`` adds a per-candidate logit offset (the Controller's fatigue nudge, so a
+        long-stint player is more likely to be the one who comes off) on top of the model's
+        learned "who usually gets subbed" distribution.
+        """
         inputs = self._next_step_inputs(outgoing=None, delta_seconds=delta_seconds)
         logits = self._head_logits(PlayerModel.KEY, "player_output", inputs)
-        return self._constrained_sample(logits, candidates, greedy=greedy)
+        return self._constrained_sample(logits, candidates, greedy=greedy,
+                                        temperature=temperature, bias=outgoing_bias)
 
     def predict_incoming(self, outgoing: str, candidates: list[str], *,
-                         delta_seconds: float = 0.0, greedy: bool = False) -> str:
+                         delta_seconds: float = 0.0, greedy: bool = False,
+                         temperature: float = SUB_TEMPERATURE) -> str:
         """Sample the incoming player from ``candidates`` (the bench) via SubstitutionModel,
         conditioned on the decided ``outgoing`` player."""
         inputs = self._next_step_inputs(outgoing=outgoing, delta_seconds=delta_seconds)
         logits = self._head_logits(SubstitutionModel.KEY, "secondary_player_output", inputs)
-        return self._constrained_sample(logits, candidates, greedy=greedy)
+        return self._constrained_sample(logits, candidates, greedy=greedy, temperature=temperature)
 
     def sample_substitution(self, *, team: str | None = None, delta_seconds: float = 0.0,
-                            greedy: bool = False) -> tuple[str, str]:
+                            greedy: bool = False,
+                            outgoing_bias: dict[str, float] | None = None) -> tuple[str, str]:
         """Generate one in-game substitution: (outgoing, incoming).
 
         The outgoing player is drawn from the active on-court roster (a given ``team`` or
         all ten); the incoming player from that team's bench (full roster minus on-court).
+        ``outgoing_bias`` is the Controller's per-player fatigue nudge for the outgoing pick.
         Does not mutate state — call ``append_event('substitution', outgoing, …,
         secondary_player=incoming)`` to apply it.
         """
@@ -299,7 +402,8 @@ class GameSimulator:
             active = self.home_roster if team == HOME else self.away_roster
         else:
             active = self.home_roster + self.away_roster
-        outgoing = self.predict_outgoing(active, delta_seconds=delta_seconds, greedy=greedy)
+        outgoing = self.predict_outgoing(active, delta_seconds=delta_seconds, greedy=greedy,
+                                         outgoing_bias=outgoing_bias)
 
         sub_team = self._team_of(outgoing)
         full = self.home_full if sub_team == HOME else self.away_full
@@ -310,12 +414,61 @@ class GameSimulator:
         return outgoing, incoming
 
     # ===================================================================== #
+    # --- Conditional heads (player / type / result) for the rollout       --
+    # ===================================================================== #
+
+    def predict_player(self, next_event: str, candidates: list[str], *,
+                       delta_seconds: float = 0.0, greedy: bool = False,
+                       temperature: float = 1.0) -> str:
+        """Sample the actor of ``next_event`` from ``candidates`` via the Player head.
+
+        ``candidates`` is the legal pool (e.g. the on-court five of the team with the ball, or
+        a team's five minus a just-credited assister) — the Controller owns that legality.
+        ``temperature`` (>1) flattens the head so one star doesn't take nearly every possession.
+        """
+        inputs = self._conditioned_inputs(next_event=next_event, delta_seconds=delta_seconds)
+        logits = self._head_logits(PlayerModel.KEY, "player_output", inputs)
+        return self._constrained_sample(logits, candidates, greedy=greedy, temperature=temperature)
+
+    def predict_type(self, key: str, next_event: str, next_player: str, allowed: list[str], *,
+                     delta_seconds: float = 0.0, greedy: bool = False,
+                     temperature: float = TYPE_TEMPERATURE) -> str:
+        """Sample an event's ``type`` from ``allowed`` via a conditional type head.
+
+        ``key`` is the head (``shot_type`` / ``assist_type`` / ``turnover_type`` /
+        ``foul_type``); ``allowed`` is the legal token set (e.g. ``{"2pt", "3pt"}`` for a live
+        field goal). The head outputs ``type_output`` and conditions on the decided actor.
+        """
+        inputs = self._conditioned_inputs(next_event=next_event, delta_seconds=delta_seconds,
+                                          next_player=next_player)
+        logits = self._head_logits(key, "type_output", inputs)
+        return self._masked_sample(logits, allowed, self.encoder.encode_type, greedy=greedy,
+                                   temperature=temperature)
+
+    def predict_result(self, next_player: str, next_type: str, allowed: list[str], *,
+                       delta_seconds: float = 0.0, greedy: bool = False,
+                       temperature: float = RESULT_TEMPERATURE) -> str:
+        """Sample a shot's ``result`` from ``allowed`` via the ``shot_result`` head.
+
+        Conditions on the decided actor and the decided ``next_type`` (the type the shot is
+        about to be). ``allowed`` is the legal outcome set — made/missed/blocked for a live FG,
+        made/missed for a free throw.
+        """
+        inputs = self._conditioned_inputs(next_event="shot", delta_seconds=delta_seconds,
+                                          next_player=next_player, next_type=next_type)
+        logits = self._head_logits("shot_result", "result_output", inputs)
+        return self._masked_sample(logits, allowed, self.encoder.encode_result, greedy=greedy,
+                                   temperature=temperature)
+
+    # ===================================================================== #
     # --- Opening-lineup bootstrap (build the starting five via subs)      --
     # ===================================================================== #
 
     def start_from_full_rosters(self, home_full: list[str], away_full: list[str],
                                 possession: str = HOME, season: str = "2003",
-                                tipoff_time: float = 0.0, greedy: bool = False) -> "GameSimulator":
+                                tipoff_time: float = 0.0, greedy: bool = False,
+                                greedy_starters: bool = True,
+                                season_context: dict | None = None) -> "GameSimulator":
         """Seed an empty ``start`` frame and build each team's starting five via subs.
 
         This is the inference counterpart of the synthesized opening subs in
@@ -323,6 +476,9 @@ class GameSimulator:
         the substitution head picks each incoming starter (constrained to that team's
         not-yet-placed roster), with the on-court five filling 0->5. Takes each team's whole
         roster (e.g. ``GameInput.home_roster`` / ``away_roster``).
+
+        ``greedy_starters`` (default True) takes the substitution head's argmax for each
+        starter — the most-likely opening five — independent of the in-game ``greedy`` flag.
         """
         self.reset()
         self.home_full = list(home_full)
@@ -334,24 +490,113 @@ class GameSimulator:
             event="start", player="start", type="start", result="start",
             secondary_player="none", time=float(tipoff_time),
         ))
-        self._build_team_opening(HOME, home_full, tipoff_time, greedy=greedy)
-        self._build_team_opening(AWAY, away_full, tipoff_time, greedy=greedy)
+        self._build_team_opening(HOME, home_full, tipoff_time, greedy=greedy_starters)
+        self._build_team_opening(AWAY, away_full, tipoff_time, greedy=greedy_starters)
         return self
+
+    def start_alternating(self, home_full: list[str], away_full: list[str],
+                          possession: str = HOME, season: str = "2003",
+                          tipoff_time: float = 0.0, greedy: bool = False,
+                          greedy_starters: bool = True,
+                          season_context: dict | None = None) -> "GameSimulator":
+        """Seed an empty ``start`` frame and build both starting fives **alternating** H, A.
+
+        Same synthesized ``start -> starter`` subs as :meth:`start_from_full_rosters`, but the
+        picks alternate home/away (home starter 1, away starter 1, home 2, …) so each incoming
+        starter is conditioned on every starter placed so far on *both* teams — the lineups
+        react to each other instead of being built one team in isolation.
+
+        ``greedy_starters`` (default True) takes the substitution head's argmax for each
+        starter — the most-likely opening five — independent of the in-game ``greedy`` flag.
+        """
+        self.reset()
+        self.home_full = list(home_full)
+        self.away_full = list(away_full)
+        self.possession = possession
+        self.season = str(season)
+        # Set before building the opening five — the substitution head now consumes rest.
+        self._set_season_context(season_context)
+        self.history.append(self._make_row(
+            event="start", player="start", type="start", result="start",
+            secondary_player="none", time=float(tipoff_time),
+        ))
+        home_avail, away_avail = list(home_full), list(away_full)
+        for _ in range(ROSTER_SIZE):
+            for team, avail in ((HOME, home_avail), (AWAY, away_avail)):
+                if avail:
+                    self._place_starter(team, avail, tipoff_time, greedy=greedy_starters)
+        return self
+
+    def start_with_starters(self, home_full: list[str], away_full: list[str],
+                            home_starters: list[str], away_starters: list[str],
+                            possession: str = HOME, season: str = "2003",
+                            tipoff_time: float = 0.0,
+                            season_context: dict | None = None) -> "GameSimulator":
+        """Seed an empty ``start`` frame and place the **given** starting fives, no model calls.
+
+        The real-starters counterpart of :meth:`start_alternating`: instead of asking the
+        SubstitutionModel who opens, the actual starters (e.g. a real game's tip-off five) are
+        placed directly. The history shape is identical — an empty ``start`` frame followed by
+        alternating home/away ``start -> starter`` subs filling the on-court fives 0->5 — so the
+        downstream rollout stays in-distribution. ``home_full`` / ``away_full`` remain the whole
+        rosters (for later bench substitutions); the starters must be a subset of them.
+        """
+        self.reset()
+        self.home_full = list(home_full)
+        self.away_full = list(away_full)
+        self.possession = possession
+        self.season = str(season)
+        # Set before building the opening five — the substitution head now consumes rest.
+        self._set_season_context(season_context)
+        self.history.append(self._make_row(
+            event="start", player="start", type="start", result="start",
+            secondary_player="none", time=float(tipoff_time),
+        ))
+        home_q, away_q = list(home_starters), list(away_starters)
+        for i in range(ROSTER_SIZE):
+            for team, q in ((HOME, home_q), (AWAY, away_q)):
+                if i < len(q):
+                    self._place_known_starter(team, q[i], tipoff_time)
+        return self
+
+    def _place_known_starter(self, team: str, incoming: str, tipoff_time: float) -> None:
+        """Log one ``start -> starter`` sub for a **predetermined** ``incoming`` starter.
+
+        The no-model sibling of :meth:`_place_starter`: same post-add roster snapshot and
+        synthesized sub row, but the incoming player is given rather than sampled.
+        """
+        roster = self.home_roster if team == HOME else self.away_roster
+        roster.append(incoming)  # post-add snapshot, like the synthesized openers
+        self.history.append(self._make_row(
+            event=SUB_EVENT, player=START_TOKEN, type=SUB_EVENT, result=SUB_EVENT,
+            secondary_player=incoming, time=float(tipoff_time),
+        ))
+
+    def _place_starter(self, team: str, available: list[str], tipoff_time: float,
+                       *, greedy: bool = False) -> None:
+        """Pick one ``start -> starter`` sub for ``team`` from ``available`` and log it.
+
+        ``greedy`` here is the starter-selection flag (argmax of the substitution head over the
+        not-yet-placed roster), not the in-game rollout flag — they are decoupled on purpose.
+        """
+        roster = self.home_roster if team == HOME else self.away_roster
+        incoming = self.predict_incoming(START_TOKEN, available,
+                                         delta_seconds=0.0, greedy=greedy)
+        available.remove(incoming)
+        roster.append(incoming)  # post-add snapshot, like the synthesized openers
+        self.history.append(self._make_row(
+            event=SUB_EVENT, player=START_TOKEN, type=SUB_EVENT, result=SUB_EVENT,
+            secondary_player=incoming, time=float(tipoff_time),
+        ))
 
     def _build_team_opening(self, team: str, full_roster: list[str], tipoff_time: float,
                             *, greedy: bool = False) -> None:
-        """Fill ``team``'s on-court five with ``start -> starter`` subs, one starter at a time."""
-        roster = self.home_roster if team == HOME else self.away_roster
+        """Fill ``team``'s on-court five with ``start -> starter`` subs, one starter at a time.
+
+        ``greedy`` is the starter-selection flag (see :meth:`_place_starter`)."""
         available = list(full_roster)
         for _ in range(min(ROSTER_SIZE, len(available))):
-            incoming = self.predict_incoming(START_TOKEN, available,
-                                             delta_seconds=0.0, greedy=greedy)
-            available.remove(incoming)
-            roster.append(incoming)  # post-add snapshot, like the synthesized openers
-            self.history.append(self._make_row(
-                event=SUB_EVENT, player=START_TOKEN, type=SUB_EVENT, result=SUB_EVENT,
-                secondary_player=incoming, time=float(tipoff_time),
-            ))
+            self._place_starter(team, available, tipoff_time, greedy=greedy)
 
     # ===================================================================== #
     # --- Data shaping (history -> model tensors)                          --
@@ -394,7 +639,7 @@ class GameSimulator:
             encode = getattr(enc, f"encode_{field}")
             buf = np.full((SEQ,), self._pad_id(field), dtype=np.int32)
             for i, row in enumerate(window):
-                buf[i] = encode(row[field])
+                buf[i] = encode(_norm_cat(row[field]))
             inputs[field] = buf
 
         # Rosters -> fixed-5 token arrays, PAD-row padded.
@@ -413,6 +658,41 @@ class GameSimulator:
             delta_time[i, 0] = (deltas[i] - delta_mean) / delta_std
         inputs["time_abs"] = time_abs
         inputs["delta_time"] = delta_time
+
+        # Season context — mirrors season_features exactly so it matches _build_split:
+        # per-player rest is clipped+standardized over the full 5 slots (PAD slots fall out
+        # of (0 - mean)/std and are masked by the roster encoder); team days-rest is
+        # standardized the same way; games-played is fed raw.
+        rest_mean = float(self.norm_stats.get("rest_mean", DEFAULT_REST_DAYS))
+        rest_std = float(self.norm_stats.get("rest_std", 1.0)) or 1.0
+
+        def _std_days(days):
+            return (min(float(days), REST_CLIP_DAYS) - rest_mean) / rest_std
+
+        rest_home = np.zeros((SEQ, ROSTER_SIZE), dtype=np.float32)
+        rest_away = np.zeros((SEQ, ROSTER_SIZE), dtype=np.float32)
+        for i, row in enumerate(window):
+            for buf, col, rest_map in (
+                (rest_home, "roster_home", self.home_rest),
+                (rest_away, "roster_away", self.away_rest),
+            ):
+                raw = np.zeros((ROSTER_SIZE,), dtype=np.float32)
+                for j, p in enumerate(row[col][:ROSTER_SIZE]):
+                    raw[j] = rest_map.get(p, DEFAULT_REST_DAYS)
+                buf[i] = (np.clip(raw, 0.0, REST_CLIP_DAYS) - rest_mean) / rest_std
+        inputs["rest_home"] = rest_home
+        inputs["rest_away"] = rest_away
+
+        team_values = {
+            "home_games_played": self.home_games_played,
+            "away_games_played": self.away_games_played,
+            "home_days_rest": _std_days(self.home_days_rest),
+            "away_days_rest": _std_days(self.away_days_rest),
+        }
+        for name in TEAM_SCALAR_COLS:
+            buf = np.zeros((SEQ, 1), dtype=np.float32)
+            buf[:n, 0] = team_values[name]
+            inputs[name] = buf
 
         # 1 for real steps, 0 for padding (attention key-padding mask).
         pad_mask = np.zeros((SEQ,), dtype=np.float32)
@@ -463,7 +743,11 @@ class GameSimulator:
         }
 
 
-def _softmax(logits: np.ndarray) -> np.ndarray:
-    z = logits - np.max(logits)
+def _softmax(logits: np.ndarray, temperature: float = 1.0) -> np.ndarray:
+    """Softmax with an optional temperature (>1 flattens, <1 sharpens); 1.0 is the raw model."""
+    scaled = np.asarray(logits, dtype=np.float64)
+    if temperature != 1.0:
+        scaled = scaled / temperature
+    z = scaled - np.max(scaled)
     e = np.exp(z)
     return e / np.sum(e)

@@ -58,6 +58,7 @@ class PlayerLine:
     blk: int = 0
     tov: int = 0
     pf: int = 0
+    pm: int = 0          # plus/minus: team points − opponent points while on court
     pts: int = 0
 
     @property
@@ -69,47 +70,61 @@ class PlayerLine:
         return self.seconds / 60.0
 
     def as_row(self) -> dict:
-        """ESPN-style display row (made-attempted shooting splits)."""
+        """Full NBA-style display row (made-attempted splits, percentages, +/-)."""
         return {
             "Player": self.player,
             "MIN": round(self.minutes, 1),
             "FG": f"{self.fgm}-{self.fga}",
+            "FG%": _pct(self.fgm, self.fga),
             "3PT": f"{self.tpm}-{self.tpa}",
+            "3P%": _pct(self.tpm, self.tpa),
             "FT": f"{self.ftm}-{self.fta}",
+            "FT%": _pct(self.ftm, self.fta),
+            "OREB": self.oreb,
+            "DREB": self.dreb,
             "REB": self.reb,
             "AST": self.ast,
             "STL": self.stl,
             "BLK": self.blk,
             "TO": self.tov,
             "PF": self.pf,
+            "+/-": f"{self.pm:+d}",
             "PTS": self.pts,
         }
 
 
 @dataclass
 class BoxScore:
-    """Both teams' stat lines plus the final score."""
+    """Both teams' stat lines plus the final score and team labels."""
     home: list[PlayerLine] = field(default_factory=list)
     away: list[PlayerLine] = field(default_factory=list)
     home_score: int = 0
     away_score: int = 0
+    home_team: str = "HOME"
+    away_team: str = "AWAY"
 
-    def to_frame(self, side: str) -> pd.DataFrame:
-        """DataFrame of one side's stat lines, sorted by points descending."""
+    def to_frame(self, side: str, *, totals: bool = True) -> pd.DataFrame:
+        """DataFrame of one side's stat lines, sorted by points descending.
+
+        With ``totals`` (default) a ``TEAM`` row of summed counting stats is appended — the
+        bottom line of a real box score (MIN totals ≈ 240, summed FG/REB/AST/…/PTS).
+        """
         lines = self.home if side == "home" else self.away
         rows = [pl.as_row() for pl in sorted(lines, key=lambda p: p.pts, reverse=True)]
+        if totals and lines:
+            rows.append(_totals_row(lines))
         return pd.DataFrame(rows, columns=list(_DISPLAY_COLUMNS))
 
     def render(self) -> str:
         """Readable two-team box score with final score."""
         out = [
-            f"HOME ({self.home_score})",
+            f"{self.home_team} ({self.home_score})",
             self.to_frame("home").to_string(index=False),
             "",
-            f"AWAY ({self.away_score})",
+            f"{self.away_team} ({self.away_score})",
             self.to_frame("away").to_string(index=False),
             "",
-            f"Final: HOME {self.home_score} - {self.away_score} AWAY",
+            f"Final: {self.home_team} {self.home_score} - {self.away_score} {self.away_team}",
         ]
         return "\n".join(out)
 
@@ -117,17 +132,43 @@ class BoxScore:
         return self.render()
 
 
-_DISPLAY_COLUMNS = ("Player", "MIN", "FG", "3PT", "FT", "REB",
-                    "AST", "STL", "BLK", "TO", "PF", "PTS")
+_DISPLAY_COLUMNS = ("Player", "MIN", "FG", "FG%", "3PT", "3P%", "FT", "FT%",
+                    "OREB", "DREB", "REB", "AST", "STL", "BLK", "TO", "PF", "+/-", "PTS")
 
 
-def generate_box_score(events) -> BoxScore:
+def _pct(made: int, att: int) -> str:
+    """Shooting percentage as a 1-decimal string ("" when there were no attempts)."""
+    return f"{100.0 * made / att:.1f}" if att else ""
+
+
+def _totals_row(lines: list[PlayerLine]) -> dict:
+    """A ``TEAM`` totals row: summed counting stats (no +/- — not meaningful as a sum)."""
+    s = lambda attr: sum(getattr(pl, attr) for pl in lines)  # noqa: E731
+    fgm, fga = s("fgm"), s("fga")
+    tpm, tpa = s("tpm"), s("tpa")
+    ftm, fta = s("ftm"), s("fta")
+    return {
+        "Player": "TEAM", "MIN": round(s("seconds") / 60.0, 1),
+        "FG": f"{fgm}-{fga}", "FG%": _pct(fgm, fga),
+        "3PT": f"{tpm}-{tpa}", "3P%": _pct(tpm, tpa),
+        "FT": f"{ftm}-{fta}", "FT%": _pct(ftm, fta),
+        "OREB": s("oreb"), "DREB": s("dreb"), "REB": s("oreb") + s("dreb"),
+        "AST": s("ast"), "STL": s("stl"), "BLK": s("blk"), "TO": s("tov"),
+        "PF": s("pf"), "+/-": "", "PTS": s("pts"),
+    }
+
+
+def generate_box_score(events, *, home_team: str = "HOME",
+                       away_team: str = "AWAY") -> BoxScore:
     """Aggregate a game's event sequence into a :class:`BoxScore`.
 
     ``events`` is an iterable of dict rows (or a ``pandas.DataFrame``) carrying at least
     ``event, player, type, result, time`` and the per-row ``roster_home`` / ``roster_away``
     snapshots. Rosters may be real lists or string literals (both are accepted). Events are
     processed in the given order; for minutes, the rows are treated as time-ordered.
+
+    Plus/minus is credited per scoring play to the lineups on the floor at that moment: the
+    scoring team's five gets ``+pts``, the opponents' five ``−pts``.
     """
     rows = _as_rows(events)
 
@@ -197,6 +238,16 @@ def generate_box_score(events) -> BoxScore:
                     home_score += pts
                 elif team == "away":
                     away_score += pts
+                # Plus/minus: credit the lineups on the floor for this scoring play.
+                if team in ("home", "away"):
+                    scorers, opponents = (
+                        (home_roster, away_roster) if team == "home"
+                        else (away_roster, home_roster)
+                    )
+                    for name in scorers:
+                        line(name).pm += pts
+                    for name in opponents:
+                        line(name).pm -= pts
 
         elif event == "assist":
             pl.ast += 1
@@ -223,7 +274,8 @@ def generate_box_score(events) -> BoxScore:
 
     home = [lines[p] for p in sorted(home_players) if p in lines]
     away = [lines[p] for p in sorted(away_players) if p in lines]
-    return BoxScore(home=home, away=away, home_score=home_score, away_score=away_score)
+    return BoxScore(home=home, away=away, home_score=home_score, away_score=away_score,
+                    home_team=home_team, away_team=away_team)
 
 
 def box_score_for_game(game_id: int, data_dir="./data") -> BoxScore:

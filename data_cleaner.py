@@ -32,6 +32,12 @@ class DataCleaner:
         self.ignore = tuple(ignore) if ignore is not None else self.IGNORE_SUBSTRINGS
         self.season = 0
         self.playoff = 0
+        # Per-game context carried onto every event (constant within a game). Date comes
+        # straight from the raw row; the team abbreviations are resolved lazily from the
+        # first action rows whose actor's roster membership is known (see _update_teams).
+        self.game_date = None
+        self.home_team = None
+        self.away_team = None
         # Per-game cumulative roster (used for end-of-game sentinel event).
         self.home_players = []
         self.away_players = []
@@ -49,6 +55,7 @@ class DataCleaner:
         self.output_columns = [
             "game_id", "roster_home", "roster_away", "time", "event",
             "player", "type", "result", "secondary_player", "home/away", "season", "playoff",
+            "game_date", "home_team", "away_team",
         ]
 
     # ------------------- HELPER METHODS -------------------
@@ -86,6 +93,35 @@ class DataCleaner:
     def home_indicator(self, home_roster, player):
         """Return 1 if player is on the home team, 2 if on away team."""
         return 1 if player in home_roster else 2
+
+    def _ctx(self):
+        """Per-game context keys stamped onto each emitted event (constant per game)."""
+        return {
+            "game_date": self.game_date,
+            "home_team": self.home_team,
+            "away_team": self.away_team,
+        }
+
+    def _update_teams(self, row, clean_home, clean_away):
+        """Resolve the game's home/away team abbreviations from the raw ``team`` column.
+
+        ``home``/``away`` in the raw data are jump-ball player names and ``opponent`` is
+        empty, so the only stable per-game team id is the event-team abbreviation. The
+        first action row whose actor sits in the home five fixes the home abbreviation;
+        the first whose actor sits in the away five fixes the away one. Idempotent once
+        both are known.
+        """
+        if self.home_team is not None and self.away_team is not None:
+            return
+        player = row.get("player")
+        team = row.get("team")
+        if pd.isna(player) or pd.isna(team):
+            return
+        team = str(team).strip()
+        if self.home_team is None and player in clean_home:
+            self.home_team = team
+        elif self.away_team is None and player in clean_away:
+            self.away_team = team
 
     def determine_turnover_type(self, data):
         """
@@ -170,6 +206,7 @@ class DataCleaner:
             "home/away": 0,
             "season": self.season,
             "playoff": 2 if self.playoff else 1,
+            **self._ctx(),
         }
 
     def process_row(self, row):
@@ -189,6 +226,11 @@ class DataCleaner:
 
             self.game_id += 1
             self.last_time = 0
+            # New game: reset per-game context. Date is on every raw row; the team
+            # abbreviations are resolved as soon as a determinable action row arrives.
+            self.game_date = row["date"] if pd.notna(row.get("date")) else None
+            self.home_team = None
+            self.away_team = None
             self.home_players = []
             self.away_players = []
             self.last_home_five = self._clean_five(
@@ -224,6 +266,9 @@ class DataCleaner:
             self.last_home_five = clean_home
         if clean_away:
             self.last_away_five = clean_away
+
+        # Resolve home/away team abbreviations once they become determinable.
+        self._update_teams(row, clean_home, clean_away)
 
         # Track every player who appeared on each side (for historical reference).
         for p in clean_home:
@@ -445,9 +490,11 @@ class DataCleaner:
 
         df = pd.read_csv(csv_path, low_memory=False, na_values=["", " "])
         df.rename(columns=lambda c: c.strip(), inplace=True)
+        # ``team`` is kept (the only stable per-game team id; see _update_teams); ``date``
+        # is also kept and consumed at the game boundary.
         df = df.drop(columns=[
             "game_id", "away_score", "home_score", "remaining_time",
-            "play_length", "play_id", "team", "outof", "possession", "shot_distance",
+            "play_length", "play_id", "outof", "possession", "shot_distance",
             "original_x", "original_y", "converted_x", "converted_y", "description",
         ], errors="ignore")
 
@@ -456,6 +503,11 @@ class DataCleaner:
             if new_row:
                 for evt in new_row:
                     evt.setdefault("game_id", self.game_id)
+                    # _end_event already carries the prior game's context; everything
+                    # else inherits the current game's via setdefault.
+                    evt.setdefault("game_date", self.game_date)
+                    evt.setdefault("home_team", self.home_team)
+                    evt.setdefault("away_team", self.away_team)
                 self.events.extend(new_row)
 
         # Synthetic end event for the last game in this file.
@@ -495,6 +547,9 @@ class DataCleaner:
 
             # Reset per-file state (game_id persists for global uniqueness).
             self.first = True
+            self.game_date = None
+            self.home_team = None
+            self.away_team = None
             self.home_players = []
             self.away_players = []
             self.last_home_five = []

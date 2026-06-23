@@ -19,6 +19,13 @@ from models.roster_set_encoder import (
     RosterEncoderParams,
     SequenceRosterEncoder,
 )
+from models.season_features import (
+    SEASON_INPUT_KEYS,
+    merge_season_features,
+    append_season_batches,
+    make_season_inputs,
+    season_team_projections,
+)
 from reporting import ReportCollector, RunConfig
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
 
@@ -213,7 +220,9 @@ class EventTimeModel:
         time_abs = (time / max_time).astype(np.float32)
         delta_norm = ((delta - delta_mean) / delta_std).astype(np.float32)
 
-        # 6) Assemble per-game padded sequences for each split.
+        # 6) Assemble per-game padded sequences for each split. Season-context features
+        #    (per-player rest + team scalars) are normalized off the TRAIN split too and
+        #    fold rest_mean/rest_std into norm_stats (persisted below for inference).
         cols = {
             **{f: enc[f] for f in CATEGORICAL_FIELDS},
             "home_roster": rosters["home_roster"],
@@ -221,6 +230,9 @@ class EventTimeModel:
             "time_abs": time_abs,
             "delta_time": delta_norm,
         }
+        merge_season_features(
+            df, cols, rosters, self.encoder.encode_player("PAD"), train_mask, self.norm_stats
+        )
         train = self._build_split(cols, game_id, train_games)
         test = self._build_split(cols, game_id, test_games)
         holdout = self._build_split(cols, game_id, holdout_games)
@@ -268,7 +280,7 @@ class EventTimeModel:
         keys_roster = ["home_roster", "away_roster"]
         keys_cont = ["time_abs", "delta_time"]
 
-        batches = {k: [] for k in (*keys_1d, *keys_roster, *keys_cont,
+        batches = {k: [] for k in (*keys_1d, *keys_roster, *keys_cont, *SEASON_INPUT_KEYS,
                                    "event_target", "time_target", "pad_mask", "loss_mask")}
 
         game_ids_sorted = [g for g in np.unique(game_id) if g in games]
@@ -294,6 +306,8 @@ class EventTimeModel:
                 buf = np.zeros((SEQ, 1), dtype=np.float32)
                 buf[:n, 0] = cols[k][idx]
                 batches[k].append(buf)
+
+            append_season_batches(batches, cols, idx, n, SEQ)
 
             # Targets: next-step shift within this game.
             event_t = np.full((SEQ,), PAD_EVENT, dtype=np.int32)
@@ -360,6 +374,7 @@ class EventTimeModel:
         away_roster = Input(shape=(SEQ, ROSTER_SIZE), dtype="int32", name="away_roster")
         time_abs = Input(shape=(SEQ, 1), dtype="float32", name="time_abs")
         delta_time = Input(shape=(SEQ, 1), dtype="float32", name="delta_time")
+        rest_home, rest_away, team_inputs = make_season_inputs(SEQ)
         pad_mask = Input(shape=(SEQ,), dtype="float32", name="pad_mask")
 
         # ---- Per-field embeddings ----
@@ -378,18 +393,19 @@ class EventTimeModel:
                 )
 
         # ---- Roster encoding across the sequence ----
-        # One shared SequenceRosterEncoder applied to both rosters: weight-ties
-        # home/away and encodes all timesteps in a single reshaped pass.
-        home_vec = self.roster_encoder(home_roster)
-        away_vec = self.roster_encoder(away_roster)
+        # One shared SequenceRosterEncoder applied to both rosters (with per-player rest):
+        # weight-ties home/away and encodes all timesteps in a single reshaped pass.
+        home_vec = self.roster_encoder([home_roster, rest_home])
+        away_vec = self.roster_encoder([away_roster, rest_away])
 
         # ---- Continuous projections ----
         t_abs = layers.Dense(16, name="time_abs_proj")(time_abs)
         t_delta = layers.Dense(16, name="delta_time_proj")(delta_time)
+        t_team = season_team_projections(team_inputs)  # games-played + team rest per side
 
         # ---- Fusion ----
         x = layers.Concatenate(axis=-1, name="fusion_concat")(
-            [*embs, home_vec, away_vec, t_abs, t_delta]
+            [*embs, home_vec, away_vec, t_abs, t_delta, *t_team]
         )
         x = layers.Dense(D, name="fusion_projection")(x)
         x = layers.LayerNormalization(epsilon=1e-6, name="fusion_ln")(x)
@@ -426,7 +442,9 @@ class EventTimeModel:
         inputs = {
             **cat_inputs,
             "home_roster": home_roster, "away_roster": away_roster,
-            "time_abs": time_abs, "delta_time": delta_time, "pad_mask": pad_mask,
+            "time_abs": time_abs, "delta_time": delta_time,
+            "rest_home": rest_home, "rest_away": rest_away, **team_inputs,
+            "pad_mask": pad_mask,
         }
         return keras.Model(
             inputs=inputs,
@@ -440,7 +458,8 @@ class EventTimeModel:
 
     INPUT_KEYS = (
         "event", "player", "type", "result", "season", "secondary_player",
-        "home_roster", "away_roster", "time_abs", "delta_time", "pad_mask",
+        "home_roster", "away_roster", "time_abs", "delta_time",
+        *SEASON_INPUT_KEYS, "pad_mask",
     )
 
     def _load_processed(self, name: str) -> dict:

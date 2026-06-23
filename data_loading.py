@@ -18,6 +18,9 @@ import pandas as pd
 
 # Roster columns hold Python-list literals (e.g. "['A', 'B', ...]") in the cleaned CSVs.
 ROSTER_STR_COLS = ("roster_home", "roster_away")
+# Season-context rest columns are roster-parallel numeric-list literals (e.g. "[1, 3, 1]")
+# added by season_context.enrich; decoded the same way as rosters when requested.
+REST_STR_COLS = ("rest_home", "rest_away")
 
 
 def cleaned_csvs(data_dir) -> list[Path]:
@@ -55,7 +58,7 @@ def load_all_cleaned(data_dir, parse_rosters: bool = False) -> pd.DataFrame:
         raise FileNotFoundError(f"No cleaned CSVs found in {Path(data_dir).resolve()}")
     out = pd.concat(frames, ignore_index=True)
     if parse_rosters:
-        for col in ROSTER_STR_COLS:
+        for col in (*ROSTER_STR_COLS, *REST_STR_COLS):
             if col in out.columns:
                 out[col] = out[col].apply(_parse_roster)
     return out

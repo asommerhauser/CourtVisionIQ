@@ -106,6 +106,7 @@ def run_summary_row(report: TrainingReport) -> dict:
         "test_time_loss": tm.get("time_output_loss"),
         "test_event_acc": tm.get("event_output_acc"),
         "test_time_mae": tm.get("time_output_mae"),
+        "test_time_mae_sec": tm.get("time_output_mae_sec"),
 
         # --- full nested state (lossless; schema-stable escape hatch) ---
         "config_json": json.dumps(cfg.to_dict()) if cfg else None,

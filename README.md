@@ -46,7 +46,7 @@ nvidia-smi                                   # should list the RTX 4070
 python3 -m venv ~/cviq-venv                  # Linux-fs venv (NOT on /mnt/c)
 source ~/cviq-venv/bin/activate
 pip install --upgrade pip
-pip install "tensorflow[and-cuda]==2.20.0" pandas numpy pytest
+pip install -r requirements-gpu.txt
 ```
 
 Confirm TensorFlow sees the GPU:

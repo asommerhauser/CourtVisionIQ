@@ -56,6 +56,14 @@ from models.roster_set_encoder import (
     RosterEncoderParams,
     SequenceRosterEncoder,
 )
+from models.season_features import (
+    SEASON_INPUT_KEYS,
+    DEFAULT_REST_DAYS,
+    merge_season_features,
+    append_season_batches,
+    make_season_inputs,
+    season_team_projections,
+)
 from reporting import ReportCollector, RunConfig
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
 
@@ -71,7 +79,8 @@ _PROCESSED = {"train": "sub_train.npz", "test": "sub_test.npz", "holdout": "sub_
 # Base history inputs (the Event/Time inputs); conditioning inputs are appended below.
 _BASE_INPUT_KEYS = (
     "event", "player", "type", "result", "season", "secondary_player",
-    "home_roster", "away_roster", "time_abs", "delta_time", "pad_mask",
+    "home_roster", "away_roster", "time_abs", "delta_time",
+    *SEASON_INPUT_KEYS, "pad_mask",
 )
 
 
@@ -118,28 +127,40 @@ class SubstitutionModel:
     # --- Opening-lineup synthesis (in-memory) ---
     # ==========================================
 
-    def _opening_sub_rows(self, start_row, home_starters, away_starters) -> list[dict]:
-        """Five ``start -> starter`` subs per team, rosters filling 0->5 (home then away)."""
+    def _opening_sub_rows(self, start_row, home_starters, away_starters,
+                          home_rest, away_rest) -> list[dict]:
+        """Five ``start -> starter`` subs per team, rosters filling 0->5 (home then away).
+
+        ``home_rest`` / ``away_rest`` are the starters' season-context rest values, aligned
+        to ``home_starters`` / ``away_starters`` so each built-up lineup carries the matching
+        per-player rest (see season_features / the roster set-encoder).
+        """
         rows: list[dict] = []
         for k in range(1, len(home_starters) + 1):
             rows.append(self._sub_row(start_row, home_starters[k - 1],
-                                      home_roster=home_starters[:k], away_roster=[]))
+                                      home_roster=home_starters[:k], away_roster=[],
+                                      rest_home=home_rest[:k], rest_away=[]))
         for k in range(1, len(away_starters) + 1):
             rows.append(self._sub_row(start_row, away_starters[k - 1],
-                                      home_roster=home_starters, away_roster=away_starters[:k]))
+                                      home_roster=home_starters, away_roster=away_starters[:k],
+                                      rest_home=home_rest, rest_away=away_rest[:k]))
         return rows
 
-    def _sub_row(self, start_row, incoming, home_roster, away_roster) -> dict:
+    def _sub_row(self, start_row, incoming, home_roster, away_roster,
+                 rest_home, rest_away) -> dict:
         """One synthetic opening sub: outgoing = ``"start"``, incoming = a starter, time 0.
 
-        Inherits all columns from the game's ``start`` row (game_id, season, playoff, …)
-        and overrides only the substitution-specific fields, so the synthetic rows align
-        exactly with the cleaned-data columns regardless of which are present.
+        Inherits all columns from the game's ``start`` row (game_id, season, playoff, team
+        scalars, …) and overrides only the substitution-specific fields plus the
+        roster-parallel ``rest_home`` / ``rest_away`` so they stay aligned with the rebuilt
+        rosters.
         """
         row = start_row.to_dict()
         row.update({
             "roster_home": list(home_roster),
             "roster_away": list(away_roster),
+            "rest_home": list(rest_home),
+            "rest_away": list(rest_away),
             "time": 0,
             "event": SUB_EVENT,
             OUTGOING_FIELD: START_TOKEN,  # outgoing = "start"
@@ -148,6 +169,19 @@ class SubstitutionModel:
             INCOMING_FIELD: incoming,     # incoming = a starter
         })
         return row
+
+    def _start_rest(self, start_row, col, count) -> list:
+        """The starting five's rest values from the ``start`` row, length ``count``.
+
+        Falls back to the default rest if the data isn't season-enriched (e.g. a unit test
+        on bare cleaned rows), so opening-sub synthesis never depends on the column.
+        """
+        if col in start_row and pd.notna(start_row[col]):
+            vals = self.encoder.str_to_list(start_row[col])[:count]
+            if len(vals) >= count:
+                return vals
+            return vals + [DEFAULT_REST_DAYS] * (count - len(vals))
+        return [DEFAULT_REST_DAYS] * count
 
     def _augment_with_opening_subs(self, df: pd.DataFrame) -> pd.DataFrame:
         """Insert the synthetic opening subs after each game's ``start`` frame.
@@ -167,10 +201,17 @@ class SubstitutionModel:
             start_row = game.loc[s]
             home_starters = self.encoder.str_to_list(start_row["roster_home"])[:ROSTER_SIZE]
             away_starters = self.encoder.str_to_list(start_row["roster_away"])[:ROSTER_SIZE]
-            synth = pd.DataFrame(self._opening_sub_rows(start_row, home_starters, away_starters))
+            # Season-context rest, aligned to the starting fives (default if not enriched).
+            home_rest = self._start_rest(start_row, "rest_home", len(home_starters))
+            away_rest = self._start_rest(start_row, "rest_away", len(away_starters))
+            synth = pd.DataFrame(self._opening_sub_rows(
+                start_row, home_starters, away_starters, home_rest, away_rest))
 
             game.at[s, "roster_home"] = []  # build the five up from empty
             game.at[s, "roster_away"] = []
+            if "rest_home" in game.columns:  # keep rest aligned with the blanked roster
+                game.at[s, "rest_home"] = []
+                game.at[s, "rest_away"] = []
             parts.append(pd.concat(
                 [game.iloc[: s + 1], synth, game.iloc[s + 1:]], ignore_index=True
             ))
@@ -237,6 +278,9 @@ class SubstitutionModel:
             "time_abs": time_abs,
             "delta_time": delta_norm,
         }
+        merge_season_features(
+            df, cols, rosters, self.encoder.encode_player("PAD"), train_mask, self.norm_stats
+        )
         train = self._build_split(cols, game_id, train_games)
         test = self._build_split(cols, game_id, test_games)
         holdout = self._build_split(cols, game_id, holdout_games)
@@ -289,7 +333,7 @@ class SubstitutionModel:
         keys_cont = ["time_abs", "delta_time"]
         keys_next_cat = ["next_event", "next_player", "next_secondary_player"]
 
-        batches = {k: [] for k in (*keys_1d, *keys_roster, *keys_cont,
+        batches = {k: [] for k in (*keys_1d, *keys_roster, *keys_cont, *SEASON_INPUT_KEYS,
                                    *keys_next_cat, "next_delta_time",
                                    "pad_mask", "loss_mask")}
 
@@ -313,6 +357,8 @@ class SubstitutionModel:
                 buf = np.zeros((SEQ, 1), dtype=np.float32)
                 buf[:n, 0] = cols[k][idx]
                 batches[k].append(buf)
+
+            append_season_batches(batches, cols, idx, n, SEQ)
 
             for k in keys_next_cat:
                 buf = np.full((SEQ,), next_pad[k], dtype=np.int32)
@@ -376,6 +422,7 @@ class SubstitutionModel:
         away_roster = Input(shape=(SEQ, ROSTER_SIZE), dtype="int32", name="away_roster")
         time_abs = Input(shape=(SEQ, 1), dtype="float32", name="time_abs")
         delta_time = Input(shape=(SEQ, 1), dtype="float32", name="delta_time")
+        rest_home, rest_away, team_inputs = make_season_inputs(SEQ)
         next_event = Input(shape=(SEQ,), dtype="int32", name="next_event")
         next_delta_time = Input(shape=(SEQ, 1), dtype="float32", name="next_delta_time")
         next_player = Input(shape=(SEQ,), dtype="int32", name="next_player")
@@ -400,18 +447,19 @@ class SubstitutionModel:
             player_emb_layer(next_player),
         ]
 
-        # ---- Roster encoding across the sequence (shared home/away) ----
-        home_vec = self.roster_encoder(home_roster)
-        away_vec = self.roster_encoder(away_roster)
+        # ---- Roster encoding across the sequence (shared home/away, with per-player rest) ----
+        home_vec = self.roster_encoder([home_roster, rest_home])
+        away_vec = self.roster_encoder([away_roster, rest_away])
 
         # ---- Continuous projections ----
         t_abs = layers.Dense(16, name="time_abs_proj")(time_abs)
         t_delta = layers.Dense(16, name="delta_time_proj")(delta_time)
         t_next_delta = layers.Dense(16, name="next_delta_time_proj")(next_delta_time)
+        t_team = season_team_projections(team_inputs)  # games-played + team rest per side
 
         # ---- Fusion ----
         x = layers.Concatenate(axis=-1, name="fusion_concat")(
-            [*embs, *cond_vecs, home_vec, away_vec, t_abs, t_delta, t_next_delta]
+            [*embs, *cond_vecs, home_vec, away_vec, t_abs, t_delta, t_next_delta, *t_team]
         )
         x = layers.Dense(D, name="fusion_projection")(x)
         x = layers.LayerNormalization(epsilon=1e-6, name="fusion_ln")(x)
@@ -447,6 +495,7 @@ class SubstitutionModel:
             **cat_inputs,
             "home_roster": home_roster, "away_roster": away_roster,
             "time_abs": time_abs, "delta_time": delta_time,
+            "rest_home": rest_home, "rest_away": rest_away, **team_inputs,
             "next_event": next_event, "next_delta_time": next_delta_time,
             "next_player": next_player,
             "pad_mask": pad_mask,
