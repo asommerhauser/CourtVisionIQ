@@ -86,3 +86,20 @@ SEASONS_PER_STAGE = 3
 #   "frac:f"      -> stop at the game f-of-the-way through that season's regular games.
 #   "pre_playoffs"-> stop at the last regular-season game (holdout = first HOLDOUT_GAMES playoffs).
 BOUNDARY_CYCLE = ("frac:0.25", "frac:0.50", "pre_playoffs")
+
+# --- Recency weighting (single full train: older seasons contribute less to the loss) ---
+# Every game still trains, but its loss weight decays with age so the modern game dominates the
+# gradient. Newest season = 1.0; weight halves every RECENCY_HALFLIFE_SEASONS seasons, floored at
+# RECENCY_FLOOR (so old-player embeddings keep getting a little gradient). See season_features.
+RECENCY_WEIGHTING = True
+RECENCY_HALFLIFE_SEASONS = 6.0
+RECENCY_FLOOR = 0.05
+
+# --- Single full-train + batched holdout eval (full_train.py / training/full_run.py) ---
+# Stop training partway through the most recent season, hold out the next FINAL_HOLDOUT_GAMES real
+# games, and predict them EVAL_BATCH at a time (pausing between batches). Full-train weights go to
+# their own root so the curriculum's ./artifacts is never clobbered.
+FINAL_SEASON_FRACTION = 0.5
+FINAL_HOLDOUT_GAMES = 100
+EVAL_BATCH = 10
+FULL_ARTIFACTS_ROOT = "./artifacts_full"

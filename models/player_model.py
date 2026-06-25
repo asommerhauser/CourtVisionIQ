@@ -33,6 +33,8 @@ from models.season_features import (
     append_season_batches,
     make_season_inputs,
     season_team_projections,
+    attach_recency_weights,
+    apply_recency,
 )
 from reporting import ReportCollector, RunConfig
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
@@ -181,6 +183,8 @@ class PlayerModel:
         train = self._build_split(cols, game_id, train_games)
         test = self._build_split(cols, game_id, test_games)
         holdout = self._build_split(cols, game_id, holdout_games)
+        attach_recency_weights(
+            [(train, train_games), (test, test_games), (holdout, holdout_games)], df, game_id)
 
         self.processed_dir.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(self.processed_dir / "player_train.npz", **train)
@@ -426,7 +430,7 @@ class PlayerModel:
         """Yield (inputs, targets, sample_weights) with PAD steps zero-weighted."""
         inputs = {k: split[k] for k in self.INPUT_KEYS}
         targets = {"player_output": split["player_target"]}
-        mask = split["loss_mask"]
+        mask = apply_recency(split["loss_mask"], split)
         sample_weights = {"player_output": mask}
 
         ds = tf.data.Dataset.from_tensor_slices((inputs, targets, sample_weights))

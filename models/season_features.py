@@ -22,7 +22,7 @@ import ast
 
 import numpy as np
 
-from config import ROSTER_SIZE
+from config import RECENCY_FLOOR, RECENCY_HALFLIFE_SEASONS, RECENCY_WEIGHTING, ROSTER_SIZE
 
 # Roster-parallel per-player rest inputs (shape (SEQ, ROSTER_SIZE), fed to the roster encoder).
 REST_LIST_COLS = ("rest_home", "rest_away")
@@ -120,6 +120,53 @@ def merge_season_features(df, cols, rosters, pad_player, train_mask, norm_stats,
     standardize_season_cols(raw, rest_mean, rest_std)
     cols.update(raw)
     return cols
+
+
+# =====================
+# --- Recency weight --
+# =====================
+#
+# For a single full train over the whole corpus we want older seasons to matter less (the modern
+# game is what we ultimately predict) without dropping them entirely. Each game gets a loss weight
+# that decays with age — newest season = 1.0, halving every ``RECENCY_HALFLIFE_SEASONS`` seasons,
+# floored at ``RECENCY_FLOOR`` so old-player embeddings still get a little gradient. The weight is
+# computed per game at preprocess time, stored in the npz, and multiplied into each model's
+# sample-weight mask in ``_make_dataset``.
+
+def recency_weight(season: int, latest_season: int,
+                   halflife: float = RECENCY_HALFLIFE_SEASONS,
+                   floor: float = RECENCY_FLOOR) -> float:
+    """Per-game loss weight: 1.0 for the newest season, halving every ``halflife`` seasons of age."""
+    age = max(0, int(latest_season) - int(season))
+    return float(max(floor, 0.5 ** (age / halflife)))
+
+
+def attach_recency_weights(splits, df, game_id) -> None:
+    """Add a per-game ``recency_weight`` (N,) array to each split dict (order matches the tensors).
+
+    ``splits`` is an iterable of ``(split_dict, games_set)``. Game order mirrors ``_build_split``
+    (sorted unique game ids present in the split). No-op when ``RECENCY_WEIGHTING`` is off.
+    """
+    if not RECENCY_WEIGHTING:
+        return
+    season_by_game = df.groupby("game_id")["season"].first().to_dict()
+    latest = int(df["season"].max())
+    uniq = np.unique(game_id)
+    for split_dict, games in splits:
+        ordered = [g for g in uniq if g in games]
+        split_dict["recency_weight"] = np.array(
+            [recency_weight(int(season_by_game[g]), latest) for g in ordered], dtype=np.float32,
+        )
+
+
+def apply_recency(mask, split):
+    """Multiply a ``(N, SEQ)`` sample-weight mask by each game's recency weight (broadcast over SEQ).
+
+    No-op when recency weighting is off or the split predates the feature (key absent).
+    """
+    if RECENCY_WEIGHTING and "recency_weight" in split:
+        return (mask * split["recency_weight"].reshape(-1, 1)).astype(np.float32)
+    return mask
 
 
 def append_season_batches(batches, cols, idx, n, SEQ) -> None:

@@ -55,6 +55,8 @@ from models.season_features import (
     append_season_batches,
     make_season_inputs,
     season_team_projections,
+    attach_recency_weights,
+    apply_recency,
 )
 from models.substitution_model import (
     SubstitutionModel, SUB_EVENT, OUTGOING_FIELD, INCOMING_FIELD, _BASE_INPUT_KEYS,
@@ -217,6 +219,8 @@ class StintLengthModel(SubstitutionModel):
         train = self._build_split(cols, game_id, train_games)
         test = self._build_split(cols, game_id, test_games)
         holdout = self._build_split(cols, game_id, holdout_games)
+        attach_recency_weights(
+            [(train, train_games), (test, test_games), (holdout, holdout_games)], df, game_id)
 
         self.processed_dir.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(self.processed_dir / _PROCESSED["train"], **train)
@@ -438,7 +442,7 @@ class StintLengthModel(SubstitutionModel):
 
         event_id = self.encoder.encode_event(SUB_EVENT)
         event_mask = (split["next_event"] == event_id).astype(np.float32)
-        mask = split["loss_mask"] * event_mask
+        mask = apply_recency(split["loss_mask"] * event_mask, split)
         sample_weights = {self.output_name: mask}
 
         ds = tf.data.Dataset.from_tensor_slices((inputs, targets, sample_weights))

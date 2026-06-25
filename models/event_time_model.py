@@ -26,6 +26,8 @@ from models.season_features import (
     append_season_batches,
     make_season_inputs,
     season_team_projections,
+    attach_recency_weights,
+    apply_recency,
 )
 from reporting import ReportCollector, RunConfig
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
@@ -251,6 +253,8 @@ class EventTimeModel:
         train = self._build_split(cols, game_id, train_games)
         test = self._build_split(cols, game_id, test_games)
         holdout = self._build_split(cols, game_id, holdout_games)
+        attach_recency_weights(
+            [(train, train_games), (test, test_games), (holdout, holdout_games)], df, game_id)
 
         # 7) Persist. Holdout tensors enable event-level eval; the manifest of holdout
         #    game ids is the contract the box-score validation reads to load real games.
@@ -503,6 +507,7 @@ class EventTimeModel:
         # time head never predicts the gap to a sub). Sub rows stay in the sequence as context.
         sub_id = self.encoder.encode_event("substitution")
         mask = (split["loss_mask"] * (split["event_target"] != sub_id)).astype(np.float32)
+        mask = apply_recency(mask, split)
         sample_weights = {"event_output": mask, "time_output": mask}
 
         ds = tf.data.Dataset.from_tensor_slices((inputs, targets, sample_weights))
