@@ -99,7 +99,7 @@ def run_all(data_dir: str = "./data", artifacts_root: str = DEFAULT_ARTIFACTS_RO
 def run_stage(data_dir: str, game_partition, *, artifacts_root: str = DEFAULT_ARTIFACTS_ROOT,
               warm_start_root: str | None = None, epochs: int = 50, batch_size: int = 64,
               report: bool = True, run_name: str | None = None,
-              done: list[str] | None = None) -> list[str]:
+              done: list[str] | None = None, on_trained=None) -> list[str]:
     """Train one curriculum stage: warm-start every model on ``game_partition`` and return the
     keys trained this call.
 
@@ -111,7 +111,9 @@ def run_stage(data_dir: str, game_partition, *, artifacts_root: str = DEFAULT_AR
 
     ``done`` lists keys already trained this stage (a resumed run): their train — and, where a
     whole group is done, their preprocess — is skipped, so an interrupted stage picks up at the
-    next unfinished model. Vocabs are never rebuilt here (the warmup fit froze them).
+    next unfinished model. ``on_trained(key)`` (when given) is called right after each model
+    finishes, so the caller can persist progress before the next (crash-resilient) model starts.
+    Vocabs are never rebuilt here (the warmup fit froze them).
     """
     warm_start_root = warm_start_root or artifacts_root
     done = set(done or [])
@@ -126,6 +128,8 @@ def run_stage(data_dir: str, game_partition, *, artifacts_root: str = DEFAULT_AR
         model.train(epochs=epochs, batch_size=batch_size, artifacts_root=artifacts_root,
                     report=report, run_name=run_name, init_weights_root=warm_start_root)
         trained.append(key)
+        if on_trained is not None:
+            on_trained(key)
 
     # 1) Event/Time, 2) Player — each its own preprocess + train.
     et = EventTimeModel(Encoder(), path=data_dir)
