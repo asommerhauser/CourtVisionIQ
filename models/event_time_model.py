@@ -13,7 +13,7 @@ from config import (
 )
 from data_loading import load_all_cleaned, resolve_partition
 from encoder.encoder import Encoder
-from models.artifacts import ModelArtifacts, DEFAULT_ARTIFACTS_ROOT
+from models.artifacts import ModelArtifacts, DEFAULT_ARTIFACTS_ROOT, warm_start_weights
 from models.norm_stats_io import load_norm_stats, save_norm_stats
 from models.roster_set_encoder import (
     RosterSetEncoder,
@@ -537,7 +537,8 @@ class EventTimeModel:
               mixed_precision=True, jit_compile=False,
               num_layers=4, num_heads=8, ff_dim=1024, dropout=0.2,
               warmup_epochs=1, lr_alpha=0.05,
-              report=True, run_name=None, reports_root=DEFAULT_REPORTS_ROOT):
+              report=True, run_name=None, reports_root=DEFAULT_REPORTS_ROOT,
+              init_weights_root=None):
         """
         Fit the Event/Time model on the preprocessed train split, validating on
         test. Multi-task masked loss: SparseCCE(from_logits) on the event head +
@@ -575,6 +576,8 @@ class EventTimeModel:
         # Print the per-layer table + Total/Trainable/Non-trainable params to the
         # console each run (the report also records these in its Model size table).
         model.summary()
+        # Curriculum warm-start: continue the previous stage's weights when given.
+        warm_start_weights(model, self.KEY, init_weights_root)
 
         # Warmup + cosine-decay LR schedule. The old ReduceLROnPlateau collapsed the
         # LR once loss flattened, stalling learning while the curve was still flat;

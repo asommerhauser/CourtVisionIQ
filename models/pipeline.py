@@ -96,6 +96,70 @@ def run_all(data_dir: str = "./data", artifacts_root: str = DEFAULT_ARTIFACTS_RO
     return None
 
 
+def run_stage(data_dir: str, game_partition, *, artifacts_root: str = DEFAULT_ARTIFACTS_ROOT,
+              warm_start_root: str | None = None, epochs: int = 50, batch_size: int = 64,
+              report: bool = True, run_name: str | None = None,
+              done: list[str] | None = None) -> list[str]:
+    """Train one curriculum stage: warm-start every model on ``game_partition`` and return the
+    keys trained this call.
+
+    Mirrors ``run_all``'s dependency order, but for staged training: every model preprocesses
+    with the explicit chronological ``game_partition`` and ``refit_norm_stats=False`` (reusing the
+    warmup-fit vocab + stats), then trains warm-started from ``warm_start_root`` (defaults to
+    ``artifacts_root`` — the live weights, which hold the *previous* stage's model for each key
+    until this stage overwrites it; an empty root on stage 1 simply trains fresh).
+
+    ``done`` lists keys already trained this stage (a resumed run): their train — and, where a
+    whole group is done, their preprocess — is skipped, so an interrupted stage picks up at the
+    next unfinished model. Vocabs are never rebuilt here (the warmup fit froze them).
+    """
+    warm_start_root = warm_start_root or artifacts_root
+    done = set(done or [])
+    trained: list[str] = []
+    pp = dict(rebuild_vocabs=False, game_partition=game_partition, refit_norm_stats=False)
+
+    def _train(model, key: str) -> None:
+        if key in done:
+            print(f"[stage] '{key}' already trained this stage — skipping")
+            return
+        print(f"\n{'=' * 70}\n[stage] training '{key}' (warm-start <- {warm_start_root})\n{'=' * 70}")
+        model.train(epochs=epochs, batch_size=batch_size, artifacts_root=artifacts_root,
+                    report=report, run_name=run_name, init_weights_root=warm_start_root)
+        trained.append(key)
+
+    # 1) Event/Time, 2) Player — each its own preprocess + train.
+    et = EventTimeModel(Encoder(), path=data_dir)
+    if EventTimeModel.KEY not in done:
+        et.preprocess(**pp)
+        _train(et, EventTimeModel.KEY)
+
+    pl = PlayerModel(Encoder(), path=data_dir)
+    if PlayerModel.KEY not in done:
+        pl.preprocess(**pp)
+        _train(pl, PlayerModel.KEY)
+
+    # 3) Conditional heads — one shared preprocess (only if a head still needs training), then each.
+    cond_keys = [cls.KEY for cls in CONDITIONAL_MODEL_CLASSES]
+    if any(k not in done for k in cond_keys):
+        CONDITIONAL_MODEL_CLASSES[0](Encoder(), path=data_dir).preprocess(**pp)
+    for cls in CONDITIONAL_MODEL_CLASSES:
+        _train(cls(Encoder(), path=data_dir), cls.KEY)
+
+    # 4) Substitution, 5) Stint-length — self-contained preprocess + train.
+    sub = SubstitutionModel(Encoder(), path=data_dir)
+    if SubstitutionModel.KEY not in done:
+        sub.preprocess(**pp)
+        _train(sub, SubstitutionModel.KEY)
+
+    stint = StintLengthModel(Encoder(), path=data_dir)
+    if StintLengthModel.KEY not in done:
+        stint.preprocess(**pp)
+        _train(stint, StintLengthModel.KEY)
+
+    print(f"\n[stage] trained this call: {trained}")
+    return trained
+
+
 def load_all(artifacts_root: str = DEFAULT_ARTIFACTS_ROOT, encoder: Encoder | None = None,
              **kwargs) -> ModelBundle:
     """Load every trained model that has artifacts under ``artifacts_root``.

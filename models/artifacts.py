@@ -61,3 +61,23 @@ class ModelArtifacts:
     def exists(self) -> bool:
         """True when the weights file is present (the minimum needed to reload)."""
         return self.weights_path.exists()
+
+
+def warm_start_weights(model, key: str, init_weights_root) -> bool:
+    """Load a model's weights from a prior artifacts root before fitting (curriculum warm-start).
+
+    Each curriculum stage continues training the previous stage's weights rather than starting
+    fresh; ``init_weights_root`` points at that prior stage's artifacts. Returns True if weights
+    were loaded. Shapes match across stages because the vocab is built + frozen once up front, so
+    every stage rebuilds the identical architecture. A no-op (returns False) when
+    ``init_weights_root`` is falsy or no prior weights exist (the first stage trains fresh).
+    """
+    if not init_weights_root:
+        return False
+    arts = ModelArtifacts.for_key(key, init_weights_root)
+    if arts.weights_path.exists():
+        model.load_weights(arts.weights_path)
+        print(f"[warm-start] '{key}': loaded weights from {arts.weights_path.resolve()}")
+        return True
+    print(f"[warm-start] '{key}': no prior weights at {arts.weights_path.resolve()}; training fresh")
+    return False

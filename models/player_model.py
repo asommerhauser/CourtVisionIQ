@@ -14,7 +14,7 @@ from config import (
 from data_loading import load_all_cleaned, resolve_partition
 from models.norm_stats_io import load_norm_stats, save_norm_stats
 from encoder.encoder import Encoder
-from models.artifacts import ModelArtifacts, DEFAULT_ARTIFACTS_ROOT
+from models.artifacts import ModelArtifacts, DEFAULT_ARTIFACTS_ROOT, warm_start_weights
 from models.event_time_model import (
     AddPositionalEmbedding,
     KeyPaddingMask,
@@ -452,7 +452,8 @@ class PlayerModel:
               mixed_precision=True, jit_compile=False,
               num_layers=4, num_heads=8, ff_dim=1024, dropout=0.2,
               warmup_epochs=1, lr_alpha=0.05,
-              report=True, run_name=None, reports_root=DEFAULT_REPORTS_ROOT):
+              report=True, run_name=None, reports_root=DEFAULT_REPORTS_ROOT,
+              init_weights_root=None):
         """
         Fit the Player model on the preprocessed train split, validating on test.
         Masked SparseCCE(from_logits) on the player head, with loss_mask as
@@ -477,6 +478,7 @@ class PlayerModel:
         model = self.model(num_layers=num_layers, num_heads=num_heads,
                            ff_dim=ff_dim, dropout=dropout)
         model.summary()
+        warm_start_weights(model, self.KEY, init_weights_root)
 
         steps_per_epoch = int(np.ceil(train_split["pad_mask"].shape[0] / batch_size))
         total_steps = steps_per_epoch * epochs
