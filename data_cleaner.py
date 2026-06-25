@@ -1,4 +1,6 @@
 import os
+import re
+
 import pandas as pd
 
 
@@ -557,7 +559,13 @@ class DataCleaner:
 
             temp_df = pd.read_csv(fpath, nrows=1)
             dataset_val = str(temp_df.iloc[0]["data_set"])
-            self.season = int(dataset_val[:4]) + 1
+            # The data_set label carries the season's start year, but the prefix varies:
+            # "2002-03 Regular Season" vs the 2019-20 bubble's "NBA 2019-2020 Regular Season".
+            # Pull the first 4-digit year out of the label rather than assuming it's at index 0.
+            year_match = re.search(r"\d{4}", dataset_val)
+            if not year_match:
+                raise ValueError(f"no season year found in data_set {dataset_val!r} ({fname})")
+            self.season = int(year_match.group()) + 1
 
             _, cleaned_df = self.parse_file(fpath)
 
