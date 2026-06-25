@@ -32,6 +32,7 @@ def main() -> None:
     p_init.add_argument("--epochs", type=int, default=50)
     p_init.add_argument("--batch-size", type=int, default=32)
 
+    sub.add_parser("reschedule", help="Rebuild the schedule from cleaned data (no reclean/warmup).")
     sub.add_parser("train", help="Train the current stage (warm-started), then stop.")
     sub.add_parser("eval", help="Predict the current stage's holdout, then stop + advance.")
     sub.add_parser("status", help="Show the schedule and per-stage progress.")
@@ -47,6 +48,8 @@ def main() -> None:
             )
         cur.init_fresh(data_dir=args.data_dir, processed_dir=args.processed_dir,
                        epochs=args.epochs, batch_size=args.batch_size)
+    elif args.command == "reschedule":
+        cur.reschedule()
     elif args.command == "train":
         cur.train_stage()
     elif args.command == "eval":

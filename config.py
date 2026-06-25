@@ -76,10 +76,13 @@ HOLDOUT_MANIFEST_NAME = "holdout_games.json"
 HOLDOUT_GAMES = 10
 # Predictions run per holdout game when scoring a stage (the simulator is stochastic; we average).
 STAGE_SIMS = 11
-# Seasons trained before the first stop. The stop-point cycle begins in the season AFTER these
-# (e.g. with 2 bootstrap seasons the first stop is 25% into the third season ≈ 2.25 seasons in).
-BOOTSTRAP_SEASONS = 2
-# The repeating stop-point cycle, applied once per season from BOOTSTRAP_SEASONS onward:
+# Seasons of training added between stops. A stop is placed every SEASONS_PER_STAGE seasons
+# (the first stop after the first SEASONS_PER_STAGE seasons), and the stop POINT cycles through
+# BOUNDARY_CYCLE across those stops. So with 3: train ~3 seasons -> stop 25% in -> +3 seasons ->
+# stop 50% in -> +3 seasons -> stop pre-playoffs -> repeat. Keeps the run to ~7 stages over the
+# full corpus rather than 3 stops every single season.
+SEASONS_PER_STAGE = 3
+# The repeating stop-point cycle (one entry consumed per stop, in order):
 #   "frac:f"      -> stop at the game f-of-the-way through that season's regular games.
 #   "pre_playoffs"-> stop at the last regular-season game (holdout = first HOLDOUT_GAMES playoffs).
 BOUNDARY_CYCLE = ("frac:0.25", "frac:0.50", "pre_playoffs")

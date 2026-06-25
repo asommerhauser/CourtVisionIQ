@@ -87,31 +87,32 @@ def test_sequential_partition_is_chronological_and_disjoint(tmp_path):
     assert 0 < len(val) < boundary
 
 
-def test_build_schedule_cycles_and_increases(tmp_path):
-    data_dir = _build_corpus(tmp_path)
+def test_build_schedule_cycles_and_steps(tmp_path):
+    seasons = tuple(range(2003, 2013))  # 10 seasons
+    data_dir = _build_corpus(tmp_path, seasons=seasons)
     idx = game_index(str(data_dir))
 
-    sched = build_schedule(idx, bootstrap_seasons=2, n_holdout=2)
-
-    # Boundaries strictly increase along the schedule.
-    bounds = [st["boundary_idx"] for st in sched]
+    # seasons_per_stage=1 -> a stop every season, the 25/50/pre-playoffs point rotating.
+    sched1 = build_schedule(idx, seasons_per_stage=1, n_holdout=2)
+    bounds = [st["boundary_idx"] for st in sched1 if st["boundary_type"] != "final_full"]
     assert bounds == sorted(bounds) and len(set(bounds)) == len(bounds)
-    # The cycle (frac:0.25 -> frac:0.50 -> pre_playoffs) appears, repeating across seasons.
-    types = [st["boundary_type"] for st in sched]
-    assert types[:3] == ["frac:0.25", "frac:0.50", "pre_playoffs"]
-    # The final stage trains on the whole corpus with no holdout.
-    assert sched[-1]["boundary_type"] == "final_full"
-    assert sched[-1]["boundary_idx"] == len(idx)
-    assert sched[-1]["holdout_game_ids"] == []
-    # Every non-final stage carries a full-size sequential holdout.
-    for st in sched[:-1]:
+    assert [st["boundary_type"] for st in sched1][:3] == ["frac:0.25", "frac:0.50", "pre_playoffs"]
+    assert sched1[-1]["boundary_type"] == "final_full"
+    assert sched1[-1]["boundary_idx"] == len(idx) and sched1[-1]["holdout_game_ids"] == []
+    for st in sched1[:-1]:
         assert len(st["holdout_game_ids"]) == 2
+
+    # seasons_per_stage=3 -> stops land 3 seasons apart (seasons[3], [6], [9]) -> far fewer stages.
+    sched3 = build_schedule(idx, seasons_per_stage=3, n_holdout=2)
+    stop_seasons = [st["season"] for st in sched3 if st["boundary_type"] != "final_full"]
+    assert stop_seasons == [seasons[3], seasons[6], seasons[9]]
+    assert len(sched3) < len(sched1)
 
 
 def test_pre_playoffs_holdout_is_first_playoff_games(tmp_path):
-    data_dir = _build_corpus(tmp_path)
+    data_dir = _build_corpus(tmp_path, seasons=tuple(range(2003, 2013)))
     idx = game_index(str(data_dir))
-    sched = build_schedule(idx, bootstrap_seasons=2, n_holdout=2)
+    sched = build_schedule(idx, seasons_per_stage=1, n_holdout=2)
 
     by_id = idx.set_index("game_id")
     for st in sched:

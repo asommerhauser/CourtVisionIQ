@@ -24,7 +24,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from config import BOOTSTRAP_SEASONS, BOUNDARY_CYCLE, HOLDOUT_GAMES, SEED, TEST_FRAC
+from config import BOUNDARY_CYCLE, HOLDOUT_GAMES, SEASONS_PER_STAGE, SEED, TEST_FRAC
 from data_loading import load_all_cleaned
 
 
@@ -94,18 +94,20 @@ def sequential_partition(index: pd.DataFrame, boundary_idx: int, *,
     return train_set, val_set, set(int(g) for g in holdout_ids)
 
 
-def build_schedule(index: pd.DataFrame, *, bootstrap_seasons: int = BOOTSTRAP_SEASONS,
+def build_schedule(index: pd.DataFrame, *, seasons_per_stage: int = SEASONS_PER_STAGE,
                    cycle: tuple[str, ...] = BOUNDARY_CYCLE,
                    n_holdout: int = HOLDOUT_GAMES) -> list[dict]:
     """The curriculum stop-point schedule: a list of stage dicts in chronological order.
 
-    Starting with the season after ``bootstrap_seasons`` (so the first stop has a real model to
-    warm-start from), emit one boundary per ``cycle`` entry per season, repeating the cycle each
-    season: ``25% of S → 50% of S → pre-playoffs of S → 25% of S+1 → ...``. ``frac:f`` cuts at the
+    A stop is placed every ``seasons_per_stage`` seasons — the first after the first
+    ``seasons_per_stage`` seasons — and the stop *point* cycles through ``cycle`` across those
+    stops. So with 3 and the default cycle: train ~3 seasons → stop 25% into the next season →
+    +3 seasons → stop 50% in → +3 seasons → stop pre-playoffs → repeat. ``frac:f`` cuts at the
     game ``f`` of the way through that season's regular games; ``pre_playoffs`` cuts at the first
-    playoff game (so the holdout is the first ``n_holdout`` playoff games — skipped if that season
-    has no playoffs). Boundaries are forced strictly increasing; any stop without room for a full
-    ``n_holdout`` holdout is dropped. A final ``final_full`` stage trains on the entire corpus.
+    playoff game (so the holdout is the first ``n_holdout`` playoff games — skipped, advancing the
+    cycle, if that season has no playoffs). Boundaries are forced strictly increasing; any stop
+    without room for a full ``n_holdout`` holdout is dropped. A final ``final_full`` stage trains
+    on the entire corpus.
 
     Each entry: ``{stage, boundary_idx, boundary_type, season, train_games, holdout_game_ids}``.
     """
@@ -118,39 +120,45 @@ def build_schedule(index: pd.DataFrame, *, bootstrap_seasons: int = BOOTSTRAP_SE
     def _last_boundary() -> int:
         return schedule[-1]["boundary_idx"] if schedule else 0
 
-    for s in seasons[bootstrap_seasons:]:
+    # Stop k (0-based) lands in the season ``seasons_per_stage`` * (k+1) along, with its point
+    # taken from ``cycle[k % len(cycle)]`` — so stops are spaced ~seasons_per_stage seasons apart
+    # while the 25% / 50% / pre-playoffs point rotates.
+    k = 0
+    while seasons_per_stage * (k + 1) < len(seasons):
+        s = seasons[seasons_per_stage * (k + 1)]
+        entry = cycle[k % len(cycle)]
+        k += 1
+
         srows = index[index["season"] == s]
         reg = srows[srows["is_regular"]]
         if reg.empty:
             continue
         first_reg_pos = int(reg["pos"].min())
         reg_count = int(len(reg))
-        playoff_rows = srows[~srows["is_regular"]]
-        first_playoff_pos = int(playoff_rows["pos"].min()) if not playoff_rows.empty else None
 
-        for entry in cycle:
-            if entry.startswith("frac:"):
-                f = float(entry.split(":", 1)[1])
-                boundary_idx = first_reg_pos + int(f * reg_count)
-            elif entry == "pre_playoffs":
-                if first_playoff_pos is None:
-                    continue
-                boundary_idx = first_playoff_pos
-            else:
-                raise ValueError(f"unknown boundary cycle entry: {entry!r}")
+        if entry.startswith("frac:"):
+            f = float(entry.split(":", 1)[1])
+            boundary_idx = first_reg_pos + int(f * reg_count)
+        elif entry == "pre_playoffs":
+            playoff_rows = srows[~srows["is_regular"]]
+            if playoff_rows.empty:
+                continue
+            boundary_idx = int(playoff_rows["pos"].min())
+        else:
+            raise ValueError(f"unknown boundary cycle entry: {entry!r}")
 
-            if boundary_idx <= _last_boundary():
-                continue                                   # keep boundaries strictly increasing
-            if boundary_idx + n_holdout > total:
-                continue                                   # not enough games left for a holdout
-            schedule.append({
-                "stage": len(schedule) + 1,
-                "boundary_idx": boundary_idx,
-                "boundary_type": entry,
-                "season": int(s),
-                "train_games": boundary_idx,
-                "holdout_game_ids": [int(g) for g in ordered_ids[boundary_idx:boundary_idx + n_holdout]],
-            })
+        if boundary_idx <= _last_boundary():
+            continue                                       # keep boundaries strictly increasing
+        if boundary_idx + n_holdout > total:
+            continue                                       # not enough games left for a holdout
+        schedule.append({
+            "stage": len(schedule) + 1,
+            "boundary_idx": boundary_idx,
+            "boundary_type": entry,
+            "season": int(s),
+            "train_games": boundary_idx,
+            "holdout_game_ids": [int(g) for g in ordered_ids[boundary_idx:boundary_idx + n_holdout]],
+        })
 
     # Final stage: train on the whole corpus (no further holdout to predict).
     if _last_boundary() < total:

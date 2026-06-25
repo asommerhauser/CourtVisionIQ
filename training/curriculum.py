@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 from config import (
-    BOOTSTRAP_SEASONS, HOLDOUT_GAMES, NORM_STATS_PATH, SEED, STAGE_SIMS, TEST_FRAC, VOCAB_DIR,
+    HOLDOUT_GAMES, NORM_STATS_PATH, SEASONS_PER_STAGE, SEED, STAGE_SIMS, TEST_FRAC, VOCAB_DIR,
 )
 from models.artifacts import DEFAULT_ARTIFACTS_ROOT
 from models.conditional_type_model import CONDITIONAL_MODEL_CLASSES
@@ -91,7 +91,7 @@ class Curriculum:
         self._warmup_fit(idx, data_dir, processed_dir)
 
         print("[init] building the stop-point schedule")
-        schedule = build_schedule(idx, bootstrap_seasons=BOOTSTRAP_SEASONS, n_holdout=HOLDOUT_GAMES)
+        schedule = build_schedule(idx, seasons_per_stage=SEASONS_PER_STAGE, n_holdout=HOLDOUT_GAMES)
 
         self.state = {
             "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -143,6 +143,25 @@ class Curriculum:
         _fit(CONDITIONAL_MODEL_CLASSES[0](Encoder(), **common), rebuild=False)
         _fit(SubstitutionModel(Encoder(), **common), rebuild=False)
         _fit(StintLengthModel(Encoder(), **common), rebuild=False)
+
+    # --------------------------------------------------------------- reschedule
+    def reschedule(self) -> None:
+        """Rebuild the stop-point schedule from the already-cleaned data; rewrite state in place.
+
+        No re-clean, no re-warmup — just regenerates ``schedule`` from the current cadence config
+        and resets progress to stage 1. Use after changing SEASONS_PER_STAGE / BOUNDARY_CYCLE.
+        """
+        self._require_init()
+        idx = game_index(self.state["data_dir"])
+        schedule = build_schedule(idx, seasons_per_stage=SEASONS_PER_STAGE, n_holdout=HOLDOUT_GAMES)
+        self.state["schedule"] = schedule
+        self.state["current_stage"] = 1
+        self.state["stages"] = {}
+        self.state["n_games"] = int(len(idx))
+        self._save()
+        print(format_schedule(idx, schedule))
+        print(f"\n[reschedule] {len(schedule)} stages over {len(idx)} games. State -> {self.state_path}")
+        print("Run:  python train_full.py train")
 
     # --------------------------------------------------------------- train
     def train_stage(self) -> None:
