@@ -99,3 +99,17 @@ def split_games(unique_games, seed: int, test_frac: float, holdout_frac: float):
     test = set(games[n_holdout:n_holdout + n_test].tolist())
     train = set(games[n_holdout + n_test:].tolist())
     return train, test, holdout
+
+
+def resolve_partition(game_partition, game_id, seed, test_frac, holdout_frac):
+    """Return the ``(train, test, holdout)`` game-id sets a model's preprocess should use.
+
+    When ``game_partition`` is given (the curriculum's explicit chronological split — see
+    ``training.chronology.sequential_partition``) it is normalized to int sets and used verbatim;
+    otherwise this falls back to the random, seeded ``split_games`` over all games. Centralized so
+    every model resolves the split the same way.
+    """
+    if game_partition is not None:
+        train, test, holdout = game_partition
+        return ({int(g) for g in train}, {int(g) for g in test}, {int(g) for g in holdout})
+    return split_games(np.unique(game_id), seed=seed, test_frac=test_frac, holdout_frac=holdout_frac)

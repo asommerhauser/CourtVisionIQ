@@ -47,7 +47,8 @@ from config import (
     MAX_SEQUENCE_LENGTH, ROSTER_SIZE, NORM_STATS_PATH,
     SEED, TEST_FRAC, HOLDOUT_FRAC, HOLDOUT_MANIFEST_NAME,
 )
-from data_loading import load_all_cleaned, split_games
+from data_loading import load_all_cleaned, resolve_partition
+from models.norm_stats_io import load_norm_stats, save_norm_stats
 from encoder.encoder import Encoder
 from models.artifacts import ModelArtifacts, DEFAULT_ARTIFACTS_ROOT
 from models.event_time_model import (
@@ -170,8 +171,13 @@ class ConditionalTypeModel:
     # --- Preprocessing ---
     # =====================
 
+    # Stable key for the shared conditional norm-stats file (per-head KEY varies; the
+    # preprocess + tensors are shared across all heads, so the stats are too).
+    STATS_KEY = "conditional"
+
     def preprocess(self, rebuild_vocabs=False, test_frac=TEST_FRAC,
-                   holdout_frac=HOLDOUT_FRAC, seed=SEED):
+                   holdout_frac=HOLDOUT_FRAC, seed=SEED,
+                   game_partition=None, refit_norm_stats=True):
         """
         Build the shared conditional tensor arrays + persist them and the time-norm stats.
 
@@ -181,6 +187,9 @@ class ConditionalTypeModel:
         base tensors plus every ``next_*`` chain array, so all five heads train off it.
         ``rebuild_vocabs`` defaults False (the shared vocab language is built + frozen by
         the Event/Time model); we just load + freeze it.
+
+        ``game_partition`` / ``refit_norm_stats`` (curriculum use): see
+        ``EventTimeModel.preprocess``.
         """
         df = self._load_all()
 
@@ -207,17 +216,23 @@ class ConditionalTypeModel:
             df.groupby("game_id")["time"].diff().fillna(0).clip(lower=0).to_numpy(dtype=np.float64)
         )
 
-        train_games, test_games, holdout_games = split_games(
-            np.unique(game_id), seed=seed, test_frac=test_frac, holdout_frac=holdout_frac,
+        train_games, test_games, holdout_games = resolve_partition(
+            game_partition, game_id, seed, test_frac, holdout_frac,
         )
         train_mask = np.array([g in train_games for g in game_id])
 
-        # Normalization stats from TRAIN ONLY (recomputed identically to Event/Time).
-        max_time = float(time[train_mask].max()) or 1.0
-        train_delta = delta[train_mask]
-        delta_mean = float(train_delta.mean())
-        delta_std = float(train_delta.std()) or 1.0
-        self.norm_stats = {"max_time": max_time, "delta_mean": delta_mean, "delta_std": delta_std}
+        # Normalization stats from TRAIN ONLY (or loaded warmup stats, for staged warm-start).
+        if refit_norm_stats:
+            max_time = float(time[train_mask].max()) or 1.0
+            train_delta = delta[train_mask]
+            delta_mean = float(train_delta.mean())
+            delta_std = float(train_delta.std()) or 1.0
+            self.norm_stats = {"max_time": max_time, "delta_mean": delta_mean, "delta_std": delta_std}
+        else:
+            self.norm_stats = load_norm_stats(self.processed_dir, self.STATS_KEY)
+            max_time = float(self.norm_stats["max_time"]) or 1.0
+            delta_mean = float(self.norm_stats["delta_mean"])
+            delta_std = float(self.norm_stats["delta_std"]) or 1.0
 
         time_abs = (time / max_time).astype(np.float32)
         delta_norm = ((delta - delta_mean) / delta_std).astype(np.float32)
@@ -230,7 +245,8 @@ class ConditionalTypeModel:
             "delta_time": delta_norm,
         }
         merge_season_features(
-            df, cols, rosters, self.encoder.encode_player("PAD"), train_mask, self.norm_stats
+            df, cols, rosters, self.encoder.encode_player("PAD"), train_mask, self.norm_stats,
+            refit=refit_norm_stats,
         )
         train = self._build_split(cols, game_id, train_games)
         test = self._build_split(cols, game_id, test_games)
@@ -243,6 +259,8 @@ class ConditionalTypeModel:
         (self.processed_dir / HOLDOUT_MANIFEST_NAME).write_text(
             json.dumps(sorted(int(g) for g in holdout_games), indent=2), encoding="utf-8"
         )
+        if refit_norm_stats:
+            save_norm_stats(self.processed_dir, self.STATS_KEY, self.norm_stats)
 
         print(f"Preprocessed {len(train_games)} train / {len(test_games)} test / "
               f"{len(holdout_games)} holdout games -> {self.processed_dir} "

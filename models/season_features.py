@@ -100,16 +100,23 @@ def standardize_season_cols(raw, rest_mean, rest_std) -> dict:
     return raw
 
 
-def merge_season_features(df, cols, rosters, pad_player, train_mask, norm_stats) -> dict:
+def merge_season_features(df, cols, rosters, pad_player, train_mask, norm_stats,
+                          refit: bool = True) -> dict:
     """Build, normalize, and merge the season-context arrays into ``cols``.
 
-    Persists ``rest_mean`` / ``rest_std`` into ``norm_stats`` (train-only, like the time
-    stats) so inference applies the identical transform. Mutates and returns ``cols``.
+    When ``refit`` (the default), computes ``rest_mean`` / ``rest_std`` from the train rows and
+    persists them into ``norm_stats`` (like the time stats) so inference applies the identical
+    transform. When ``refit`` is False (staged curriculum runs), reuses the already-persisted
+    ``rest_mean`` / ``rest_std`` from ``norm_stats`` so standardization stays fixed across stages.
+    Mutates and returns ``cols``.
     """
     raw = build_raw_season_cols(df)
-    rest_mean, rest_std = compute_rest_stats(raw, rosters, pad_player, train_mask)
-    norm_stats["rest_mean"] = rest_mean
-    norm_stats["rest_std"] = rest_std
+    if refit:
+        rest_mean, rest_std = compute_rest_stats(raw, rosters, pad_player, train_mask)
+        norm_stats["rest_mean"] = rest_mean
+        norm_stats["rest_std"] = rest_std
+    else:
+        rest_mean, rest_std = norm_stats["rest_mean"], norm_stats["rest_std"]
     standardize_season_cols(raw, rest_mean, rest_std)
     cols.update(raw)
     return cols

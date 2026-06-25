@@ -11,9 +11,10 @@ from config import (
     MAX_SEQUENCE_LENGTH, ROSTER_SIZE, NORM_STATS_PATH,
     SEED, TEST_FRAC, HOLDOUT_FRAC, HOLDOUT_MANIFEST_NAME,
 )
-from data_loading import load_all_cleaned, split_games
+from data_loading import load_all_cleaned, resolve_partition
 from encoder.encoder import Encoder
 from models.artifacts import ModelArtifacts, DEFAULT_ARTIFACTS_ROOT
+from models.norm_stats_io import load_norm_stats, save_norm_stats
 from models.roster_set_encoder import (
     RosterSetEncoder,
     RosterEncoderParams,
@@ -161,7 +162,8 @@ class EventTimeModel:
     # =====================
 
     def preprocess(self, rebuild_vocabs=True, test_frac=TEST_FRAC,
-                   holdout_frac=HOLDOUT_FRAC, seed=SEED):
+                   holdout_frac=HOLDOUT_FRAC, seed=SEED,
+                   game_partition=None, refit_norm_stats=True):
         """
         Build the model-ready tensor arrays and persist them, the vocabs, and the
         time-normalization stats. Returns (train, test) dicts of numpy arrays.
@@ -171,6 +173,12 @@ class EventTimeModel:
         batch of real games the model never sees, for unbiased real-game testing. The
         holdout game ids are written to a manifest so the box-score validation can find
         exactly those games.
+
+        ``game_partition`` (curriculum use): an explicit ``(train, test, holdout)`` tuple of
+        game-id collections to use instead of the random ``split_games`` (e.g. the chronological
+        next-N split from ``training.chronology.sequential_partition``). ``refit_norm_stats``
+        (default True) recomputes + persists normalization stats from the train slice; set False
+        in staged runs to load the warmup-fit stats so standardization stays fixed for warm-start.
         """
         df = self._load_all()
 
@@ -203,19 +211,25 @@ class EventTimeModel:
 
         # 4) Split games into train/test/holdout BEFORE computing normalization stats.
         #    The holdout is carved off first and excluded from both train and test.
-        train_games, test_games, holdout_games = split_games(
-            np.unique(game_id), seed=seed, test_frac=test_frac, holdout_frac=holdout_frac,
+        train_games, test_games, holdout_games = resolve_partition(
+            game_partition, game_id, seed, test_frac, holdout_frac,
         )
 
         train_mask = np.array([g in train_games for g in game_id])
 
-        # 5) Normalization stats from TRAIN ONLY. time_abs = time/max_time;
-        #    delta standardized. Persist so inference uses identical transforms.
-        max_time = float(time[train_mask].max()) or 1.0
-        train_delta = delta[train_mask]
-        delta_mean = float(train_delta.mean())
-        delta_std = float(train_delta.std()) or 1.0
-        self.norm_stats = {"max_time": max_time, "delta_mean": delta_mean, "delta_std": delta_std}
+        # 5) Normalization stats from TRAIN ONLY (or loaded, for staged warm-start). time_abs =
+        #    time/max_time; delta standardized. Persist so inference uses identical transforms.
+        if refit_norm_stats:
+            max_time = float(time[train_mask].max()) or 1.0
+            train_delta = delta[train_mask]
+            delta_mean = float(train_delta.mean())
+            delta_std = float(train_delta.std()) or 1.0
+            self.norm_stats = {"max_time": max_time, "delta_mean": delta_mean, "delta_std": delta_std}
+        else:
+            self.norm_stats = load_norm_stats(self.processed_dir, self.KEY)
+            max_time = float(self.norm_stats["max_time"]) or 1.0
+            delta_mean = float(self.norm_stats["delta_mean"])
+            delta_std = float(self.norm_stats["delta_std"]) or 1.0
 
         time_abs = (time / max_time).astype(np.float32)
         delta_norm = ((delta - delta_mean) / delta_std).astype(np.float32)
@@ -231,7 +245,8 @@ class EventTimeModel:
             "delta_time": delta_norm,
         }
         merge_season_features(
-            df, cols, rosters, self.encoder.encode_player("PAD"), train_mask, self.norm_stats
+            df, cols, rosters, self.encoder.encode_player("PAD"), train_mask, self.norm_stats,
+            refit=refit_norm_stats,
         )
         train = self._build_split(cols, game_id, train_games)
         test = self._build_split(cols, game_id, test_games)
@@ -246,8 +261,11 @@ class EventTimeModel:
         (self.processed_dir / HOLDOUT_MANIFEST_NAME).write_text(
             json.dumps(sorted(int(g) for g in holdout_games), indent=2), encoding="utf-8"
         )
-        Path(NORM_STATS_PATH).parent.mkdir(parents=True, exist_ok=True)
-        Path(NORM_STATS_PATH).write_text(json.dumps(self.norm_stats, indent=2), encoding="utf-8")
+        # Only (re)write the normalization stats when refitting; staged runs reuse warmup stats.
+        if refit_norm_stats:
+            save_norm_stats(self.processed_dir, self.KEY, self.norm_stats)
+            Path(NORM_STATS_PATH).parent.mkdir(parents=True, exist_ok=True)
+            Path(NORM_STATS_PATH).write_text(json.dumps(self.norm_stats, indent=2), encoding="utf-8")
 
         print(f"Preprocessed {len(train_games)} train / {len(test_games)} test / "
               f"{len(holdout_games)} holdout games -> {self.processed_dir} "

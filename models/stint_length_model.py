@@ -38,7 +38,8 @@ from keras import layers, Input
 from config import (
     NORM_STATS_PATH, ROSTER_SIZE, SEED, TEST_FRAC, HOLDOUT_FRAC, HOLDOUT_MANIFEST_NAME,
 )
-from data_loading import split_games
+from data_loading import resolve_partition
+from models.norm_stats_io import load_norm_stats, save_norm_stats
 from models.artifacts import DEFAULT_ARTIFACTS_ROOT
 from models.event_time_model import (
     AddPositionalEmbedding,
@@ -122,7 +123,8 @@ class StintLengthModel(SubstitutionModel):
     # =====================
 
     def preprocess(self, rebuild_vocabs=False, test_frac=TEST_FRAC,
-                   holdout_frac=HOLDOUT_FRAC, seed=SEED):
+                   holdout_frac=HOLDOUT_FRAC, seed=SEED,
+                   game_partition=None, refit_norm_stats=True):
         """Build the stint-length tensor arrays (with synthesized opening subs) + persist.
 
         Same loader / encoding / Δt normalization / train-val-holdout split as the rest of the
@@ -130,6 +132,11 @@ class StintLengthModel(SubstitutionModel):
         target: standardized ``log1p`` realized stint seconds per substitution row, with
         ``stint_log_mean`` / ``stint_log_std`` folded into ``norm_stats``. Writes
         ``stint_{train,test,holdout}.npz``.
+
+        ``game_partition`` / ``refit_norm_stats`` (curriculum use): see
+        ``EventTimeModel.preprocess``. With ``refit_norm_stats=False`` the log-stint scaling
+        (``stint_log_mean`` / ``stint_log_std``) is loaded too, so the regression target stays in
+        the same units the warm-started head was trained against.
         """
         df = self._load_all()
         df = self._augment_with_opening_subs(df).reset_index(drop=True)
@@ -157,26 +164,38 @@ class StintLengthModel(SubstitutionModel):
             df.groupby("game_id")["time"].diff().fillna(0).clip(lower=0).to_numpy(dtype=np.float64)
         )
 
-        train_games, test_games, holdout_games = split_games(
-            np.unique(game_id), seed=seed, test_frac=test_frac, holdout_frac=holdout_frac,
+        train_games, test_games, holdout_games = resolve_partition(
+            game_partition, game_id, seed, test_frac, holdout_frac,
         )
         train_mask = np.array([g in train_games for g in game_id])
 
-        max_time = float(time[train_mask].max()) or 1.0
-        train_delta = delta[train_mask]
-        delta_mean = float(train_delta.mean())
-        delta_std = float(train_delta.std()) or 1.0
-        self.norm_stats = {"max_time": max_time, "delta_mean": delta_mean, "delta_std": delta_std}
+        if refit_norm_stats:
+            max_time = float(time[train_mask].max()) or 1.0
+            train_delta = delta[train_mask]
+            delta_mean = float(train_delta.mean())
+            delta_std = float(train_delta.std()) or 1.0
+            self.norm_stats = {"max_time": max_time, "delta_mean": delta_mean, "delta_std": delta_std}
+        else:
+            self.norm_stats = load_norm_stats(self.processed_dir, self.KEY)
+            max_time = float(self.norm_stats["max_time"]) or 1.0
+            delta_mean = float(self.norm_stats["delta_mean"])
+            delta_std = float(self.norm_stats["delta_std"]) or 1.0
 
         time_abs = (time / max_time).astype(np.float32)
         delta_norm = ((delta - delta_mean) / delta_std).astype(np.float32)
 
         # --- Regression target: standardized log1p(stint seconds) on substitution rows. ---
+        # Scaling is recomputed from train (refit) or loaded (staged) so it matches the
+        # warm-started head's units.
         is_sub = enc["event"] == self.encoder.encode_event(SUB_EVENT)
         log_stint = np.log1p(self._stint_seconds_per_row(df))
-        train_sub = train_mask & is_sub
-        stint_log_mean = float(log_stint[train_sub].mean()) if train_sub.any() else 0.0
-        stint_log_std = (float(log_stint[train_sub].std()) if train_sub.any() else 1.0) or 1.0
+        if refit_norm_stats:
+            train_sub = train_mask & is_sub
+            stint_log_mean = float(log_stint[train_sub].mean()) if train_sub.any() else 0.0
+            stint_log_std = (float(log_stint[train_sub].std()) if train_sub.any() else 1.0) or 1.0
+        else:
+            stint_log_mean = float(self.norm_stats["stint_log_mean"])
+            stint_log_std = float(self.norm_stats["stint_log_std"]) or 1.0
         stint_target = ((log_stint - stint_log_mean) / stint_log_std).astype(np.float32)
         stint_target[~is_sub] = 0.0  # non-sub rows are masked out of the loss anyway
 
@@ -189,7 +208,8 @@ class StintLengthModel(SubstitutionModel):
             "stint_target": stint_target,
         }
         merge_season_features(
-            df, cols, rosters, self.encoder.encode_player("PAD"), train_mask, self.norm_stats
+            df, cols, rosters, self.encoder.encode_player("PAD"), train_mask, self.norm_stats,
+            refit=refit_norm_stats,
         )
         self.norm_stats["stint_log_mean"] = stint_log_mean
         self.norm_stats["stint_log_std"] = stint_log_std
@@ -205,6 +225,8 @@ class StintLengthModel(SubstitutionModel):
         (self.processed_dir / HOLDOUT_MANIFEST_NAME).write_text(
             json.dumps(sorted(int(g) for g in holdout_games), indent=2), encoding="utf-8"
         )
+        if refit_norm_stats:
+            save_norm_stats(self.processed_dir, self.KEY, self.norm_stats)
 
         print(f"Preprocessed {len(train_games)} train / {len(test_games)} test / "
               f"{len(holdout_games)} holdout games -> {self.processed_dir} "
