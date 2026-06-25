@@ -490,7 +490,11 @@ class DataCleaner:
     def parse_file(self, csv_path):
         self.events = []
 
-        df = pd.read_csv(csv_path, low_memory=False, na_values=["", " "])
+        # Some scraped master files have a handful of malformed rows (a stray comma in a
+        # free-text description yields an extra field — e.g. ~402 of 603k rows in 2016-17).
+        # Skip those rather than abort the whole file; they are individual play rows and
+        # dropping a scattered few does not meaningfully affect a season's games.
+        df = pd.read_csv(csv_path, low_memory=False, na_values=["", " "], on_bad_lines="skip")
         df.rename(columns=lambda c: c.strip(), inplace=True)
         # ``team`` is kept (the only stable per-game team id; see _update_teams); ``date``
         # is also kept and consumed at the game boundary.
