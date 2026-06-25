@@ -29,6 +29,7 @@ from models.conditional_type_model import _PROCESSED, CONDITIONAL_MODEL_CLASSES
 from models.event_time_model import EventTimeModel
 from models.model_bundle import ModelBundle
 from models.player_model import PlayerModel
+from models.stint_length_model import _PROCESSED as _STINT_PROCESSED, StintLengthModel
 from models.substitution_model import (
     _PROCESSED as _SUB_PROCESSED,
     SUB_EVENT,
@@ -61,6 +62,15 @@ def _roster(players):
     return str(list(players))
 
 
+# Season-context columns the (post-season-enrichment) preprocess consumes — every synthetic row
+# carries them so the fixtures match the enriched cleaned-data schema the models train on.
+_SEASON = {
+    "rest_home": str([2.0] * 5), "rest_away": str([2.0] * 5),
+    "home_games_played": 0.5, "away_games_played": 0.5,
+    "home_days_rest": 2.0, "away_days_rest": 2.0,
+}
+
+
 def _event_time_csv(path: Path) -> None:
     """Three short games so an 80/20-ish split yields both train and test games."""
     rows = []
@@ -77,6 +87,7 @@ def _event_time_csv(path: Path) -> None:
                 "result": "r",
                 "secondary_player": "none",
                 "season": "2003",
+                **_SEASON,
             })
     pd.DataFrame(rows).to_csv(path, index=False)
 
@@ -139,6 +150,7 @@ def _player_csv(path: Path) -> None:
                 "result": "r",
                 "secondary_player": "none",
                 "season": "2003",
+                **_SEASON,
             })
     pd.DataFrame(rows).to_csv(path, index=False)
 
@@ -209,14 +221,14 @@ def _conditional_csv(path: Path) -> None:
         rows.append({
             "game_id": gid, "roster_home": _roster(home), "roster_away": _roster(away),
             "time": 0, "event": "start", "player": "start", "type": "start",
-            "result": "start", "secondary_player": "none", "season": "2003",
+            "result": "start", "secondary_player": "none", "season": "2003", **_SEASON,
         })
         for i in range(n):
             ev, tp, rs = plays[i % len(plays)]
             rows.append({
                 "game_id": gid, "roster_home": _roster(home), "roster_away": _roster(away),
                 "time": (i + 1) * 10, "event": ev, "player": players[(gid + i) % len(players)],
-                "type": tp, "result": rs, "secondary_player": "none", "season": "2003",
+                "type": tp, "result": rs, "secondary_player": "none", "season": "2003", **_SEASON,
             })
     pd.DataFrame(rows).to_csv(path, index=False)
 
@@ -272,17 +284,19 @@ def _substitution_csv(path: Path) -> None:
             "game_id": gid, "roster_home": _roster(home), "roster_away": _roster(away),
             "time": 0, "event": "start", "player": "start", "type": "start",
             "result": "start", "secondary_player": "none", "season": "2003", "playoff": 1,
+            **_SEASON,
         })
         rows.append({
             "game_id": gid, "roster_home": _roster(home), "roster_away": _roster(away),
             "time": 10, "event": "shot", "player": "A", "type": "2pt", "result": "made",
-            "secondary_player": "none", "season": "2003", "playoff": 1,
+            "secondary_player": "none", "season": "2003", "playoff": 1, **_SEASON,
         })
         for j, (out, inc) in enumerate(subs):
             rows.append({
                 "game_id": gid, "roster_home": _roster(home), "roster_away": _roster(away),
                 "time": 20 + j * 10, "event": SUB_EVENT, "player": out, "type": SUB_EVENT,
                 "result": SUB_EVENT, "secondary_player": inc, "season": "2003", "playoff": 1,
+                **_SEASON,
             })
     pd.DataFrame(rows).to_csv(path, index=False)
 
@@ -323,10 +337,49 @@ SUBSTITUTION_ADAPTER = ModelTestAdapter(
 )
 
 
+# --------------------------------------------------------------------------- #
+# Stint-length head (regresses an entering player's realized stint; same data as subs)
+# --------------------------------------------------------------------------- #
+
+def _stint_build(encoder, data_dir, processed_dir):
+    return StintLengthModel(
+        encoder,
+        sequence_length=TEST_SEQ_LEN,
+        path=str(data_dir),
+        processed_dir=str(processed_dir),
+    )
+
+
+def _stint_forward(inst, model) -> dict:
+    split = inst._load_processed(_STINT_PROCESSED["test"])
+    inputs = {k: split[k] for k in inst.INPUT_KEYS}
+    out = model(inputs, training=False)
+    return {k: np.asarray(v) for k, v in out.items()}
+
+
+def _stint_assert(inst, outputs) -> None:
+    assert set(outputs.keys()) == {inst.output_name}      # "stint_output"
+    o = outputs[inst.output_name]
+    assert o.ndim == 3 and o.shape[1] == TEST_SEQ_LEN and o.shape[2] == 1  # one regression scalar
+    assert o.shape[0] >= 1
+    assert np.isfinite(o).all()
+
+
+STINT_ADAPTER = ModelTestAdapter(
+    key=StintLengthModel.KEY,
+    model_cls=StintLengthModel,
+    seq_len=TEST_SEQ_LEN,
+    make_csv=_substitution_csv,     # same start+sub fixture; stint targets derive from it
+    build=_stint_build,
+    forward=_stint_forward,
+    assert_outputs=_stint_assert,
+)
+
+
 # New models: append their adapter here to inherit the round-trip coverage below.
 MODEL_TEST_ADAPTERS = [EVENT_TIME_ADAPTER, PLAYER_ADAPTER] + [
     _conditional_adapter(cls) for cls in CONDITIONAL_MODEL_CLASSES
-] + [SUBSTITUTION_ADAPTER]
+] + [SUBSTITUTION_ADAPTER, STINT_ADAPTER]
 
 
 # --------------------------------------------------------------------------- #

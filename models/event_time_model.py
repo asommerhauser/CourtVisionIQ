@@ -478,8 +478,13 @@ class EventTimeModel:
             "event_output": split["event_target"],
             "time_output": split["time_target"],
         }
-        # loss_mask zeroes the loss on PAD steps and on the final (no-next) step.
-        mask = split["loss_mask"]
+        # loss_mask zeroes the loss on PAD steps and on the final (no-next) step. We also zero
+        # every step whose NEXT event is a substitution: substitutions are injected by the
+        # rotation scheduler at inference, not sampled from the event stream, so the event/time
+        # heads must never learn to emit them (no probability mass to renormalize away, and the
+        # time head never predicts the gap to a sub). Sub rows stay in the sequence as context.
+        sub_id = self.encoder.encode_event("substitution")
+        mask = (split["loss_mask"] * (split["event_target"] != sub_id)).astype(np.float32)
         sample_weights = {"event_output": mask, "time_output": mask}
 
         ds = tf.data.Dataset.from_tensor_slices((inputs, targets, sample_weights))
@@ -574,12 +579,19 @@ class EventTimeModel:
         )
         # Time head is trained on standardized deltas; mae_sec reports the same error
         # in real seconds (normalized MAE * delta_std) so convergence is readable.
+        #
+        # Loss is MSE, not MAE, on purpose: inter-event gaps are right-skewed, and MAE targets the
+        # conditional *median* (< mean for a right skew). The rollout fills a fixed 48 minutes by
+        # advancing the clock by the predicted gap each step, so a median-targeting head
+        # systematically under-shoots the gap and packs too many events (hence too many shots) into
+        # the game. MSE targets the conditional *mean*, which makes the expected event count (and
+        # thus pace / FGA) come out right. clipnorm=1.0 on the optimizer guards the rare long gap.
         delta_std = float((self.norm_stats or {}).get("delta_std", 1.0) or 1.0)
         model.compile(
             optimizer=optimizer,
             loss={
                 "event_output": keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-                "time_output": keras.losses.MeanAbsoluteError(),
+                "time_output": keras.losses.MeanSquaredError(),
             },
             loss_weights={"event_output": 1.0, "time_output": time_loss_weight},
             metrics={

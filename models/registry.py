@@ -15,6 +15,7 @@ from __future__ import annotations
 from models.conditional_type_model import CONDITIONAL_MODEL_CLASSES
 from models.event_time_model import EventTimeModel
 from models.player_model import PlayerModel
+from models.stint_length_model import StintLengthModel
 from models.substitution_model import SubstitutionModel
 
 # key -> model wrapper class
@@ -26,4 +27,6 @@ MODEL_REGISTRY: dict[str, type] = {
     **{cls.KEY: cls for cls in CONDITIONAL_MODEL_CLASSES},
     # Substitution head: predicts the incoming player of a substitution.
     SubstitutionModel.KEY: SubstitutionModel,
+    # Stint-length head: regresses how long an entering player stays on the floor.
+    StintLengthModel.KEY: StintLengthModel,
 }

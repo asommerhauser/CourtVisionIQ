@@ -12,8 +12,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from config import FOUL_OUT_LIMIT, PLAYER_TEMPERATURE
-from simulation.controller import GameController, REGULATION, OT_LENGTH, PERIOD_LENGTH
+from config import FOUL_OUT_LIMIT, PLAYER_TEMPERATURE, ROSTER_SIZE
+from simulation.controller import (
+    GameController, OPEN_PLAY_EVENTS, REGULATION, OT_LENGTH, PERIOD_LENGTH,
+)
 from simulation.game_simulator import HOME, AWAY
 
 HOME_FIVE = ["A", "B", "C", "D", "E"]
@@ -25,13 +27,16 @@ REQUIRED_HEADS = {"player", "substitution", "shot_type", "shot_result",
 class FakeSim:
     """Scripted stand-in for GameSimulator — no TF graph, no artifacts."""
 
-    def __init__(self):
+    def __init__(self, scheduler: bool = False, stint_seconds: float = 300.0):
         self.home_roster = list(HOME_FIVE)
         self.away_roster = list(AWAY_FIVE)
         self.home_full = list(HOME_FIVE)
         self.away_full = list(AWAY_FIVE)
         self.history: list[dict] = []
         self.heads = {k: object() for k in REQUIRED_HEADS}
+        if scheduler:                       # opt-in to the stint-length scheduler path
+            self.heads["stint_length"] = object()
+        self.stint_seconds = stint_seconds  # fixed length returned by predict_stint_length
         self.rng = np.random.default_rng(0)
         self.calls: list[tuple] = []
         self._q: dict[str, list] = {"player": [], "type": [], "result": [], "incoming": []}
@@ -68,12 +73,19 @@ class FakeSim:
         self.calls.append(("sub", team, outgoing_bias))
         return self._pop("player"), self._pop("incoming")
 
+    def predict_stint_length(self, incoming, outgoing, *, delta_seconds=0.0, greedy=False,
+                             sigma=None):
+        self.calls.append(("stint", incoming, outgoing))
+        return self.stint_seconds
+
     def start_alternating(self, home_full, away_full, *, possession=HOME, season="2003",
-                          tipoff_time=0.0, greedy=False, greedy_starters=False):
+                          tipoff_time=0.0, greedy=False, greedy_starters=False,
+                          season_context=None):
         self.calls.append(("start_alternating", greedy, greedy_starters))
 
     def start_with_starters(self, home_full, away_full, home_starters, away_starters,
-                            *, possession=HOME, season="2003", tipoff_time=0.0):
+                            *, possession=HOME, season="2003", tipoff_time=0.0,
+                            season_context=None):
         self.calls.append(("start_with_starters", list(home_starters), list(away_starters)))
         self.home_roster = list(home_starters)
         self.away_roster = list(away_starters)
@@ -501,3 +513,66 @@ def test_force_sub_skips_during_pending_rebound():
     ctrl.pending_rebound = True              # mid-play: no subbing at a live ball
     ctrl._maybe_force_sub()
     assert ctrl.sim.home_roster == HOME_FIVE
+
+
+# ===================================================================== #
+# Stint-length scheduler (hybrid rotation timing)
+# ===================================================================== #
+
+def test_substitution_is_never_in_the_event_menu():
+    """The event head is not trained to emit substitution, so it's never a sampled event —
+    regardless of whether the stint scheduler is loaded. Subs are owned by the scheduler /
+    cadence backstop, not the event stream."""
+    for scheduler in (False, True):
+        ctrl = GameController(FakeSim(scheduler=scheduler), seed=0)
+        assert ctrl.use_scheduler is scheduler
+        assert "substitution" not in ctrl.open_play_events
+        assert "substitution" not in OPEN_PLAY_EVENTS
+
+
+def test_start_schedules_an_opening_stint_for_all_ten():
+    ctrl = GameController(FakeSim(scheduler=True, stint_seconds=300.0), seed=0)
+    ctrl.start(HOME_FIVE, AWAY_FIVE)
+    # Every starter is committed to a stint, scheduled to expire at clock(0) + length.
+    assert set(ctrl.stint_target_clock) == set(HOME_FIVE + AWAY_FIVE)
+    assert all(t == 300.0 for t in ctrl.stint_target_clock.values())
+    # Each opener was scheduled with the "start" token as the outgoing conditioning.
+    stint_calls = [c for c in ctrl.sim.calls if c[0] == "stint"]
+    assert len(stint_calls) == 10 and all(c[2] == "start" for c in stint_calls)
+
+
+def test_scheduled_sub_does_not_fire_before_target():
+    ctrl = GameController(FakeSim(scheduler=True, stint_seconds=300.0), seed=0)
+    ctrl.sim.home_full = HOME_FIVE + ["K"]
+    ctrl.start(HOME_FIVE, AWAY_FIVE)
+    ctrl.clock = 200.0                       # before any 300s target
+    ctrl._process_scheduled_subs()
+    assert ctrl.sim.home_roster == HOME_FIVE  # nobody is due yet
+
+
+def test_scheduled_sub_pulls_most_overdue_at_target():
+    ctrl = GameController(FakeSim(scheduler=True, stint_seconds=300.0), seed=0)
+    ctrl.sim.home_full = HOME_FIVE + ["K"]
+    ctrl.start(HOME_FIVE, AWAY_FIVE)
+    ctrl.stint_target_clock["A"] = 250.0     # A is the most overdue on the home five
+    ctrl.clock = 300.0
+    ctrl.sim.script(incoming=["K"])
+    ctrl._process_scheduled_subs()
+
+    assert "K" in ctrl.sim.home_roster and "A" not in ctrl.sim.home_roster
+    assert "A" not in ctrl.stint_target_clock          # outgoing's schedule cleared
+    assert ctrl.stint_target_clock["K"] == 300.0 + 300.0  # incoming committed to a fresh stint
+    # Exactly one player was pulled from the home five (one sub per team per dead ball).
+    assert sum(1 for p in ctrl.sim.home_roster if p in HOME_FIVE) == ROSTER_SIZE - 1
+
+
+def test_scheduled_sub_skips_when_no_bench():
+    ctrl = GameController(FakeSim(scheduler=True, stint_seconds=300.0), seed=0)
+    ctrl.start(HOME_FIVE, AWAY_FIVE)         # full == on-court, no bench either side
+    ctrl.clock = 400.0                       # everyone overdue
+    ctrl._process_scheduled_subs()
+    # Nobody to bring in → no sub happened, the substitution head was never queried, and the
+    # most-overdue player's target was pushed out so the scheduler doesn't spin on it.
+    assert ctrl.sim.home_roster == HOME_FIVE and ctrl.sim.away_roster == AWAY_FIVE
+    assert not [c for c in ctrl.sim.calls if c[0] == "incoming"]
+    assert max(ctrl.stint_target_clock.values()) > 400.0

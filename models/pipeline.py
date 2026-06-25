@@ -27,6 +27,7 @@ from models.conditional_type_model import CONDITIONAL_MODEL_CLASSES
 from models.event_time_model import EventTimeModel
 from models.model_bundle import ModelBundle
 from models.player_model import PlayerModel
+from models.stint_length_model import StintLengthModel
 from models.substitution_model import SubstitutionModel
 
 
@@ -79,6 +80,15 @@ def run_all(data_dir: str = "./data", artifacts_root: str = DEFAULT_ARTIFACTS_RO
         sub.preprocess(rebuild_vocabs=False, holdout_frac=holdout_frac)
     if train:
         _train(sub, SubstitutionModel.KEY)
+
+    # 5) Stint-length head — self-contained preprocess (own stint_*.npz, with the
+    # synthesized opening subs), then train. Drives rotation timing at inference.
+    stint = StintLengthModel(Encoder(), path=data_dir)
+    if not skip_preprocess:
+        print("[pipeline] preprocess 'stint_length' (stint_*.npz w/ opening subs)")
+        stint.preprocess(rebuild_vocabs=False, holdout_frac=holdout_frac)
+    if train:
+        _train(stint, StintLengthModel.KEY)
 
     if train:
         print(f"\n[pipeline] all models trained -> loading bundle from {artifacts_root}")

@@ -17,15 +17,23 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from config import ROSTER_SIZE
+from config import ROSTER_SIZE, STINT_MAX_SECONDS
 from encoder.encoder import Encoder
 from models.event_time_model import EventTimeModel
+from models.stint_length_model import StintLengthModel
 from models.substitution_model import SubstitutionModel
 from simulation.game_simulator import GameSimulator
 
 TEST_SEQ_LEN = 16
 HOME_FIVE = ["A", "B", "C", "D", "E"]
 AWAY_FIVE = ["F", "G", "H", "I", "J"]
+
+# Season-context columns the (post-season-enrichment) preprocess consumes.
+_SEASON = {
+    "rest_home": str([2.0] * 5), "rest_away": str([2.0] * 5),
+    "home_games_played": 0.5, "away_games_played": 0.5,
+    "home_days_rest": 2.0, "away_days_rest": 2.0,
+}
 
 
 def _roster(players):
@@ -59,6 +67,7 @@ def _row(gid, time, event, player, type_, result, secondary):
         "result": result,
         "secondary_player": secondary,
         "season": "2003",
+        **_SEASON,
     }
 
 
@@ -206,6 +215,63 @@ def test_opening_bootstrap_builds_five_from_full_rosters(tmp_path):
     assert all(r["player"] == "start" for r in subs)
     # The incoming starters land in secondary_player.
     assert {r["secondary_player"] for r in subs} == set(sim.home_roster) | set(sim.away_roster)
+
+
+def test_conditioned_inputs_carry_incoming_player(tmp_path):
+    """The stint-head conditioning attaches next_secondary_player (the decided incoming player)."""
+    sim = _load_sim(tmp_path)
+    sim.start_game(HOME_FIVE, AWAY_FIVE, season="2003")
+    sim.append_event("shot", "A", "2pt", "missed")
+
+    inputs = sim._conditioned_inputs(next_event="substitution", delta_seconds=0.0,
+                                     next_player="B", next_secondary_player="K")
+    assert "next_secondary_player" in inputs
+    n = min(len(sim.history), TEST_SEQ_LEN)
+    enc = sim.encoder
+    # The decided incoming player is encoded at the decision position (n-1).
+    assert inputs["next_secondary_player"][0, n - 1] == enc.encode_secondary_player("K")
+    assert inputs["next_player"][0, n - 1] == enc.encode_player("B")
+
+
+def _train_tiny_with_stint(tmp_path: Path):
+    """Train event_time + substitution + stint_length into one artifacts dir."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _make_csv(data_dir / "season_clean.csv")
+    vocab_dir = tmp_path / "vocabs"
+    artifacts_root = tmp_path / "artifacts"
+    processed_dir = tmp_path / "processed"
+
+    et = EventTimeModel(Encoder(vocab_dir=vocab_dir), sequence_length=TEST_SEQ_LEN,
+                        path=str(data_dir), processed_dir=str(processed_dir))
+    et.preprocess(rebuild_vocabs=True, test_frac=0.34)
+    et.train(epochs=1, batch_size=2, artifacts_root=str(artifacts_root),
+             mixed_precision=False, report=False)
+
+    for cls in (SubstitutionModel, StintLengthModel):
+        m = cls(Encoder(vocab_dir=vocab_dir), sequence_length=TEST_SEQ_LEN,
+                path=str(data_dir), processed_dir=str(processed_dir))
+        m.preprocess(rebuild_vocabs=False, test_frac=0.34, holdout_frac=0.0)
+        m.train(epochs=1, batch_size=2, artifacts_root=str(artifacts_root),
+                mixed_precision=False, report=False)
+    return artifacts_root, vocab_dir, data_dir, processed_dir
+
+
+def test_predict_stint_length_is_finite_and_capped(tmp_path):
+    """The stint head loads, carries its own log-stint norm stats, and yields a capped, finite,
+    non-negative stint length in seconds."""
+    artifacts_root, vocab_dir, data_dir, processed_dir = _train_tiny_with_stint(tmp_path)
+    sim = GameSimulator.load(
+        artifacts_root=str(artifacts_root), encoder=Encoder(vocab_dir=vocab_dir),
+        sequence_length=TEST_SEQ_LEN, path=str(data_dir), processed_dir=str(processed_dir),
+    )
+    assert StintLengthModel.KEY in sim.heads
+    assert "stint_log_mean" in sim.stint_norm_stats and "stint_log_std" in sim.stint_norm_stats
+
+    sim.start_game(HOME_FIVE, AWAY_FIVE, season="2003")
+    length = sim.predict_stint_length("K", "B", greedy=True)  # greedy: no sampling noise
+    assert np.isfinite(length)
+    assert 0.0 <= length <= STINT_MAX_SECONDS
 
 
 def test_constrained_sample_respects_candidates(tmp_path):

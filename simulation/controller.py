@@ -26,6 +26,8 @@ from config import (
     EVENT_TEMPERATURE, FOUL_OUT_LIMIT, PLAYER_TEMPERATURE, SUB_FATIGUE_WEIGHT,
     SUB_MAX_GAP_SECONDS,
 )
+from models.stint_length_model import StintLengthModel
+from models.substitution_model import START_TOKEN
 from simulation.game_simulator import GameSimulator, HOME, AWAY
 
 # --- Game structure (NBA) ---
@@ -35,8 +37,11 @@ REGULATION = 4 * PERIOD_LENGTH  # 2880s (48:00)
 MAX_DELTA = 40.0             # clamp the time head so one bad Δt can't blow up the clock
 MAX_EVENTS = 4000            # hard safety cap on rollout length (≈ 8× a real game)
 
-# Legal next-events the event head is masked to, per context.
-OPEN_PLAY_EVENTS = ["shot", "assist", "turnover", "foul", "substitution"]
+# Legal next-events the event head is masked to, per context. Substitution is intentionally NOT
+# here: subs are owned by the rotation scheduler (injected at stint expiry), and the retrained
+# event head is not trained to emit them (its loss masks substitution targets — see
+# EventTimeModel._make_dataset), so there is no substitution mass to renormalize away.
+OPEN_PLAY_EVENTS = ["shot", "assist", "turnover", "foul"]
 POST_MISS_EVENTS = ["rebound", "foul"]   # a rebound is only legal right after a miss
 
 # Conditional-head token whitelists (intentional sampling / masking).
@@ -120,6 +125,17 @@ class GameController:
         self.stint_start: dict[str, float] = {}
         self.last_sub_clock: dict[str, float] = {HOME: 0.0, AWAY: 0.0}
 
+        # --- Stint-length scheduler ---
+        # Substitutions are never sampled from the event head (it isn't trained to emit them);
+        # rotation is owned here. When the stint-length head is loaded, each entering player is
+        # committed to a stint and scheduled to exit at this clock, then pulled at the next dead
+        # ball once reached (see _schedule_stint / _process_scheduled_subs). When the head is
+        # absent we fall back to the cadence backstop (_maybe_force_sub) alone so a bundle without
+        # the stint head still rotates (just without committed stint lengths).
+        self.use_scheduler: bool = StintLengthModel.KEY in self.sim.heads
+        self.stint_target_clock: dict[str, float] = {}
+        self.open_play_events: list[str] = list(OPEN_PLAY_EVENTS)
+
     # ===================================================================== #
     # --- Setup + main loop                                                --
     # ===================================================================== #
@@ -151,6 +167,10 @@ class GameController:
         for player in self._all_ten():
             self.stint_start[player] = 0.0
         self.last_sub_clock = {HOME: 0.0, AWAY: 0.0}
+        # Commit each starter to an opening stint (outgoing = the "start" token, as trained).
+        if self.use_scheduler:
+            for player in self._all_ten():
+                self._schedule_stint(player, START_TOKEN)
         return self
 
     def run(self) -> list[dict]:
@@ -164,7 +184,7 @@ class GameController:
         """Sample and resolve one top-level event (a "play"), updating all game context."""
         post_miss = self.pending_rebound
         self.pending_rebound = False
-        allowed = POST_MISS_EVENTS if post_miss else OPEN_PLAY_EVENTS
+        allowed = POST_MISS_EVENTS if post_miss else self.open_play_events
 
         event, delta = self._sample_event(allowed)
         self._advance_clock(delta)
@@ -183,7 +203,9 @@ class GameController:
             self._do_substitution(delta)
 
         self._check_period()
-        self._maybe_force_sub()
+        if self.use_scheduler:
+            self._process_scheduled_subs()
+        self._maybe_force_sub()   # cadence backstop (and the legacy in-game sub path's safety net)
 
     def _sample_event(self, allowed: list[str]) -> tuple[str, float]:
         """Run the event/time head and pick the next event from ``allowed`` (masked)."""
@@ -317,6 +339,46 @@ class GameController:
         self.stint_start.pop(outgoing, None)
         self.stint_start[incoming] = self.clock
         self.last_sub_clock[team] = self.clock
+        # Commit the incoming player to a fresh stint; the outgoing player's schedule is done.
+        if self.use_scheduler:
+            self.stint_target_clock.pop(outgoing, None)
+            self._schedule_stint(incoming, outgoing)
+
+    def _schedule_stint(self, incoming: str, outgoing: str) -> None:
+        """Sample ``incoming``'s stint length and schedule their exit at ``clock + length``.
+
+        ``outgoing`` is the player they replace (the literal ``"start"`` token for an opener),
+        passed through as the stint head's outgoing conditioning.
+        """
+        length = self.sim.predict_stint_length(incoming, outgoing, greedy=self.greedy)
+        self.stint_target_clock[incoming] = self.clock + length
+
+    def _process_scheduled_subs(self) -> None:
+        """Scheduler trigger: at a dead ball, pull each team's most-overdue committed player.
+
+        A player is due when the clock reaches their scheduled exit; we sub out the single
+        most-overdue player per team per dead ball (the next dead ball catches the next one) and
+        let the substitution head pick the bench replacement. Foul-outs/ejections still pull
+        players immediately elsewhere; this only governs ordinary rotation timing.
+        """
+        if self.pending_rebound or self.finished:
+            return
+        for team in (HOME, AWAY):
+            five = self._five_of(team)
+            overdue = [(self.clock - self.stint_target_clock[p], p) for p in five
+                       if p in self.stint_target_clock
+                       and self.clock >= self.stint_target_clock[p]]
+            if not overdue:
+                continue
+            overdue.sort(reverse=True)          # most overdue first
+            outgoing = overdue[0][1]
+            bench = [p for p in (self.sim.home_full if team == HOME else self.sim.away_full)
+                     if p not in five]
+            if not bench:                       # nobody to bring in — push the target out, move on
+                self.stint_target_clock[outgoing] = self.clock + self.sub_max_gap
+                continue
+            incoming = self.sim.predict_incoming(outgoing, bench, greedy=self.greedy)
+            self._apply_sub(outgoing, incoming)
 
     def _maybe_force_sub(self) -> None:
         """Cadence safety net: force a sub for any team starved past ``sub_max_gap``.

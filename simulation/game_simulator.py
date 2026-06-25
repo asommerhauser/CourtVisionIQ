@@ -39,7 +39,8 @@ from __future__ import annotations
 import numpy as np
 
 from config import (
-    MAX_SEQUENCE_LENGTH, RESULT_TEMPERATURE, ROSTER_SIZE, SUB_TEMPERATURE, TYPE_TEMPERATURE,
+    MAX_SEQUENCE_LENGTH, RESULT_TEMPERATURE, ROSTER_SIZE, STINT_MAX_SECONDS,
+    STINT_SAMPLE_SIGMA, SUB_INCOMING_TEMPERATURE, SUB_TEMPERATURE, TYPE_TEMPERATURE,
 )
 from encoder.encoder import Encoder
 from models.artifacts import DEFAULT_ARTIFACTS_ROOT
@@ -49,6 +50,7 @@ from models.player_model import PlayerModel
 from models.season_features import (
     DEFAULT_REST_DAYS, REST_CLIP_DAYS, TEAM_SCALAR_COLS,
 )
+from models.stint_length_model import StintLengthModel
 from models.substitution_model import START_TOKEN, SUB_EVENT, SubstitutionModel
 
 # Neutral default for a hand-built matchup with no schedule given: treat both teams as
@@ -95,6 +97,9 @@ class GameSimulator:
 
         # Extra model heads (Player / Substitution / …), keyed by KEY.
         self.heads: dict = {}
+        # Stint-length head's normalization stats (its own log-stint mean/std), populated at
+        # load() from that head's wrapper. Empty -> predict_stint_length reads raw (mean 0/std 1).
+        self.stint_norm_stats: dict = {}
         # RNG for constrained sampling (seedable for reproducible rollouts/tests).
         self.rng = np.random.default_rng()
 
@@ -144,6 +149,11 @@ class GameSimulator:
         sim = cls(bundle.models[EventTimeModel.KEY], bundle.instances[EventTimeModel.KEY])
         # Stash any other loaded heads for future use (none consumed yet).
         sim.heads = {k: m for k, m in bundle.models.items() if k != EventTimeModel.KEY}
+        # The stint-length head carries its own log-stint norm stats (separate from the shared
+        # time/rest stats); keep them on hand to denormalize its predictions.
+        stint_inst = bundle.instances.get(StintLengthModel.KEY)
+        if stint_inst is not None:
+            sim.stint_norm_stats = dict(stint_inst.norm_stats or {})
         return sim
 
     # ===================================================================== #
@@ -313,15 +323,17 @@ class GameSimulator:
 
     def _conditioned_inputs(self, *, next_event: str, delta_seconds: float,
                             next_player: str | None = None,
-                            next_type: str | None = None) -> dict:
+                            next_type: str | None = None,
+                            next_secondary_player: str | None = None) -> dict:
         """Base history inputs + the next-step conditioning a downstream head reads.
 
         Every head conditions on ``next_event`` / ``next_delta_time`` at the decision position
         (the last real step ``n-1``); the player head needs nothing more, the type heads add
-        ``next_player`` (the decided actor), and the result head also adds ``next_type`` (the
-        type the shot is about to be). Only the requested conditioning is attached, so a head
-        is never handed an input it doesn't define. A head ignores any *extra* keys, so the
-        shared ``base`` is safe to pass to all of them.
+        ``next_player`` (the decided actor), the result head also adds ``next_type`` (the type
+        the shot is about to be), and the stint-length head adds ``next_secondary_player`` (the
+        decided incoming player, whose stint it predicts). Only the requested conditioning is
+        attached, so a head is never handed an input it doesn't define. A head ignores any
+        *extra* keys, so the shared ``base`` is safe to pass to all of them.
         """
         base = self.build_model_inputs()
         SEQ = self.sequence_length
@@ -345,6 +357,9 @@ class GameSimulator:
             inputs["next_player"] = _col(enc.encode_player, next_player)
         if next_type is not None:
             inputs["next_type"] = _col(enc.encode_type, next_type)
+        if next_secondary_player is not None:
+            inputs["next_secondary_player"] = _col(enc.encode_secondary_player,
+                                                   next_secondary_player)
         return inputs
 
     def _next_step_inputs(self, *, outgoing: str | None, delta_seconds: float) -> dict:
@@ -380,9 +395,13 @@ class GameSimulator:
 
     def predict_incoming(self, outgoing: str, candidates: list[str], *,
                          delta_seconds: float = 0.0, greedy: bool = False,
-                         temperature: float = SUB_TEMPERATURE) -> str:
+                         temperature: float = SUB_INCOMING_TEMPERATURE) -> str:
         """Sample the incoming player from ``candidates`` (the bench) via SubstitutionModel,
-        conditioned on the decided ``outgoing`` player."""
+        conditioned on the decided ``outgoing`` player.
+
+        Defaults to the sharpened ``SUB_INCOMING_TEMPERATURE`` (like the actor head) so the bench
+        pick follows the model's real preference instead of spreading near-uniformly across the
+        bench — the deep bench should check in rarely, not as often as a rotation regular."""
         inputs = self._next_step_inputs(outgoing=outgoing, delta_seconds=delta_seconds)
         logits = self._head_logits(SubstitutionModel.KEY, "secondary_player_output", inputs)
         return self._constrained_sample(logits, candidates, greedy=greedy, temperature=temperature)
@@ -412,6 +431,36 @@ class GameSimulator:
         incoming = self.predict_incoming(outgoing, bench, delta_seconds=delta_seconds,
                                           greedy=greedy)
         return outgoing, incoming
+
+    def predict_stint_length(self, incoming: str, outgoing: str, *,
+                             delta_seconds: float = 0.0, greedy: bool = False,
+                             sigma: float | None = None) -> float:
+        """Predict how long ``incoming`` will stay on the floor (game-seconds), via StintLengthModel.
+
+        Conditions on the fully decided substitution — ``next_player`` (outgoing, ``"start"``
+        for an opener) and ``next_secondary_player`` (incoming) — and regresses standardized
+        log-stint. Denormalizes with the head's own ``stint_log_mean`` / ``stint_log_std``, then
+        (unless ``greedy``) adds multiplicative log-space noise (``STINT_SAMPLE_SIGMA``) for
+        rotation variety. Capped at ``STINT_MAX_SECONDS``; there is **no** lower bound — a short
+        specialist stint is legitimate.
+        """
+        inputs = self._conditioned_inputs(
+            next_event=SUB_EVENT, delta_seconds=delta_seconds,
+            next_player=outgoing, next_secondary_player=incoming,
+        )
+        pred = self._head_logits(StintLengthModel.KEY, "stint_output", inputs)
+        log_norm = float(np.ravel(pred)[0])  # (1,) regression scalar at position n-1
+
+        mean = float(self.stint_norm_stats.get("stint_log_mean", 0.0))
+        std = float(self.stint_norm_stats.get("stint_log_std", 1.0)) or 1.0
+        log_stint = log_norm * std + mean
+
+        s = STINT_SAMPLE_SIGMA if sigma is None else sigma
+        if not greedy and s > 0:
+            log_stint += float(self.rng.normal(0.0, s))
+
+        seconds = float(np.expm1(log_stint))
+        return max(0.0, min(seconds, STINT_MAX_SECONDS))
 
     # ===================================================================== #
     # --- Conditional heads (player / type / result) for the rollout       --
