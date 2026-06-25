@@ -97,34 +97,37 @@ def run_all(data_dir: str = "./data", artifacts_root: str = DEFAULT_ARTIFACTS_RO
 
 
 def run_stage(data_dir: str, game_partition, *, artifacts_root: str = DEFAULT_ARTIFACTS_ROOT,
-              warm_start_root: str | None = None, epochs: int = 50, batch_size: int = 32,
+              warm_start_root: str | None = None, warm_start: bool = True,
+              refit_norm_stats: bool = False, epochs: int = 50, batch_size: int = 32,
               report: bool = True, run_name: str | None = None,
               done: list[str] | None = None, on_trained=None) -> list[str]:
-    """Train one curriculum stage: warm-start every model on ``game_partition`` and return the
-    keys trained this call.
+    """Train every model on ``game_partition`` (one stage / one full train) and return the keys
+    trained this call.
 
-    Mirrors ``run_all``'s dependency order, but for staged training: every model preprocesses
-    with the explicit chronological ``game_partition`` and ``refit_norm_stats=False`` (reusing the
-    warmup-fit vocab + stats), then trains warm-started from ``warm_start_root`` (defaults to
-    ``artifacts_root`` — the live weights, which hold the *previous* stage's model for each key
-    until this stage overwrites it; an empty root on stage 1 simply trains fresh).
+    Mirrors ``run_all``'s dependency order. Two modes:
+      * **Curriculum stage** (defaults): ``warm_start=True`` continues the previous stage's weights
+        from ``warm_start_root`` (defaults to ``artifacts_root``), and ``refit_norm_stats=False``
+        reuses the warmup-fit stats so standardization stays fixed across stages.
+      * **Single full train**: ``warm_start=False`` trains fresh (``init_weights_root=None``) and
+        ``refit_norm_stats=True`` recomputes stats on this train slice. Vocabs are never rebuilt
+        here (the warmup fit froze them).
 
-    ``done`` lists keys already trained this stage (a resumed run): their train — and, where a
-    whole group is done, their preprocess — is skipped, so an interrupted stage picks up at the
-    next unfinished model. ``on_trained(key)`` (when given) is called right after each model
-    finishes, so the caller can persist progress before the next (crash-resilient) model starts.
-    Vocabs are never rebuilt here (the warmup fit froze them).
+    ``done`` lists keys already trained this call (a resumed run): their train — and, where a whole
+    group is done, their preprocess — is skipped, so an interruption picks up at the next unfinished
+    model. ``on_trained(key)`` (when given) is called right after each model finishes so the caller
+    can persist progress before the next (crash-resilient) model starts.
     """
-    warm_start_root = warm_start_root or artifacts_root
+    warm_start_root = (warm_start_root or artifacts_root) if warm_start else None
     done = set(done or [])
     trained: list[str] = []
-    pp = dict(rebuild_vocabs=False, game_partition=game_partition, refit_norm_stats=False)
+    pp = dict(rebuild_vocabs=False, game_partition=game_partition, refit_norm_stats=refit_norm_stats)
 
     def _train(model, key: str) -> None:
         if key in done:
-            print(f"[stage] '{key}' already trained this stage — skipping")
+            print(f"[stage] '{key}' already trained this call — skipping")
             return
-        print(f"\n{'=' * 70}\n[stage] training '{key}' (warm-start <- {warm_start_root})\n{'=' * 70}")
+        origin = warm_start_root if warm_start_root else "fresh init"
+        print(f"\n{'=' * 70}\n[stage] training '{key}' ({origin})\n{'=' * 70}")
         model.train(epochs=epochs, batch_size=batch_size, artifacts_root=artifacts_root,
                     report=report, run_name=run_name, init_weights_root=warm_start_root)
         trained.append(key)

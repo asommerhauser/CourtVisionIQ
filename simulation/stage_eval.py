@@ -110,16 +110,19 @@ def _write_game_folder(out_dir: Path, game, spec, boxes, histories, record,
 
 
 def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
-                   n_sims: int = STAGE_SIMS, data_dir: str = "./data",
-                   processed_dir: str = "./data/processed",
+                   n_sims: int = STAGE_SIMS, max_new: int | None = None,
+                   data_dir: str = "./data", processed_dir: str = "./data/processed",
                    artifacts_root: str = DEFAULT_ARTIFACTS_ROOT,
                    reports_root: str = DEFAULT_REPORTS_ROOT,
                    predictions_root: str = DEFAULT_OUTPUT_ROOT, seed0: int = 0) -> dict:
     """Predict a stage's holdout games (``n_sims`` each), write per-game folders + a stage report.
 
     ``holdout_ids`` defaults to the manifest the stage's preprocess wrote (``holdout_games.json``).
-    Finished games (those with a cached ``record.json``) are reloaded rather than re-simulated, so
-    a killed eval resumes. Returns the report dict (with ``run_dir``).
+    Finished games (those with a cached ``record.json``) are reloaded rather than re-simulated, so a
+    killed eval resumes. ``max_new`` caps how many *new* games are simulated this call (the rest are
+    left for a later call) — used to predict the holdout a batch at a time. Already-finished games
+    still load into the report, so the report covers everything done so far. Returns the report dict
+    (with ``run_dir``, ``done``, ``total``).
     """
     from reporting.eval_report import build_report, write_eval_report
 
@@ -136,6 +139,7 @@ def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
     sim = None  # lazily loaded only if there's an unfinished game to simulate
 
     records: list[dict] = []
+    new_done = 0
     for gid in holdout_ids:
         game = df[df["game_id"] == int(gid)].sort_values("time")
         if game.empty:
@@ -149,6 +153,9 @@ def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
             print(f"  game {gid}: already evaluated -> reusing {cached}")
             records.append(json.loads(cached.read_text(encoding="utf-8")))
             continue
+
+        if max_new is not None and new_done >= max_new:
+            continue  # batch limit hit — leave this (unfinished) game for a later call
 
         if sim is None:
             sim = GameSimulator.load(artifacts_root=artifacts_root)
@@ -166,15 +173,20 @@ def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
                                    home_team=home_team, away_team=away_team)
         _write_game_folder(out_dir, game, spec, boxes, histories, record, home_team, away_team)
         records.append(record)
+        new_done += 1
 
     aggregate = _aggregate(records)
     report = build_report(records=records, aggregate=aggregate, n_sims=n_sims, run_name=stage_name)
     run_dir = write_eval_report(report, reports_root=reports_root)
     _print_summary(aggregate, len(records), n_sims)
-    print(f"\n  per-game predictions -> {stage_dir.resolve()}")
+    print(f"\n  {len(records)}/{len(holdout_ids)} holdout games done "
+          f"({new_done} predicted this call)")
+    print(f"  per-game predictions -> {stage_dir.resolve()}")
     print(f"  stage report        -> {run_dir.resolve()}")
     report["run_dir"] = str(run_dir)
     report["predictions_dir"] = str(stage_dir)
+    report["done"] = len(records)
+    report["total"] = len(holdout_ids)
     return report
 
 
