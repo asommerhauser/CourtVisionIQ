@@ -65,17 +65,23 @@ _BOX_ACCURACY_STATS = ("pts", "fga", "fgm", "tpa", "tpm", "fta", "ftm",
 
 def simulate_repeated(sim: GameSimulator, spec, home_starters, away_starters, *,
                       n_sims: int, seed0: int, home_team: str = "HOME",
-                      away_team: str = "AWAY") -> list[BoxScore]:
-    """Play one matchup ``n_sims`` times (seeds ``seed0..seed0+n_sims-1``) -> list of box scores."""
+                      away_team: str = "AWAY", return_histories: bool = False):
+    """Play one matchup ``n_sims`` times (seeds ``seed0..seed0+n_sims-1``) -> list of box scores.
+
+    With ``return_histories`` also return the per-sim event histories (so the stage evaluator can
+    persist each generated play-by-play): returns ``(boxes, histories)`` instead of just ``boxes``.
+    """
     boxes: list[BoxScore] = []
+    histories: list[list[dict]] = []
     for s in range(n_sims):
         ctrl = GameController(sim, seed=seed0 + s)
         ctrl.start(spec.home_roster, spec.away_roster, season=str(spec.season),
                    home_starters=home_starters, away_starters=away_starters,
                    season_context=spec.season_context())
         history = ctrl.run()
+        histories.append(history)
         boxes.append(generate_box_score(history, home_team=home_team, away_team=away_team))
-    return boxes
+    return (boxes, histories) if return_histories else boxes
 
 
 # --------------------------------------------------------------------------- box aggregation
@@ -149,7 +155,6 @@ def evaluate_game(sim: GameSimulator, game_df, *, n_sims: int, seed0: int,
                   home_team: str = "HOME", away_team: str = "AWAY") -> dict:
     """Run ``n_sims`` predictions for one cleaned game and build its evaluation record."""
     spec = extract_game_input(game_df)
-    actual_box = generate_box_score(game_df, home_team=home_team, away_team=away_team)
     try:
         home_starters, away_starters = _real_starters(game_df)
     except ValueError:
@@ -157,7 +162,18 @@ def evaluate_game(sim: GameSimulator, game_df, *, n_sims: int, seed0: int,
 
     boxes = simulate_repeated(sim, spec, home_starters, away_starters, n_sims=n_sims,
                               seed0=seed0, home_team=home_team, away_team=away_team)
+    return build_game_record(game_df, boxes, n_sims=n_sims,
+                             home_team=home_team, away_team=away_team)
 
+
+def build_game_record(game_df, boxes: list[BoxScore], *, n_sims: int,
+                      home_team: str = "HOME", away_team: str = "AWAY") -> dict:
+    """Assemble one game's evaluation record from its (already-simulated) box scores.
+
+    Split out from ``evaluate_game`` so the stage evaluator can run the sims itself (keeping the
+    per-sim histories to persist) and still produce the identical record for the aggregate report.
+    """
+    actual_box = generate_box_score(game_df, home_team=home_team, away_team=away_team)
     margins = [b.home_score - b.away_score for b in boxes]
     home_wins = sum(1 for m in margins if m > 0)
     win_prob_home = home_wins / len(boxes)
@@ -413,6 +429,6 @@ if __name__ == "__main__":
 
 
 __all__ = [
-    "simulate_repeated", "average_box", "std_box", "evaluate_game",
+    "simulate_repeated", "average_box", "std_box", "evaluate_game", "build_game_record",
     "spread_metrics", "win_metrics", "evaluate_holdout",
 ]
