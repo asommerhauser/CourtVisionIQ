@@ -30,7 +30,7 @@ def main() -> None:
     p_init.add_argument("--data-dir", default="./data")
     p_init.add_argument("--processed-dir", default="./data/processed")
     p_init.add_argument("--epochs", type=int, default=50)
-    p_init.add_argument("--batch-size", type=int, default=64)
+    p_init.add_argument("--batch-size", type=int, default=32)
 
     sub.add_parser("train", help="Train the current stage (warm-started), then stop.")
     sub.add_parser("eval", help="Predict the current stage's holdout, then stop + advance.")

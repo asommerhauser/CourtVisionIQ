@@ -97,7 +97,7 @@ def run_all(data_dir: str = "./data", artifacts_root: str = DEFAULT_ARTIFACTS_RO
 
 
 def run_stage(data_dir: str, game_partition, *, artifacts_root: str = DEFAULT_ARTIFACTS_ROOT,
-              warm_start_root: str | None = None, epochs: int = 50, batch_size: int = 64,
+              warm_start_root: str | None = None, epochs: int = 50, batch_size: int = 32,
               report: bool = True, run_name: str | None = None,
               done: list[str] | None = None, on_trained=None) -> list[str]:
     """Train one curriculum stage: warm-start every model on ``game_partition`` and return the

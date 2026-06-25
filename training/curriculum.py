@@ -71,7 +71,7 @@ class Curriculum:
     def init_fresh(self, *, data_dir: str = "./data", processed_dir: str = "./data/processed",
                    artifacts_root: str = DEFAULT_ARTIFACTS_ROOT,
                    reports_root: str = DEFAULT_REPORTS_ROOT,
-                   epochs: int = 50, batch_size: int = 64) -> None:
+                   epochs: int = 50, batch_size: int = 32) -> None:
         """Destructive reset → re-clean → warmup fit → schedule. Requires the explicit caller."""
         print("=" * 70)
         print("FULL CLEAN + RETRAIN — wiping prior cleaned data / artifacts / reports")
