@@ -23,11 +23,12 @@ from pathlib import Path
 
 from config import (
     EVAL_BATCH, FINAL_HOLDOUT_GAMES, FINAL_SEASON_FRACTION, FULL_ARTIFACTS_ROOT,
-    SEED, STAGE_SIMS, TEST_FRAC,
+    SEED, STAGE_SIMS, SUBSET_MODEL_KEYS, TEST_FRAC,
 )
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
 from training.chronology import game_index, sequential_partition
 from training.curriculum import STAGE_MODEL_KEYS
+from training.subset import load_subset_games
 
 DEFAULT_STATE_PATH = "./training/full_run_state.json"
 RUN_NAME = "full_train"
@@ -103,6 +104,18 @@ class FullRun:
                                          n_holdout=FINAL_HOLDOUT_GAMES, val_frac=TEST_FRAC, seed=SEED)
         print(f"[train] one fresh full train on {self.state['boundary_idx']} games "
               f"(recency-weighted) -> {self.state['artifacts_root']}")
+
+        # Small heads (config.SUBSET_MODEL_KEYS) train on the compact, modern-heavy per-season
+        # subset if it has been extracted (python -m training.subset extract); the big player-vocab
+        # heads keep the full corpus. No subset file => everything trains full, as before.
+        subset_train = load_subset_games()
+        if subset_train is not None:
+            print(f"[train] small heads {list(SUBSET_MODEL_KEYS)} -> {len(subset_train)}-game subset; "
+                  f"player/substitution/stint_length -> full corpus.")
+        else:
+            print("[train] no subset extracted — all heads train on the full corpus. "
+                  "(Run `python -m training.subset extract` to enable the small-head subset.)")
+
         self.state["status"] = "training"
         self._save()
 
@@ -117,6 +130,7 @@ class FullRun:
             warm_start=False, refit_norm_stats=True, epochs=self.state["epochs"],
             batch_size=self.state["batch_size"], report=True, run_name=RUN_NAME,
             done=sdict["trained_models"], on_trained=on_trained,
+            subset_keys=SUBSET_MODEL_KEYS, subset_train_games=subset_train,
         )
 
         self.state["status"] = "trained"
@@ -149,6 +163,40 @@ class FullRun:
             print(f"STOP — {done}/{total} holdout games done. Take a break if you like.")
             print("  When ready, predict the next batch:  python full_train.py eval")
         print("=" * 70)
+
+    # ------------------------------------------------------- retrain-shot-type
+    def retrain_shot_type(self) -> None:
+        """Targeted retrain of ONLY the shot_type head, reusing the existing cond_*.npz.
+
+        The shot_type head now masks its loss to live field goals ({2pt, 3pt}); free-throw shot
+        rows — which the simulator never asks shot_type to choose (FTs come from fouls) — no longer
+        pollute the binary 2pt-vs-3pt task. The shared conditional tensors are untouched (shot_result
+        still needs the FT rows), so this reuses them as-is: no re-preprocess, no other head retrained.
+        Fresh init; weights -> ``artifacts_root``/shot_type, overwriting the old head.
+        """
+        from encoder.encoder import Encoder
+        from models.conditional_type_model import CONDITIONAL_MODEL_CLASSES
+
+        self._require()
+        cond_train = Path(self.state["processed_dir"]) / "cond_train.npz"
+        if not cond_train.exists():
+            raise SystemExit(
+                f"{cond_train} not found — the conditional preprocess has not run yet. "
+                f"Run `python full_train.py train` first (it writes the cond_*.npz)."
+            )
+        cls = next(c for c in CONDITIONAL_MODEL_CLASSES if c.KEY == "shot_type")
+        model = cls(Encoder(), path=self.state["data_dir"], processed_dir=self.state["processed_dir"])
+        print(f"[retrain-shot-type] fresh train on existing {cond_train.name} "
+              f"(live field goals only) -> {self.state['artifacts_root']}/shot_type")
+        model.train(
+            epochs=self.state["epochs"], batch_size=self.state["batch_size"],
+            artifacts_root=self.state["artifacts_root"], report=True, run_name=RUN_NAME,
+            init_weights_root=None,
+        )
+        if "shot_type" not in self.state.setdefault("trained_models", []):
+            self.state["trained_models"].append("shot_type")
+            self._save()
+        print("[retrain-shot-type] done — shot_type now trained on {2pt, 3pt} only.")
 
     # --------------------------------------------------------------- report / status
     def report(self) -> None:

@@ -12,9 +12,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from config import FOUL_OUT_LIMIT, PLAYER_TEMPERATURE, ROSTER_SIZE
+from config import DELTA_TIME_SCALE, FOUL_OUT_LIMIT, PLAYER_TEMPERATURE, ROSTER_SIZE
 from simulation.controller import (
-    GameController, OPEN_PLAY_EVENTS, REGULATION, OT_LENGTH, PERIOD_LENGTH,
+    GameController, OPEN_PLAY_EVENTS, REGULATION, OT_LENGTH, PERIOD_LENGTH, MAX_DELTA,
 )
 from simulation.game_simulator import HOME, AWAY
 
@@ -39,7 +39,8 @@ class FakeSim:
         self.stint_seconds = stint_seconds  # fixed length returned by predict_stint_length
         self.rng = np.random.default_rng(0)
         self.calls: list[tuple] = []
-        self._q: dict[str, list] = {"player": [], "type": [], "result": [], "incoming": []}
+        self._q: dict[str, list] = {"player": [], "type": [], "result": [], "incoming": [],
+                                    "delta": []}
 
     # --- scripting ---
     def script(self, **queues):
@@ -60,13 +61,18 @@ class FakeSim:
         self.calls.append(("type", key, next_player, list(allowed)))
         return self._pop("type")
 
-    def predict_result(self, next_player, next_type, allowed, *, delta_seconds=0.0, greedy=False):
+    def predict_result(self, next_player, next_type, allowed, *, delta_seconds=0.0, greedy=False,
+                       bias=None):
         self.calls.append(("result", next_player, next_type, list(allowed)))
         return self._pop("result")
 
     def predict_incoming(self, outgoing, candidates, *, delta_seconds=0.0, greedy=False):
         self.calls.append(("incoming", outgoing, list(candidates)))
         return self._pop("incoming")
+
+    def predict_delta(self, next_event, next_player, *, delta_seconds=0.0):
+        self.calls.append(("delta", next_event, next_player))
+        return self._pop("delta") if self._q["delta"] else 12.0
 
     def sample_substitution(self, *, team=None, delta_seconds=0.0, greedy=False,
                             outgoing_bias=None):
@@ -437,10 +443,13 @@ def test_do_foul_charges_the_fouler():
 # Temperature defaults
 # ===================================================================== #
 
-def test_default_player_temperature_is_sharpening():
+def test_default_player_temperature_matches_config():
+    # The actor head is intentionally FLATTENED (>1) — the full-corpus retrain converges to an
+    # over-concentrated head, so PLAYER_TEMPERATURE=2.0 spreads usage back to a realistic shot share
+    # (see config.py). The controller must adopt the config default.
     ctrl = GameController(FakeSim(), seed=0)
     assert ctrl.player_temp == PLAYER_TEMPERATURE
-    assert PLAYER_TEMPERATURE < 1.0                 # sharpen, don't flatten, the actor head
+    assert PLAYER_TEMPERATURE > 1.0                 # flatten over-concentration, not sharpen
 
 
 def test_rebounder_uses_player_temperature():
@@ -454,13 +463,37 @@ def test_rebounder_uses_player_temperature():
     assert reb_call[3] == 1.7               # rebounder flattened like any other actor pick
 
 
+def test_conditional_time_head_drives_clock_when_loaded():
+    # With the conditional time head loaded, the clock advances by Δt(event, actor) — conditioned on
+    # the sampled play — not by the event head's marginal Δt passed into the handler.
+    sim = FakeSim()
+    sim.heads["event_time_cond"] = object()
+    ctrl = GameController(sim, seed=0)
+    assert ctrl.use_condtime
+    sim.script(player=["A"], type=["2pt"], result=["missed"], delta=[18.0])
+    ctrl._do_shot(delta=5.0)                 # marginal 5.0 conditions the actor pick; clock uses 18.0
+    assert ctrl.player_seconds["A"] == pytest.approx(18.0 * DELTA_TIME_SCALE)
+    assert ("delta", "shot", "A") in sim.calls
+
+
+def test_marginal_delta_drives_clock_without_conditional_head():
+    # Back-compat: no conditional time head → fall back to the event head's marginal Δt.
+    ctrl = make_controller(HOME)
+    assert not ctrl.use_condtime
+    ctrl.sim.script(player=["A"], type=["2pt"], result=["missed"])
+    ctrl._do_shot(delta=7.0)
+    assert ctrl.player_seconds["A"] == pytest.approx(7.0 * DELTA_TIME_SCALE)
+
+
 def test_advance_clock_accrues_on_court_minutes():
     ctrl = GameController(FakeSim(), seed=0)
     ctrl._advance_clock(30.0)
-    # Both on-court fives get the elapsed seconds; the clamp keeps a huge delta bounded.
-    assert all(ctrl.player_seconds[p] == 30.0 for p in (*HOME_FIVE, *AWAY_FIVE))
+    # Both on-court fives get the elapsed seconds (scaled by DELTA_TIME_SCALE); the clamp keeps a
+    # huge delta bounded.
+    tick = 30.0 * DELTA_TIME_SCALE
+    assert all(ctrl.player_seconds[p] == pytest.approx(tick) for p in (*HOME_FIVE, *AWAY_FIVE))
     ctrl._advance_clock(10_000.0)
-    assert ctrl.player_seconds["A"] == 30.0 + 40.0   # second tick clamped to MAX_DELTA
+    assert ctrl.player_seconds["A"] == pytest.approx(tick + MAX_DELTA)  # second tick clamped to MAX_DELTA
 
 
 def test_fatigue_bias_weights_long_stints():

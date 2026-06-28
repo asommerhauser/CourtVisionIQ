@@ -619,7 +619,9 @@ class SubstitutionModel:
         model.compile(
             optimizer=optimizer,
             loss={self.output_name: keras.losses.SparseCategoricalCrossentropy(from_logits=True)},
-            metrics={self.output_name: [keras.metrics.SparseCategoricalAccuracy(name="acc")]},
+            # weighted_metrics (NOT metrics): only weighted_metrics receive the sample_weight
+            # mask, so acc reflects real rows, not every padded position.
+            weighted_metrics={self.output_name: [keras.metrics.SparseCategoricalAccuracy(name="acc")]},
             jit_compile=jit_compile,
         )
 

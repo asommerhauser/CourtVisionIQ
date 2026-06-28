@@ -42,6 +42,7 @@ from config import (
     MAX_SEQUENCE_LENGTH, RESULT_TEMPERATURE, ROSTER_SIZE, STINT_MAX_SECONDS,
     STINT_SAMPLE_SIGMA, SUB_INCOMING_TEMPERATURE, SUB_TEMPERATURE, TYPE_TEMPERATURE,
 )
+from models.conditional_time_model import ConditionalTimeModel
 from encoder.encoder import Encoder
 from models.artifacts import DEFAULT_ARTIFACTS_ROOT
 from models.event_time_model import CATEGORICAL_FIELDS, EventTimeModel
@@ -100,6 +101,9 @@ class GameSimulator:
         # Stint-length head's normalization stats (its own log-stint mean/std), populated at
         # load() from that head's wrapper. Empty -> predict_stint_length reads raw (mean 0/std 1).
         self.stint_norm_stats: dict = {}
+        # Conditional-time head's Δt normalization stats (its own delta mean/std), populated at
+        # load(). Empty -> predict_delta falls back to the shared (event_time) norm stats.
+        self.condtime_norm_stats: dict = {}
         # RNG for constrained sampling (seedable for reproducible rollouts/tests).
         self.rng = np.random.default_rng()
 
@@ -154,6 +158,10 @@ class GameSimulator:
         stint_inst = bundle.instances.get(StintLengthModel.KEY)
         if stint_inst is not None:
             sim.stint_norm_stats = dict(stint_inst.norm_stats or {})
+        # The conditional-time head carries its own Δt norm stats (delta_mean/std on the raw stream).
+        ct_inst = bundle.instances.get(ConditionalTimeModel.KEY)
+        if ct_inst is not None:
+            sim.condtime_norm_stats = dict(ct_inst.norm_stats or {})
         return sim
 
     # ===================================================================== #
@@ -368,16 +376,28 @@ class GameSimulator:
         return self._conditioned_inputs(next_event=SUB_EVENT, delta_seconds=delta_seconds,
                                         next_player=outgoing)
 
+    def _infer(self, model_key: str, inputs: dict) -> dict:
+        """Run one head's forward pass and return its outputs as numpy (batch dim kept).
+
+        The single seam every prediction routes through (``predict_next`` for the event/time head,
+        ``_head_logits`` for the conditional heads). ``model_key`` is ``EventTimeModel.KEY`` for the
+        core model, else a key into ``self.heads``. Subclassing/overriding **just this method** lets
+        the batched rollout coordinator pool many games' forward passes into one GPU call without
+        touching any rule or sampling logic (see ``simulation/batched_rollout.py``).
+        """
+        model = self.model if model_key == EventTimeModel.KEY else self.heads.get(model_key)
+        if model is None:
+            raise RuntimeError(
+                f"'{model_key}' head not loaded; train it and load via GameSimulator.load()."
+            )
+        out = model(inputs, training=False)
+        return {k: np.asarray(v) for k, v in out.items()}
+
     def _head_logits(self, key: str, output_name: str, inputs: dict) -> np.ndarray:
         """Run a loaded head and return its logits at the decision position (n-1)."""
-        head = self.heads.get(key)
-        if head is None:
-            raise RuntimeError(
-                f"'{key}' head not loaded; train it and load via GameSimulator.load()."
-            )
         n = min(len(self.history), self.sequence_length)
-        out = head(inputs, training=False)
-        return np.asarray(out[output_name])[0, n - 1]
+        out = self._infer(key, inputs)
+        return out[output_name][0, n - 1]
 
     def predict_outgoing(self, candidates: list[str], *, delta_seconds: float = 0.0,
                          greedy: bool = False, temperature: float = SUB_TEMPERATURE,
@@ -496,18 +516,41 @@ class GameSimulator:
 
     def predict_result(self, next_player: str, next_type: str, allowed: list[str], *,
                        delta_seconds: float = 0.0, greedy: bool = False,
-                       temperature: float = RESULT_TEMPERATURE) -> str:
+                       temperature: float = RESULT_TEMPERATURE,
+                       bias: dict[str, float] | None = None) -> str:
         """Sample a shot's ``result`` from ``allowed`` via the ``shot_result`` head.
 
         Conditions on the decided actor and the decided ``next_type`` (the type the shot is
         about to be). ``allowed`` is the legal outcome set — made/missed/blocked for a live FG,
-        made/missed for a free throw.
+        made/missed for a free throw. ``bias`` (e.g. the ``SHOT_RESULT_BIAS`` calibration on a live
+        shot) adds a per-outcome logit offset before sampling — see :meth:`_masked_sample`.
         """
         inputs = self._conditioned_inputs(next_event="shot", delta_seconds=delta_seconds,
                                           next_player=next_player, next_type=next_type)
         logits = self._head_logits("shot_result", "result_output", inputs)
         return self._masked_sample(logits, allowed, self.encoder.encode_result, greedy=greedy,
-                                   temperature=temperature)
+                                   temperature=temperature, bias=bias)
+
+    def predict_delta(self, next_event: str, next_player: str, *,
+                      delta_seconds: float = 0.0) -> float:
+        """Predict the inter-event Δt (seconds) before ``next_event`` via the ConditionalTimeModel.
+
+        Conditions on the decided event and its actor (``next_player``); regresses standardized Δt
+        and denormalizes with the conditional-time head's own ``delta_mean`` / ``delta_std`` (falling
+        back to the shared event/time stats if the head carries none). This is the *authoritative*
+        clock advance — Δt follows the play, replacing the marginal time head's average.
+        """
+        inputs = self._conditioned_inputs(next_event=next_event, delta_seconds=delta_seconds,
+                                           next_player=next_player)
+        # The conditional-time graph does not declare next_delta_time (Δt is its target), so drop the
+        # key _conditioned_inputs always attaches — the dict must match the model's inputs exactly.
+        inputs.pop("next_delta_time", None)
+        pred = self._head_logits(ConditionalTimeModel.KEY, "time_output", inputs)
+        norm = float(np.ravel(pred)[0])
+        stats = self.condtime_norm_stats or self.norm_stats
+        mean = float(stats.get("delta_mean", 0.0))
+        std = float(stats.get("delta_std", 1.0)) or 1.0
+        return norm * std + mean
 
     # ===================================================================== #
     # --- Opening-lineup bootstrap (build the starting five via subs)      --
@@ -771,14 +814,14 @@ class GameSimulator:
         """
         inputs = self.build_model_inputs()
         n = min(len(self.history), self.sequence_length)
-        out = self.model(inputs, training=False)
+        out = self._infer(EventTimeModel.KEY, inputs)
 
-        event_logits = np.asarray(out["event_output"])[0, n - 1]   # (event_vocab,)
+        event_logits = out["event_output"][0, n - 1]   # (event_vocab,)
         event_probs = _softmax(event_logits)
         event_vocab = self.encoder.vocabs["event"]
         event_dist = {event_vocab.decode(i): float(p) for i, p in enumerate(event_probs)}
 
-        delta_norm = float(np.asarray(out["time_output"])[0, n - 1, 0])
+        delta_norm = float(out["time_output"][0, n - 1, 0])
         delta_mean = float(self.norm_stats.get("delta_mean", 0.0))
         delta_std = float(self.norm_stats.get("delta_std", 1.0)) or 1.0
         delta_seconds = delta_norm * delta_std + delta_mean

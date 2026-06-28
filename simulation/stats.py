@@ -12,6 +12,8 @@ team's total minutes on the floor (so overtime games are compared on the same fo
 """
 from __future__ import annotations
 
+import math
+
 from simulation.box_score import PlayerLine
 
 # Numeric counting fields we average / std across sims and sum into team totals. This is the
@@ -68,6 +70,20 @@ def advanced_stats(team: dict[str, float], opp: dict[str, float]) -> dict[str, f
     }
 
 
+def score_win_prob(mean_margin: float, margin_std: float) -> float:
+    """Home win probability from the sims' margin distribution (normal approximation).
+
+    Uses the *average predicted score* (mean margin) and the cross-sim spread, instead of the raw
+    share of sims the home team won. A confident average (e.g. +6 every sim) isn't washed back toward
+    0.5 by a few coin-flip games, so the implied probability — and the winner pick (sign of the mean
+    margin) — track the score the box-score model already predicts well. With zero spread it collapses
+    to a hard 1/0 by sign (0.5 on an exact tie).
+    """
+    if margin_std <= 1e-9:
+        return 1.0 if mean_margin > 0 else 0.0 if mean_margin < 0 else 0.5
+    return 0.5 * (1.0 + math.erf(mean_margin / (margin_std * math.sqrt(2.0))))
+
+
 # Display order + friendly labels for the advanced block (four factors + pace).
 ADVANCED_LABELS = {
     "pts": "PTS",
@@ -85,5 +101,6 @@ __all__ = [
     "team_totals",
     "possessions",
     "advanced_stats",
+    "score_win_prob",
     "ADVANCED_LABELS",
 ]

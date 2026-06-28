@@ -33,6 +33,7 @@ import pandas as pd
 
 from reporting.report_artifacts import ReportArtifacts, new_run_id, DEFAULT_REPORTS_ROOT
 from simulation.stats import ADVANCED_LABELS, BOX_STATS
+from simulation.eval_metrics import score_win_view
 
 # Friendly labels for the box-accuracy stat keys.
 _STAT_LABELS = {
@@ -54,8 +55,16 @@ def _git_commit() -> str:
 
 
 def build_report(*, records: list[dict], aggregate: dict, n_sims: int,
-                 run_name: str | None = None) -> dict:
-    """Package the harness output into a serializable report dict."""
+                 run_name: str | None = None, tuning: dict | None = None) -> dict:
+    """Package the harness output into a serializable report dict.
+
+    ``tuning`` is the snapshot of rollout dials that produced this run (DELTA_TIME_SCALE, the
+    temperatures, the rotation/clock knobs, …); it defaults to the live values from ``config`` so
+    every eval report records exactly the tuning behind it for cross-run analysis.
+    """
+    if tuning is None:
+        from config import tuning_snapshot
+        tuning = tuning_snapshot()
     return {
         "run_id": new_run_id(run_name),
         "run_name": run_name,
@@ -64,6 +73,7 @@ def build_report(*, records: list[dict], aggregate: dict, n_sims: int,
         "platform": platform.platform(),
         "n_games": len(records),
         "n_sims": n_sims,
+        "tuning": tuning,
         "aggregate": aggregate,
         "records": records,
     }
@@ -79,7 +89,7 @@ def _fig_to_base64(fig) -> str:
     return base64.b64encode(buf.read()).decode("ascii")
 
 
-def _calibration_plot(win: dict) -> str | None:
+def _calibration_plot(win: dict, title: str = "Win-probability calibration") -> str | None:
     cal = win.get("calibration") or []
     if not cal:
         return None
@@ -92,7 +102,7 @@ def _calibration_plot(win: dict) -> str | None:
     ax.set_xlim(0, 1); ax.set_ylim(0, 1)
     ax.set_xlabel("predicted home win probability")
     ax.set_ylabel("observed home win rate")
-    ax.set_title("Win-probability calibration")
+    ax.set_title(title)
     ax.grid(True, alpha=0.3); ax.legend()
     return _fig_to_base64(fig)
 
@@ -131,6 +141,28 @@ def _bias_plot(team_acc: dict) -> str | None:
     return _fig_to_base64(fig)
 
 
+def _progression_chart(prog: list[dict]) -> str | None:
+    """Trend of the key tuning-target metrics across the distinct-tuning segments."""
+    if len(prog) < 2:
+        return None
+    xs = [p["segment"] for p in prog]
+    panels = [("score_brier", "Score Brier", "#4C78A8"),
+              ("spread_mae", "Spread MAE (pts)", "#E45756"),
+              ("pace_bias", "Pace bias (pred−actual)", "#54A24B")]
+    fig, axes = plt.subplots(1, 3, figsize=(11, 3.2))
+    for ax, (key, title, color) in zip(axes, panels):
+        ys = [p["metrics"][key] for p in prog]
+        ax.plot(xs, ys, "-o", color=color)
+        if key == "pace_bias":
+            ax.axhline(0, color="#9ca3af", linewidth=0.8)
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("tuning segment")
+        ax.set_xticks(xs)
+        ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    return _fig_to_base64(fig)
+
+
 # --------------------------------------------------------------------------- HTML
 
 def _esc(v) -> str:
@@ -142,8 +174,16 @@ def _cards(headline: dict) -> str:
         return (f"<div class='card'><div class='label'>{_esc(label)}</div>"
                 f"<div class='value'>{_esc(value)}</div></div>")
     cards = [
-        card("Win-pick accuracy", f"{headline['pick_accuracy'] * 100:.1f}%"),
-        card("Brier score", f"{headline['brier']:.3f}"),
+        card("Win-pick (vote)", f"{headline['pick_accuracy'] * 100:.1f}%"),
+        card("Brier (vote)", f"{headline['brier']:.3f}"),
+    ]
+    # Score-based winner (mean predicted margin) — shown alongside the vote headline when present.
+    if "score_pick_accuracy" in headline:
+        cards += [
+            card("Win-pick (score)", f"{headline['score_pick_accuracy'] * 100:.1f}%"),
+            card("Brier (score)", f"{headline['score_brier']:.3f}"),
+        ]
+    cards += [
         card("Point-spread MAE", f"{headline['spread_mae']:.1f} pts"),
         card("Team PTS MAE", f"{headline['points_mae']:.1f} pts"),
     ]
@@ -158,29 +198,54 @@ def _table(headers: list[str], rows: list[list], cls: str = "data") -> str:
 
 def _win_section(agg: dict, records: list[dict]) -> str:
     win = agg["win"]
+    win_score = agg.get("win_score")
+
+    # Method comparison: majority vote vs average predicted score, side by side.
+    comp_rows = [["pick accuracy",
+                  f"{win['pick_accuracy'] * 100:.1f}%",
+                  f"{win_score['pick_accuracy'] * 100:.1f}%" if win_score else "—"],
+                 ["Brier score",
+                  f"{win['brier']:.4f}",
+                  f"{win_score['brier']:.4f}" if win_score else "—"],
+                 ["log-loss",
+                  f"{win['log_loss']:.4f}",
+                  f"{win_score['log_loss']:.4f}" if win_score else "—"]]
+    comparison = _table(["metric", "majority vote", "average score"], comp_rows)
+
     rows = []
     for r in sorted(records, key=lambda x: x["game_id"]):
-        mark = "✓" if r["pick_correct"] else "✗"
+        sv = score_win_view(r)
+        vote_mark = "✓" if r["pick_correct"] else "✗"
+        score_mark = "✓" if sv["pick_correct"] else "✗"
         rows.append([
-            r["game_id"], f"{r['win_prob_home'] * 100:.0f}%", r["pred_pick"],
-            r["actual_winner"], mark,
+            r["game_id"], r["actual_winner"],
+            f"{r['win_prob_home'] * 100:.0f}%", r["pred_pick"], vote_mark,
+            f"{sv['win_prob_home'] * 100:.0f}%", sv["pick"], score_mark,
             f"{r['pred_home_score']:.0f}-{r['pred_away_score']:.0f}",
             f"{r['actual_home_score']}-{r['actual_away_score']}",
         ])
-    table = _table(["game", "P(home win)", "pick", "actual", "correct",
+    table = _table(["game", "actual",
+                    "vote P(home)", "vote pick", "✓",
+                    "score P(home)", "score pick", "✓",
                     "pred score (H-A)", "actual score"], rows)
-    cal = _calibration_plot(win)
-    img = (f"<div class='charts'><img alt='calibration' "
-           f"src='data:image/png;base64,{cal}'/></div>") if cal else ""
-    summary = _table(["metric", "value"], [
-        ["games", win["n"]],
-        ["pick accuracy", f"{win['pick_accuracy'] * 100:.1f}%"],
-        ["Brier score", f"{win['brier']:.4f}"],
-        ["log-loss", f"{win['log_loss']:.4f}"],
-    ], cls="kv2")
+
+    charts = []
+    cal_vote = _calibration_plot(win, "Calibration — majority vote")
+    if cal_vote:
+        charts.append(f"<img alt='calibration (vote)' src='data:image/png;base64,{cal_vote}'/>")
+    if win_score:
+        cal_score = _calibration_plot(win_score, "Calibration — average score")
+        if cal_score:
+            charts.append(
+                f"<img alt='calibration (score)' src='data:image/png;base64,{cal_score}'/>")
+    img = f"<div class='charts'>{''.join(charts)}</div>" if charts else ""
+
     return ("<h2>Win prediction (headline)</h2>"
-            "<p class='sub'>Majority of the per-game sims is the pick; the share that picks home "
-            "is its win probability.</p>" + summary + img + table)
+            "<p class='sub'>Two ways to call the winner. <b>Majority vote</b>: the share of sims the "
+            "home team won is its win probability, and the majority is the pick. <b>Average score</b>: "
+            "the winner is the sign of the mean predicted margin, with the probability from the sims' "
+            "margin spread (normal approx) — more robust when the box-score averages are good but "
+            "individual sims are coin-flippy.</p>" + comparison + img + table)
 
 
 def _spread_section(agg: dict, records: list[dict]) -> str:
@@ -261,6 +326,60 @@ def _example_box_section(records: list[dict]) -> str:
     return "".join(out)
 
 
+def _fmt_dial(v) -> str:
+    """Compact display of a tuning dial value (floats trimmed; dict-strings passed through)."""
+    if isinstance(v, float):
+        return f"{v:g}"
+    return _esc(v)
+
+
+def _progression_section(agg: dict) -> str:
+    """How the headline metrics moved across distinct-tuning segments (alongside the overall)."""
+    prog = agg.get("progression") or []
+    if not prog:
+        return ""
+    rows = []
+    for p in prog:
+        m = p["metrics"]
+        gids = p["game_ids"]
+        span = f"{min(gids)}–{max(gids)} ({p['n_games']})" if gids else f"({p['n_games']})"
+        changed = p["changed_dials"]
+        changed_txt = ("(baseline)" if p["segment"] == 1 and not changed
+                       else " · ".join(f"{k}={_fmt_dial(v)}" for k, v in changed.items()) or "—")
+        rows.append([
+            p["segment"], span, changed_txt,
+            f"{m['pace_bias']:+.1f}", f"{m['fga_bias']:+.1f}", f"{m['efg_bias'] * 100:+.1f}%",
+            f"{m['pick_accuracy'] * 100:.0f}%", f"{m['brier']:.3f}",
+            f"{m['score_pick_accuracy'] * 100:.0f}%", f"{m['score_brier']:.3f}",
+            f"{m['spread_mae']:.1f}", f"{m['points_mae']:.1f}",
+        ])
+    table = _table(["seg", "games", "tuning change", "pace bias", "FGA bias", "eFG bias",
+                    "vote pick", "vote Brier", "score pick", "score Brier",
+                    "spread MAE", "PTS MAE"], rows)
+    chart = _progression_chart(prog)
+    img = (f"<div class='charts'><img alt='progression' "
+           f"src='data:image/png;base64,{chart}'/></div>") if chart else ""
+    note = ("Holdout segmented by <b>distinct tuning</b> in evaluation order — each row is a stretch of "
+            "games simmed under one set of dials, with what changed vs the prior segment. Tracks how "
+            "the model evolved as you retuned, alongside the overall aggregate above. "
+            "(One row only = the whole holdout ran under a single tuning, or per-game tuning wasn't "
+            "recorded.)")
+    return f"<h2>Tuning progression</h2><p class='sub'>{note}</p>{table}{img}"
+
+
+def _tuning_section(report: dict) -> str:
+    """Run-configuration / tuning dials used for this eval (recorded for cross-run analysis)."""
+    tuning = report.get("tuning") or {}
+    if not tuning:
+        return ""
+    rows = [[k, v] for k, v in tuning.items()]
+    table = _table(["dial", "value"], rows, cls="kv2")
+    return ("<h2>Run configuration (tuning)</h2>"
+            "<p class='sub'>Rollout dials used for this run, captured from <code>config</code>. "
+            "Also written to <code>run_summary.parquet</code> (one row per run) with the headline "
+            "outcomes for knobs→results analysis across runs.</p>" + table)
+
+
 _STYLE = """
 :root { --fg:#1f2329; --muted:#6b7280; --line:#e5e7eb; --accent:#4C78A8; }
 * { box-sizing:border-box; }
@@ -300,6 +419,7 @@ def render_html(report: dict) -> str:
         _cards(agg["headline"]),
         _win_section(agg, records),
         _spread_section(agg, records),
+        _progression_section(agg),
         _accuracy_section("Team box-score accuracy", agg["team_accuracy"],
                           agg["team_reliability"],
                           "Predicted (mean over sims) vs actual per team; 'sim std' is the average "
@@ -309,6 +429,7 @@ def render_html(report: dict) -> str:
                           agg["player_reliability"],
                           "Players matched by name across sims and the real game (absent = 0)."),
         _example_box_section(records),
+        _tuning_section(report),
         "<footer>Generated by CourtVisionIQ evaluation harness.</footer>",
     ]
     return ("<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>"
@@ -321,10 +442,13 @@ def render_html(report: dict) -> str:
 def _games_frame(records: list[dict]) -> pd.DataFrame:
     rows = []
     for r in records:
+        sv = score_win_view(r)  # average-score winner (derived from the stored margin scalars)
         rows.append({
             "game_id": r["game_id"], "n_sims": r["n_sims"],
             "win_prob_home": r["win_prob_home"], "pred_pick": r["pred_pick"],
             "actual_winner": r["actual_winner"], "pick_correct": r["pick_correct"],
+            "score_win_prob_home": sv["win_prob_home"], "score_pick": sv["pick"],
+            "score_pick_correct": sv["pick_correct"],
             "pred_margin_mean": r["pred_margin_mean"], "pred_margin_std": r["pred_margin_std"],
             "actual_margin": r["actual_margin"],
             "pred_home_score": r["pred_home_score"], "pred_away_score": r["pred_away_score"],
@@ -356,6 +480,12 @@ def _summary_frame(agg: dict) -> pd.DataFrame:
                  "predicted": agg["win"]["pick_accuracy"], "actual": None, "mae": None, "bias": None})
     rows.append({"scope": "win", "metric": "brier",
                  "predicted": agg["win"]["brier"], "actual": None, "mae": None, "bias": None})
+    # Average-score winner (parallel to the vote scope above).
+    if agg.get("win_score"):
+        for metric in ("pick_accuracy", "brier", "log_loss"):
+            rows.append({"scope": "win_score", "metric": metric,
+                         "predicted": agg["win_score"][metric],
+                         "actual": None, "mae": None, "bias": None})
     for m in ("mae", "bias", "rmse", "corr"):
         rows.append({"scope": "spread", "metric": m, "predicted": None, "actual": None,
                      "mae": agg["spread"]["mae"] if m == "mae" else None,
@@ -370,8 +500,68 @@ def _summary_frame(agg: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _progression_frame(agg: dict) -> pd.DataFrame:
+    """One row per distinct-tuning segment: metrics + the tuning dials + what changed.
+
+    Complements the one-row ``run_summary.parquet`` (which records a single run-level tuning) by
+    capturing the *within-run* trajectory when the dials change between eval batches.
+    """
+    rows = []
+    for p in (agg.get("progression") or []):
+        gids = p["game_ids"]
+        row = {
+            "segment": p["segment"], "n_games": p["n_games"],
+            "game_id_min": min(gids) if gids else None,
+            "game_id_max": max(gids) if gids else None,
+            "evaluated_at": p.get("evaluated_at"),
+            "changed_dials": json.dumps(p["changed_dials"], sort_keys=True),
+            **p["metrics"],
+            **(p["tuning"] or {}),
+        }
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _run_summary_frame(report: dict) -> pd.DataFrame:
+    """One row joining the run's tuning dials to its headline outcomes (cross-run analysis table).
+
+    Concatenating these single-row tables across runs gives a knobs→results table: every tuning
+    dial alongside pick accuracy, Brier, spread/points MAE, and the pace / FGA / eFG biases.
+    """
+    agg = report["aggregate"]
+
+    def _bias(block: str, metric: str):
+        return agg.get(block, {}).get(metric, {}).get("bias")
+
+    row = {
+        "run_id": report["run_id"],
+        "run_name": report.get("run_name"),
+        "created_at": report.get("created_at"),
+        "git_commit": report.get("git_commit"),
+        "n_games": report["n_games"],
+        "n_sims": report["n_sims"],
+        # How many distinct tunings the holdout spanned (1 = single tuning; >1 = retuned mid-run, so
+        # the run-level dials below are only the last segment's — see progression.parquet).
+        "n_tuning_segments": len(agg.get("progression") or []),
+        # Headline outcomes (both winner methods).
+        "pick_accuracy": agg["headline"]["pick_accuracy"],
+        "brier": agg["headline"]["brier"],
+        "score_pick_accuracy": agg["headline"].get("score_pick_accuracy"),
+        "score_brier": agg["headline"].get("score_brier"),
+        "spread_mae": agg["headline"]["spread_mae"],
+        "points_mae": agg["headline"]["points_mae"],
+        # Key biases the tuning targets (predicted − actual, per team).
+        "pace_bias": _bias("advanced", "pace"),
+        "fga_bias": _bias("team_accuracy", "fga"),
+        "efg_bias": _bias("advanced", "efg"),
+        # Every tuning dial that produced the run.
+        **(report.get("tuning") or {}),
+    }
+    return pd.DataFrame([row])
+
+
 def write_eval_report(report: dict, *, reports_root: str = DEFAULT_REPORTS_ROOT):
-    """Write report.html / report.json / the three Parquet tables. Returns the run dir Path."""
+    """Write report.html / report.json / the Parquet tables. Returns the run dir Path."""
     arts = ReportArtifacts.for_run("evaluation", report["run_id"], root=reports_root)
     run_dir = arts.ensure_dir()
 
@@ -381,6 +571,10 @@ def write_eval_report(report: dict, *, reports_root: str = DEFAULT_REPORTS_ROOT)
     _games_frame(report["records"]).to_parquet(run_dir / "games.parquet", index=False)
     _box_players_frame(report["records"]).to_parquet(run_dir / "box_players.parquet", index=False)
     _summary_frame(report["aggregate"]).to_parquet(run_dir / "summary.parquet", index=False)
+    _run_summary_frame(report).to_parquet(run_dir / "run_summary.parquet", index=False)
+    prog = _progression_frame(report["aggregate"])
+    if not prog.empty:
+        prog.to_parquet(run_dir / "progression.parquet", index=False)
     return run_dir
 
 

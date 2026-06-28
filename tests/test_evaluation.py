@@ -7,8 +7,9 @@ import pandas as pd
 import pytest
 
 from simulation.box_score import BoxScore, PlayerLine
-from simulation.stats import BOX_STATS, advanced_stats, team_totals
+from simulation.stats import BOX_STATS, advanced_stats, score_win_prob, team_totals
 from simulation import evaluation as ev
+from simulation import eval_metrics as em
 from reporting import eval_report
 
 
@@ -88,10 +89,34 @@ def test_empty_metrics_are_safe():
     assert ev.win_metrics([], [], [])["n"] == 0
 
 
+def test_score_win_prob():
+    # Symmetric: an exactly-even matchup is a coin flip; sign of the margin drives the rest.
+    assert score_win_prob(0.0, 5.0) == pytest.approx(0.5)
+    assert score_win_prob(5.0, 5.0) == pytest.approx(0.5 * (1 + math.erf(1 / math.sqrt(2))))
+    assert score_win_prob(-5.0, 5.0) == pytest.approx(1 - score_win_prob(5.0, 5.0))
+    # Zero spread collapses to a hard call by the sign of the mean margin.
+    assert score_win_prob(3.0, 0.0) == 1.0
+    assert score_win_prob(-3.0, 0.0) == 0.0
+    assert score_win_prob(0.0, 0.0) == 0.5
+
+
+def test_score_win_view_picks_by_mean_margin():
+    # Vote would split this game 50/50, but the mean margin is clearly negative -> pick away.
+    r = {"pred_margin_mean": -4.0, "pred_margin_std": 6.0, "actual_winner": "away"}
+    view = em.score_win_view(r)
+    assert view["pick"] == "away"
+    assert view["pick_correct"] is True
+    assert view["win_prob_home"] < 0.5
+
+
 # --------------------------------------------------------------------------- report writer
 
-def _make_record(gid: int, win_prob: float, pred_margin: float, actual_margin: int) -> dict:
-    """A fully-populated per-game record (the shape evaluate_game returns)."""
+def _make_record(gid: int, win_prob: float, pred_margin: float, actual_margin: int,
+                 tuning: dict | None = None, evaluated_at: str | None = None) -> dict:
+    """A fully-populated per-game record (the shape evaluate_game returns).
+
+    ``tuning`` / ``evaluated_at`` populate the sim-time provenance the progression view segments on.
+    """
     def teamrow(pts):
         row = {f: 0.0 for f in BOX_STATS}
         row.update(pts=float(pts), fga=80.0, fgm=36.0, tpa=18.0, tpm=6.0, fta=20.0, ftm=15.0,
@@ -108,6 +133,7 @@ def _make_record(gid: int, win_prob: float, pred_margin: float, actual_margin: i
     sides = ("home", "away")
     return {
         "game_id": gid, "n_sims": 11,
+        "tuning": tuning, "evaluated_at": evaluated_at,
         "win_prob_home": win_prob, "pred_pick": "home" if win_prob > 0.5 else "away",
         "actual_winner": "home" if actual_margin > 0 else "away",
         "actual_home_win": actual_margin > 0,
@@ -136,6 +162,15 @@ def test_aggregate_and_write_report(tmp_path):
     assert agg["team_accuracy"]["pts"]["n"] == 4          # 2 games x 2 sides
     assert agg["spread"]["n"] == 2
 
+    # Average-score winner is aggregated alongside the vote method (both call these correctly here).
+    assert agg["headline"]["score_pick_accuracy"] == 1.0
+    assert agg["win_score"]["n"] == 2
+    assert 0.0 <= agg["headline"]["score_brier"] <= 1.0
+
+    # No per-game tuning -> a single progression segment (everything collapses).
+    assert len(agg["progression"]) == 1
+    assert agg["progression"][0]["n_games"] == 2
+
     report = eval_report.build_report(records=records, aggregate=agg, n_sims=11, run_name="test")
     run_dir = eval_report.write_eval_report(report, reports_root=str(tmp_path))
 
@@ -143,10 +178,12 @@ def test_aggregate_and_write_report(tmp_path):
     assert (run_dir / "report.json").exists()
     html = (run_dir / "report.html").read_text(encoding="utf-8")
     assert "Holdout evaluation report" in html and "Win prediction" in html
+    assert "average score" in html and "majority vote" in html
 
     games = pd.read_parquet(run_dir / "games.parquet")
     assert set(games["game_id"]) == {1, 2}
     assert "win_prob_home" in games.columns and "pick_correct" in games.columns
+    assert {"score_win_prob_home", "score_pick", "score_pick_correct"}.issubset(games.columns)
 
     box = pd.read_parquet(run_dir / "box_players.parquet")
     assert {"pred_pts", "std_pts", "actual_pts"}.issubset(box.columns)
@@ -155,3 +192,61 @@ def test_aggregate_and_write_report(tmp_path):
     summary = pd.read_parquet(run_dir / "summary.parquet")
     assert {"scope", "metric", "predicted", "actual", "mae", "bias"}.issubset(summary.columns)
     assert (summary["scope"] == "advanced").any()
+
+    # Tuning capture: the dials that produced the run are recorded in the report + HTML, and a
+    # one-row run_summary.parquet joins them to the headline outcomes for cross-run analysis.
+    import config
+    assert report["tuning"]["DELTA_TIME_SCALE"] == config.DELTA_TIME_SCALE
+    assert "Run configuration" in html
+    run_summary = pd.read_parquet(run_dir / "run_summary.parquet")
+    assert len(run_summary) == 1
+    assert {"run_id", "pick_accuracy", "pace_bias", "fga_bias", "efg_bias",
+            "DELTA_TIME_SCALE", "SUB_INCOMING_TEMPERATURE"}.issubset(run_summary.columns)
+    assert run_summary.iloc[0]["pick_accuracy"] == 1.0
+    assert run_summary.iloc[0]["n_tuning_segments"] == 1
+
+
+# --------------------------------------------------------------------------- tuning progression
+
+def test_progression_segments_by_distinct_tuning():
+    tune_a = {"DELTA_TIME_SCALE": 1.0, "HOME_COURT_SHOT_BIAS": 0.0}
+    tune_b = {"DELTA_TIME_SCALE": 1.06, "HOME_COURT_SHOT_BIAS": 0.0}
+    # Two games under tune A, then one under tune B (in evaluation order via evaluated_at).
+    records = [
+        _make_record(1, 0.7, 4.0, 3, tuning=tune_a, evaluated_at="2026-06-28T10:00:00"),
+        _make_record(2, 0.3, -6.0, -5, tuning=tune_a, evaluated_at="2026-06-28T10:01:00"),
+        _make_record(3, 0.6, 2.0, 1, tuning=tune_b, evaluated_at="2026-06-28T11:00:00"),
+    ]
+    prog = em.progression(records)
+
+    assert [s["segment"] for s in prog] == [1, 2]
+    assert prog[0]["n_games"] == 2 and prog[0]["game_ids"] == [1, 2]
+    assert prog[1]["n_games"] == 1 and prog[1]["game_ids"] == [3]
+    # First segment is the baseline (no prior to diff against); second flags the one dial that moved.
+    assert prog[0]["changed_dials"] == {}
+    assert prog[1]["changed_dials"] == {"DELTA_TIME_SCALE": 1.06}
+    # Each segment's metrics match _aggregate_core over just its records (no recursion / leakage).
+    seg2_core = em._aggregate_core(records[2:])
+    assert prog[1]["metrics"]["spread_mae"] == pytest.approx(seg2_core["headline"]["spread_mae"])
+
+
+def test_progression_renders_section_and_parquet(tmp_path):
+    tune_a = {"DELTA_TIME_SCALE": 1.0}
+    tune_b = {"DELTA_TIME_SCALE": 1.06}
+    records = [
+        _make_record(1, 0.7, 4.0, 3, tuning=tune_a, evaluated_at="2026-06-28T10:00:00"),
+        _make_record(2, 0.3, -6.0, -5, tuning=tune_b, evaluated_at="2026-06-28T11:00:00"),
+    ]
+    agg = ev._aggregate(records)
+    assert len(agg["progression"]) == 2
+
+    report = eval_report.build_report(records=records, aggregate=agg, n_sims=11, run_name="prog")
+    run_dir = eval_report.write_eval_report(report, reports_root=str(tmp_path))
+
+    html = (run_dir / "report.html").read_text(encoding="utf-8")
+    assert "Tuning progression" in html and "DELTA_TIME_SCALE=1.06" in html
+
+    prog = pd.read_parquet(run_dir / "progression.parquet")
+    assert len(prog) == 2
+    assert {"segment", "n_games", "spread_mae", "DELTA_TIME_SCALE", "changed_dials"}.issubset(
+        prog.columns)

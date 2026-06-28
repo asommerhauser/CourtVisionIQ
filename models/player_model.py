@@ -501,7 +501,10 @@ class PlayerModel:
         model.compile(
             optimizer=optimizer,
             loss={"player_output": keras.losses.SparseCategoricalCrossentropy(from_logits=True)},
-            metrics={"player_output": [keras.metrics.SparseCategoricalAccuracy(name="acc")]},
+            # weighted_metrics (NOT metrics): only weighted_metrics receive the sample_weight
+            # mask, so acc reflects real event rows, not every padded position (see note in
+            # conditional_type_model.train).
+            weighted_metrics={"player_output": [keras.metrics.SparseCategoricalAccuracy(name="acc")]},
             jit_compile=jit_compile,
         )
 

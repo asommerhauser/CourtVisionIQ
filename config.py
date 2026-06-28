@@ -16,27 +16,66 @@ ROSTER_SIZE = 5
 # >1 flattens toward uniform, 1.0 is the raw model. Every categorical pick routes through
 # _masked_sample / _constrained_sample, which apply these.
 #
-# The player/actor head (shooter, rebounder, assister, fouler, FT shooter) is sharpened below 1
-# so usage concentrates on the better players instead of spreading evenly across the on-court
-# five — the small, real differences in the head's logits should drive who shoots, not be smoothed
-# away. The rest default to 1.0 (raw) and are exposed as knobs for future tuning.
-PLAYER_TEMPERATURE = 0.8
+# The player/actor head (shooter, rebounder, assister, fouler, FT shooter) is FLATTENED above 1.
+# The full-corpus, recency-weighted retrain converges to a much more confident head than the old
+# curriculum stages: restricted to the on-court five it puts ~0.55-0.85 of the mass on a single
+# player (measured via a probe over real holdout lineups), so at the old 0.8 (a *sharpening*) one
+# star vacuumed points+rebounds+assists at once (the shared head also picks the rebounder/assister)
+# — e.g. a 50/15/14 line — while a star the head under-ranks got starved. 2.0 lands the alpha's
+# shot share back in the realistic ~0.33-0.41 band while preserving the ranking. Temperature only
+# flattens over-concentration; it cannot fix a genuine per-player mis-ranking (a training issue).
+# The rest default to 1.0 (raw) and are exposed as knobs for future tuning.
+PLAYER_TEMPERATURE = 2.0
 EVENT_TEMPERATURE = 1.0    # next-event head (shot / foul / turnover / … mix)
+# Multiplicative calibration on the predicted inter-event Δt before it advances the game clock
+# (GameController._advance_clock). 1.0 = raw model. Pace ≈ possessions/48 ≈ FGA-driven, and the
+# clock filling 48 min sets how many possessions fit: >1 slows the clock (fewer possessions →
+# lower pace), <1 speeds it up. Leave at 1.0 until measured, then set to real_Δt_mean/sim_Δt_mean
+# from `python -m simulation.diagnostics` (it does not require a retrain).
+# Set to 1.06 off the 100-game full-train holdout: pace ran 107.8 vs 101.3 real poss/48 (+6.4%),
+# so the conditional-time head's mean gap is ~6% short. 101.3/107.8 ~= 0.94 -> slow the clock by
+# x1.06 to land pace ~= real and deflate the across-the-board counting-stat over-prediction
+# (DREB/AST/STL all inflated ~proportionally with pace). Re-confirm with diagnostics after a retrain.
+DELTA_TIME_SCALE = 1.06
 SUB_TEMPERATURE = 1.0      # outgoing substitution pick (legacy path) / generic sub sampling
 # Incoming-sub pick temperature. The substitution head emits over the *player* vocab, so — like
 # the actor head — its small, real preferences (which bench player actually checks in) should
 # drive the pick, not be smoothed toward a uniform bench. <1 sharpens; push toward 0 to approach
 # argmax (the single most-likely sub every time, at the cost of all rotation variety). Sharper
 # than the actor head by default since a coach's bench order is more concentrated than shot usage.
-SUB_INCOMING_TEMPERATURE = 0.7
+# Lowered from 0.7: the stage eval over-played the deep bench (rank 15+ by +4..+14 min) and
+# under-played starters (~9 min); sharpening concentrates check-ins on the real 8–9 man rotation.
+SUB_INCOMING_TEMPERATURE = 0.45
 TYPE_TEMPERATURE = 1.0     # shot_type / assist_type / turnover_type / foul_type / rebound_type
 RESULT_TEMPERATURE = 1.0   # shot_result (made / missed / blocked)
+# Per-outcome logit offset applied to the live-shot result sample (made / missed / blocked) via the
+# existing `bias` arg of GameSimulator._masked_sample. Default {} = raw model. Blocks were
+# over-produced (+53% in the stage eval), which drags eFG/FG% down; if eFG stays low after the
+# pace fix, push "blocked" negative (and/or "made" positive) here to pull make/block rates to real.
+SHOT_RESULT_BIAS: dict[str, float] = {}
+# Home-court edge. The rollout is otherwise home/away symmetric (HOME just inbounds first), so the
+# sim can't separate winners and win-pick accuracy sits near a coin flip. This adds a logit nudge to
+# the live-shot "made" outcome: +HOME_COURT_SHOT_BIAS for the home offense, -HOME_COURT_SHOT_BIAS for
+# the away offense. Symmetric on purpose — it tilts the home/away split (driving win prediction)
+# without moving the pooled eFG/FG% the four-factors table already gets ~right. ~0.10 lifts home eFG
+# ~+1pt / drops away ~-1pt, roughly a ~2.5-pt home edge (real NBA ~2.5-3.0). 0 = off; tune against
+# the win-prediction calibration + spread bias in the eval report. Applied in GameController._do_shot.
+HOME_COURT_SHOT_BIAS = 0.10
 # Logit bonus per second of a player's current on-court stint, added to the outgoing-sub pick so
 # a long-tenured player (a star included) is *nudged* — not forced — toward coming off. 0 = off.
-SUB_FATIGUE_WEIGHT = 0.15
+# Lowered from 0.15 so starters are pulled for tenure less aggressively (the stage eval under-played
+# the top of the rotation); lets stars hold longer stints.
+SUB_FATIGUE_WEIGHT = 0.08
 # Max game-seconds a team may go without a substitution before the Controller forces one (the
 # event head never targets a team, so this safety net keeps a team from playing five men 48 min).
 SUB_MAX_GAP_SECONDS = 420.0
+
+# Number of independent game-sims the batched rollout runs concurrently, pooling their per-event
+# forward passes into one batched GPU call (simulation/batched_rollout.py). >1 enables batching; 1 is
+# the original one-at-a-time path. The win comes from amortizing batch-1 kernel-launch overhead, so
+# size it to how many games fit in VRAM (the model is small — dozens are fine). It does NOT affect
+# results (pure scheduling), so it's a perf knob, not a tuning dial.
+ROLLOUT_BATCH_SIZE = 16
 
 # --- Stint-length scheduler (StintLengthModel + GameController hybrid scheduler) ---
 # When the stint-length head is loaded, the Controller commits each entering player to a stint:
@@ -51,6 +90,42 @@ STINT_MAX_SECONDS = 900.0
 # Personal fouls that disqualify a player for the rest of the game (NBA standard: 6). Offensive
 # fouls count toward this; technicals do not.
 FOUL_OUT_LIMIT = 6
+
+# Clamp on a single predicted Δt before it advances the game clock (after DELTA_TIME_SCALE), so one
+# bad gap can't blow up the clock. Raised from 40 to 60 — real end-of-quarter / dead-ball gaps
+# exceed 40s and truncating them bleeds game time (nudging pace up). The controller imports this.
+MAX_DELTA = 60.0
+# Probability a missed shot yields no individual rebound (an out-of-bounds / dropped team rebound):
+# the ball just changes hands with no row. The off/def split of real rebounds is the rebound-type
+# head's job; this is only the rare no-rebounder case. The controller imports this.
+DEADBALL_REBOUND_PROB = 0.06
+
+# Rollout dials captured into each evaluation report (reporting/eval_report.py) so tuning settings
+# are recorded alongside results for cross-run analysis. Order is the display order in the report.
+_TUNING_KEYS = (
+    "DELTA_TIME_SCALE", "MAX_DELTA", "DEADBALL_REBOUND_PROB",
+    "PLAYER_TEMPERATURE", "EVENT_TEMPERATURE", "TYPE_TEMPERATURE", "RESULT_TEMPERATURE",
+    "SUB_TEMPERATURE", "SUB_INCOMING_TEMPERATURE", "SUB_FATIGUE_WEIGHT", "SUB_MAX_GAP_SECONDS",
+    "STINT_SAMPLE_SIGMA", "STINT_MAX_SECONDS", "FOUL_OUT_LIMIT", "SHOT_RESULT_BIAS",
+    "HOME_COURT_SHOT_BIAS",
+)
+
+
+def tuning_snapshot() -> dict:
+    """The live values of every rollout dial (read from this module at call time).
+
+    Reading the module globals means edits to this file between runs are reflected accurately, so
+    each evaluation report records exactly the tuning that produced it. ``SHOT_RESULT_BIAS`` is
+    JSON-encoded to a compact string so it sits cleanly in a single Parquet column.
+    """
+    import json as _json
+    g = globals()
+    snap: dict = {}
+    for k in _TUNING_KEYS:
+        v = g[k]
+        snap[k] = _json.dumps(v, sort_keys=True) if isinstance(v, dict) else v
+    return snap
+
 
 # Where the shared vocab "language" files live
 VOCAB_DIR = ROOT_DIR / "encoder" / "vocabs"
@@ -103,3 +178,30 @@ FINAL_SEASON_FRACTION = 0.5
 FINAL_HOLDOUT_GAMES = 100
 EVAL_BATCH = 10
 FULL_ARTIFACTS_ROOT = "./artifacts_full"
+
+# --- Representative subset for the small heads (training/subset.py) ---
+# The small categorical/regression heads (event/type/result/conditional-time) saturate long before
+# they see the whole corpus and start to overfit, so they train on a compact, *representative*
+# slice instead of every game. The slice is selected by a per-season sample RATE that is heavy on
+# the modern game (so current players are well-learned) and decays gently for older seasons, but it
+# stays coverage-complete: every player who appears in the train pool is guaranteed at least one
+# game, so no embedding goes starved. The big player-vocab heads (player / substitution /
+# stint_length) keep the full corpus — they actually need the data.
+#
+# Per-season sample rate for the most recent seasons, NEWEST FIRST: the newest season gets 70% of
+# its games, the next 40%, the third 25%. The newest season is itself already truncated at
+# FINAL_SEASON_FRACTION (we cut partway through it), so 70% of that is a modest absolute count.
+SUBSET_RECENT_SEASON_RATES = (0.70, 0.40, 0.25)
+# Seasons older than the recent block decay from the last recent rate (0.25), halving every
+# this-many seasons — a gentle exponential tail. Coverage still guarantees every player a game, so
+# old-only players pull in the older games they need regardless of the rate.
+SUBSET_RECENCY_HALFLIFE_SEASONS = 8.0
+SUBSET_SEED = 42                     # deterministic subset selection
+SUBSET_GAMES_PATH = "./training/subset_games.json"  # persisted subset manifest (one extract step)
+# Heads trained on the representative subset rather than the full corpus. All six conditional
+# type/result heads share one preprocess file, so they move as a group. Everything NOT listed here
+# (event_time, player, substitution, stint_length) trains on the full corpus.
+SUBSET_MODEL_KEYS = (
+    "event_time_cond",
+    "shot_type", "shot_result", "assist_type", "turnover_type", "foul_type", "rebound_type",
+)

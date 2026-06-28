@@ -87,6 +87,55 @@ def _dt(times) -> np.ndarray:
     return d[d > 0]
 
 
+# Δt-by-preceding-event: which kind of event the gap *follows*, so we can see whether the time head
+# lengthens Δt after a made basket and shortens it after a miss (the per-transition timing the
+# conditional time head is meant to capture). Display order top→bottom.
+_PREV_LABELS = (
+    "after_made_fg", "after_missed_fg", "after_blocked", "after_def_reb", "after_off_reb",
+    "after_turnover", "after_foul", "after_assist", "after_ft",
+)
+
+
+def _prev_label(event, etype, result) -> str | None:
+    """Bucket label for the gap that *follows* this row (None = a transition we don't track)."""
+    if event == "shot":
+        if etype == "free throw":
+            return "after_ft"
+        if result == "made":
+            return "after_made_fg"
+        if result == "blocked":
+            return "after_blocked"
+        return "after_missed_fg"
+    if event == "rebound":
+        return "after_off_reb" if etype == "offensive" else "after_def_reb"
+    if event == "turnover":
+        return "after_turnover"
+    if event == "foul":
+        return "after_foul"
+    if event == "assist":
+        return "after_assist"
+    return None
+
+
+def _labeled_gaps(events, etypes, results, times) -> dict[str, list[float]]:
+    """Positive inter-event gaps bucketed by the preceding event's label."""
+    events, etypes, results, times = list(events), list(etypes), list(results), list(times)
+    out: dict[str, list[float]] = {}
+    for i in range(len(times) - 1):
+        gap = float(times[i + 1]) - float(times[i])
+        if gap <= 0:
+            continue
+        lab = _prev_label(events[i], etypes[i], results[i])
+        if lab is not None:
+            out.setdefault(lab, []).append(gap)
+    return out
+
+
+def _merge_labeled(acc: dict[str, list[float]], new: dict[str, list[float]]) -> None:
+    for lab, gaps in new.items():
+        acc.setdefault(lab, []).extend(gaps)
+
+
 def _event_hist(events) -> dict[str, float]:
     counts = pd.Series(list(events)).value_counts()
     return {e: float(counts.get(e, 0)) for e in _EVENT_TYPES}
@@ -111,6 +160,7 @@ def compare_holdout(*, games: int | None = None, seeds: int = 3,
 
     pred_team, act_team = [], []          # per-team stat rows
     pred_dt, act_dt = [], []              # pooled inter-event gaps
+    pred_dt_lab, act_dt_lab = {}, {}      # inter-event gaps bucketed by preceding event
     pred_hist, act_hist = [], []          # per-game event histograms
     pred_events_per_game, act_events_per_game = [], []
 
@@ -122,6 +172,8 @@ def compare_holdout(*, games: int | None = None, seeds: int = 3,
         actual_box = generate_box_score(game)
         act_team.extend(_box_team_rows(actual_box))
         act_dt.append(_dt(game["time"]))
+        _merge_labeled(act_dt_lab, _labeled_gaps(game["event"], game["type"],
+                                                 game["result"], game["time"]))
         act_hist.append(_event_hist(game["event"]))
         act_events_per_game.append(int((~game["event"].isin(["start", "end"])).sum()))
         try:
@@ -138,6 +190,9 @@ def compare_holdout(*, games: int | None = None, seeds: int = 3,
             pred_box = generate_box_score(history)
             pred_team.extend(_box_team_rows(pred_box))
             pred_dt.append(_dt([r["time"] for r in history]))
+            _merge_labeled(pred_dt_lab, _labeled_gaps(
+                [r["event"] for r in history], [r["type"] for r in history],
+                [r["result"] for r in history], [r["time"] for r in history]))
             pred_hist.append(_event_hist([r["event"] for r in history]))
             pred_events_per_game.append(sum(1 for r in history
                                             if r["event"] not in ("start", "end")))
@@ -148,6 +203,7 @@ def compare_holdout(*, games: int | None = None, seeds: int = 3,
         "team_stats": _summarize_team(pred_team, act_team),
         "dt": _summarize_dt(np.concatenate(pred_dt) if pred_dt else np.empty(0),
                             np.concatenate(act_dt) if act_dt else np.empty(0)),
+        "dt_by_prev": _summarize_labeled(pred_dt_lab, act_dt_lab),
         "events_per_game": {
             "predicted": _mean(pred_events_per_game), "actual": _mean(act_events_per_game),
         },
@@ -182,6 +238,16 @@ def _summarize_hist(pred: list[dict], act: list[dict]) -> dict:
                 "actual": _mean([h[e] for h in act])} for e in _EVENT_TYPES}
 
 
+def _summarize_labeled(pred: dict[str, list[float]], act: dict[str, list[float]]) -> dict:
+    """Mean gap (seconds) and count per preceding-event label, predicted vs real."""
+    out = {}
+    for lab in _PREV_LABELS:
+        p, a = pred.get(lab, []), act.get(lab, [])
+        out[lab] = {"predicted": _mean(p), "actual": _mean(a),
+                    "n_pred": len(p), "n_act": len(a)}
+    return out
+
+
 def _print_report(r: dict) -> None:
     print(f"\n=== sim-vs-real baseline  ({r['n_games']} holdout games x {r['seeds']} seeds) ===\n")
 
@@ -202,6 +268,13 @@ def _print_report(r: dict) -> None:
     print("\n-- inter-event Δt (sec) --")
     for stat in ("mean", "median", "p90"):
         row(f"Δt {stat}", r["dt"]["predicted"][stat], r["dt"]["actual"][stat], "{:.2f}")
+
+    print("\n-- Δt by preceding event (mean sec) --")
+    for lab in _PREV_LABELS:
+        v = r["dt_by_prev"][lab]
+        if v["n_act"] == 0 and v["n_pred"] == 0:
+            continue
+        row(lab.replace("after_", "after "), v["predicted"], v["actual"], "{:.2f}")
 
     print("\n-- events per game --")
     row("events", r["events_per_game"]["predicted"], r["events_per_game"]["actual"])

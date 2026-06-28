@@ -89,6 +89,12 @@ class TypeGenSpec:
     event: str                     # event token whose rows this head learns on, e.g. "shot"
     target_field: str              # "type" or "result" — the field predicted
     condition_fields: tuple        # extra decided fields, e.g. ("player",) or ("player", "type")
+    # If non-empty, the loss is further restricted to rows whose *target* token is in this set.
+    # Used by shot_type to learn live field goals only ({2pt, 3pt}): in the cleaned data a free
+    # throw is a shot row (event="shot", type="free throw"), but the simulator never asks shot_type
+    # to choose one (FTs are emitted directly from fouls — controller._free_throws), so training on
+    # them only confuses a binary 2pt-vs-3pt head. Empty = no extra restriction (all other heads).
+    target_tokens: tuple = ()
 
 
 # The learned set (the prior solution's, minus the deterministic-result heads, plus the
@@ -97,7 +103,7 @@ class TypeGenSpec:
 # picked, so it does not condition on ``next_player`` — the controller samples the type first,
 # then the rebounder from the team that type implies.
 TYPE_GEN_SPECS: dict[str, TypeGenSpec] = {
-    "shot_type":     TypeGenSpec("shot_type",     "shot",     "type",   ("player",)),
+    "shot_type":     TypeGenSpec("shot_type",     "shot",     "type",   ("player",), ("2pt", "3pt")),
     "shot_result":   TypeGenSpec("shot_result",   "shot",     "result", ("player", "type")),
     "assist_type":   TypeGenSpec("assist_type",   "assist",   "type",   ("player",)),
     "turnover_type": TypeGenSpec("turnover_type", "turnover", "type",   ("player",)),
@@ -519,13 +525,20 @@ class ConditionalTypeModel:
 
         The shared file carries every event's rows; ``loss_mask`` already zeroes PAD /
         no-next steps. We additionally zero every step whose decided event is not this
-        head's event, so e.g. the shot-type head only learns on shot placements.
+        head's event, so e.g. the shot-type head only learns on shot placements. When the
+        spec carries ``target_tokens`` we also zero rows whose target is outside that set
+        (shot_type: live field goals {2pt, 3pt} only — free-throw shot rows are excluded).
         """
         inputs = {k: split[k] for k in self.INPUT_KEYS}
-        targets = {self.output_name: split[f"next_{self.spec.target_field}"]}
+        target_arr = split[f"next_{self.spec.target_field}"]
+        targets = {self.output_name: target_arr}
 
         event_id = self.encoder.encode_event(self.spec.event)
         event_mask = (split["next_event"] == event_id).astype(np.float32)
+        if self.spec.target_tokens:
+            encode_target = getattr(self.encoder, f"encode_{self.spec.target_field}")
+            allowed_ids = [encode_target(t) for t in self.spec.target_tokens]
+            event_mask = event_mask * np.isin(target_arr, allowed_ids).astype(np.float32)
         mask = apply_recency(split["loss_mask"] * event_mask, split)
         sample_weights = {self.output_name: mask}
 
@@ -597,7 +610,11 @@ class ConditionalTypeModel:
         model.compile(
             optimizer=optimizer,
             loss={self.output_name: keras.losses.SparseCategoricalCrossentropy(from_logits=True)},
-            metrics={self.output_name: [keras.metrics.SparseCategoricalAccuracy(name="acc")]},
+            # weighted_metrics (NOT metrics): Keras only feeds the sample_weight mask to
+            # weighted_metrics. With plain `metrics=`, acc is computed over EVERY padded
+            # position (PAD + non-shot + non-2pt/3pt rows), so it ignores the loss_mask and
+            # reads nonsense (~0.2-0.36) instead of the true masked 2pt-vs-3pt hit rate.
+            weighted_metrics={self.output_name: [keras.metrics.SparseCategoricalAccuracy(name="acc")]},
             jit_compile=jit_compile,
         )
 

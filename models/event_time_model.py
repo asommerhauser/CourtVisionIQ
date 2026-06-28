@@ -537,7 +537,7 @@ class EventTimeModel:
             keras.mixed_precision.set_global_policy("mixed_float16")
         return gpus
 
-    def train(self, epochs=50, batch_size=64, lr=3e-4, time_loss_weight=0.25,
+    def train(self, epochs=50, batch_size=64, lr=3e-4, time_loss_weight=0.5,
               patience=10, artifacts_root=DEFAULT_ARTIFACTS_ROOT,
               mixed_precision=True, jit_compile=False,
               num_layers=4, num_heads=8, ff_dim=1024, dropout=0.2,
@@ -620,7 +620,10 @@ class EventTimeModel:
                 "time_output": keras.losses.MeanSquaredError(),
             },
             loss_weights={"event_output": 1.0, "time_output": time_loss_weight},
-            metrics={
+            # weighted_metrics (NOT metrics): only weighted_metrics receive the sample_weight
+            # mask, so acc/mae are computed over real (non-PAD) rows instead of every padded
+            # position. Plain `metrics=` would dilute them across the whole sequence.
+            weighted_metrics={
                 "event_output": [keras.metrics.SparseCategoricalAccuracy(name="acc")],
                 "time_output": [
                     keras.metrics.MeanAbsoluteError(name="mae"),

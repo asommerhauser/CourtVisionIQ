@@ -1,0 +1,32 @@
+{
+  "string_to_token": {
+    "PAD": 0,
+    "UNK": 1,
+    "start": 2,
+    "end": 3,
+    "none": 4,
+    "shot": 5,
+    "rebound": 6,
+    "assist": 7,
+    "turnover": 8,
+    "block": 9,
+    "foul": 10,
+    "substitution": 11
+  },
+  "token_to_string": {
+    "0": "PAD",
+    "1": "UNK",
+    "2": "start",
+    "3": "end",
+    "4": "none",
+    "5": "shot",
+    "6": "rebound",
+    "7": "assist",
+    "8": "turnover",
+    "9": "block",
+    "10": "foul",
+    "11": "substitution"
+  },
+  "next_token": 12,
+  "frozen": true
+}

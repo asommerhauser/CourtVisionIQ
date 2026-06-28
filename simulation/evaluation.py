@@ -33,12 +33,12 @@ except Exception:
 
 import argparse
 import json
-import math
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
-from config import HOLDOUT_MANIFEST_NAME
+from config import HOLDOUT_MANIFEST_NAME, ROLLOUT_BATCH_SIZE, tuning_snapshot
 from data_loading import load_all_cleaned
 from models.artifacts import DEFAULT_ARTIFACTS_ROOT
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
@@ -54,23 +54,41 @@ from simulation.stats import (
     player_stats,
     team_totals,
 )
+# Pure (TF-free) scoring math lives in eval_metrics; re-exported here so existing imports
+# (stage_eval, tests) keep working and the rollout + metrics stay one import away.
+from simulation.eval_metrics import (  # noqa: F401
+    spread_metrics, win_metrics, score_win_view, _stat_errors, _aggregate, _BOX_ACCURACY_STATS,
+)
 
 DEFAULT_SIMS = 11
-# Stat keys (display name -> they map onto BOX_STATS / derived) used in box accuracy tables.
-_BOX_ACCURACY_STATS = ("pts", "fga", "fgm", "tpa", "tpm", "fta", "ftm",
-                       "oreb", "dreb", "ast", "stl", "blk", "tov", "pf")
 
 
 # --------------------------------------------------------------------------- rollout
 
 def simulate_repeated(sim: GameSimulator, spec, home_starters, away_starters, *,
                       n_sims: int, seed0: int, home_team: str = "HOME",
-                      away_team: str = "AWAY", return_histories: bool = False):
+                      away_team: str = "AWAY", return_histories: bool = False,
+                      batch_size: int = ROLLOUT_BATCH_SIZE, show_progress: bool = False):
     """Play one matchup ``n_sims`` times (seeds ``seed0..seed0+n_sims-1``) -> list of box scores.
 
     With ``return_histories`` also return the per-sim event histories (so the stage evaluator can
     persist each generated play-by-play): returns ``(boxes, histories)`` instead of just ``boxes``.
+
+    ``batch_size`` > 1 runs the sims through the batched rollout coordinator (one GPU forward pass per
+    head across the concurrent sims, see ``simulation/batched_rollout.py``); 1 keeps the original
+    one-at-a-time loop. Batching is pure scheduling, so the box scores are unchanged (deterministic
+    heads) / distribution-equivalent (real heads).
     """
+    if batch_size and batch_size > 1 and n_sims > 1:
+        from simulation.batched_rollout import GameJob, run_jobs_batched
+        jobs = [GameJob(home_roster=spec.home_roster, away_roster=spec.away_roster,
+                        season=str(spec.season), home_starters=home_starters,
+                        away_starters=away_starters, season_context=spec.season_context(),
+                        seed=seed0 + s) for s in range(n_sims)]
+        histories = run_jobs_batched(sim, jobs, batch_size=batch_size, show_progress=show_progress)
+        boxes = [generate_box_score(h, home_team=home_team, away_team=away_team) for h in histories]
+        return (boxes, histories) if return_histories else boxes
+
     boxes: list[BoxScore] = []
     histories: list[list[dict]] = []
     for s in range(n_sims):
@@ -152,7 +170,8 @@ def _advanced_series(boxes: list[BoxScore], side: str) -> dict[str, list[float]]
 # --------------------------------------------------------------------------- per-game
 
 def evaluate_game(sim: GameSimulator, game_df, *, n_sims: int, seed0: int,
-                  home_team: str = "HOME", away_team: str = "AWAY") -> dict:
+                  home_team: str = "HOME", away_team: str = "AWAY",
+                  batch_size: int = ROLLOUT_BATCH_SIZE) -> dict:
     """Run ``n_sims`` predictions for one cleaned game and build its evaluation record."""
     spec = extract_game_input(game_df)
     try:
@@ -161,7 +180,8 @@ def evaluate_game(sim: GameSimulator, game_df, *, n_sims: int, seed0: int,
         home_starters = away_starters = None
 
     boxes = simulate_repeated(sim, spec, home_starters, away_starters, n_sims=n_sims,
-                              seed0=seed0, home_team=home_team, away_team=away_team)
+                              seed0=seed0, home_team=home_team, away_team=away_team,
+                              batch_size=batch_size)
     return build_game_record(game_df, boxes, n_sims=n_sims,
                              home_team=home_team, away_team=away_team)
 
@@ -217,6 +237,11 @@ def build_game_record(game_df, boxes: list[BoxScore], *, n_sims: int,
     return {
         "game_id": int(game_df["game_id"].iloc[0]),
         "n_sims": n_sims,
+        # Tuning provenance captured at sim time: which dials produced THIS game's sims, so the
+        # report can segment the holdout by distinct tuning (games simmed across retunes keep their
+        # own snapshot). evaluated_at orders the progression by when each game was actually run.
+        "tuning": tuning_snapshot(),
+        "evaluated_at": datetime.now().isoformat(timespec="seconds"),
         "win_prob_home": win_prob_home,
         "pred_pick": pred_pick,
         "actual_winner": actual_winner,
@@ -236,136 +261,12 @@ def build_game_record(game_df, boxes: list[BoxScore], *, n_sims: int,
     }
 
 
-# --------------------------------------------------------------------------- pure metrics
-
-def spread_metrics(pred: list[float], actual: list[float],
-                   within=(3, 6, 10)) -> dict:
-    """Error of predicted mean margin vs actual margin: MAE, bias, RMSE, correlation, within-N."""
-    p, a = np.asarray(pred, float), np.asarray(actual, float)
-    if p.size == 0:
-        return {"n": 0, "mae": 0.0, "bias": 0.0, "rmse": 0.0, "corr": 0.0,
-                "within": {str(w): 0.0 for w in within}}
-    err = p - a
-    abs_err = np.abs(err)
-    corr = float(np.corrcoef(p, a)[0, 1]) if p.size > 1 and p.std() > 0 and a.std() > 0 else 0.0
-    return {
-        "n": int(p.size),
-        "mae": float(abs_err.mean()),
-        "bias": float(err.mean()),
-        "rmse": float(np.sqrt((err ** 2).mean())),
-        "corr": corr,
-        "within": {str(w): float((abs_err <= w).mean()) for w in within},
-    }
-
-
-def win_metrics(win_probs: list[float], outcomes: list[bool], picks_correct: list[bool],
-                bins=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0)) -> dict:
-    """Pick accuracy + probability calibration (Brier, log-loss, binned reliability)."""
-    p = np.asarray(win_probs, float)
-    y = np.asarray([1.0 if o else 0.0 for o in outcomes], float)
-    n = int(p.size)
-    if n == 0:
-        return {"n": 0, "pick_accuracy": 0.0, "brier": 0.0, "log_loss": 0.0, "calibration": []}
-    eps = 1e-12
-    clipped = np.clip(p, eps, 1 - eps)
-    log_loss = float(-(y * np.log(clipped) + (1 - y) * np.log(1 - clipped)).mean())
-
-    calibration = []
-    for lo, hi in zip(bins[:-1], bins[1:]):
-        last = math.isclose(hi, bins[-1])
-        mask = (p >= lo) & (p <= hi if last else p < hi)
-        if mask.any():
-            calibration.append({
-                "lo": lo, "hi": hi, "n": int(mask.sum()),
-                "pred_mean": float(p[mask].mean()), "obs_rate": float(y[mask].mean()),
-            })
-    return {
-        "n": n,
-        "pick_accuracy": float(np.mean([1.0 if c else 0.0 for c in picks_correct])),
-        "brier": float(((p - y) ** 2).mean()),
-        "log_loss": log_loss,
-        "calibration": calibration,
-    }
-
-
-def _stat_errors(pairs: list[tuple[float, float]]) -> dict:
-    """MAE / bias / predicted-mean / actual-mean for a list of (predicted, actual) pairs."""
-    if not pairs:
-        return {"n": 0, "pred_mean": 0.0, "actual_mean": 0.0, "mae": 0.0, "bias": 0.0}
-    pred = np.array([p for p, _ in pairs], float)
-    act = np.array([a for _, a in pairs], float)
-    err = pred - act
-    return {"n": len(pairs), "pred_mean": float(pred.mean()), "actual_mean": float(act.mean()),
-            "mae": float(np.abs(err).mean()), "bias": float(err.mean())}
-
-
-# --------------------------------------------------------------------------- set-level
-
-def _aggregate(records: list[dict]) -> dict:
-    """Roll per-game records up into the report's aggregate blocks."""
-    # Win + spread (headline).
-    win = win_metrics([r["win_prob_home"] for r in records],
-                      [r["actual_home_win"] for r in records],
-                      [r["pick_correct"] for r in records])
-    spread = spread_metrics([r["pred_margin_mean"] for r in records],
-                            [r["actual_margin"] for r in records])
-
-    # Team box accuracy + reliability, pooling both sides of every game.
-    team_acc, team_reliability = {}, {}
-    for f in _BOX_ACCURACY_STATS:
-        pairs, stds = [], []
-        for r in records:
-            for side in ("home", "away"):
-                pairs.append((r["team_pred"][side][f], r["team_actual"][side][f]))
-                stds.append(r["team_std"][side][f])
-        team_acc[f] = _stat_errors(pairs)
-        team_reliability[f] = float(np.mean(stds)) if stds else 0.0
-
-    # Per-player box accuracy + reliability (matched by name; union of sims + actual, zeros for absent).
-    player_acc, player_reliability = {}, {}
-    for f in _BOX_ACCURACY_STATS:
-        pairs, stds = [], []
-        for r in records:
-            for side in ("home", "away"):
-                for name in r["players"][side]:
-                    pred = r["player_avg"][side][name][f]
-                    actual = r["player_actual"][side].get(name, {}).get(f, 0.0)
-                    pairs.append((pred, actual))
-                    stds.append(r["player_std"][side][name][f])
-        player_acc[f] = _stat_errors(pairs)
-        player_reliability[f] = float(np.mean(stds)) if stds else 0.0
-
-    # Advanced (four factors + pace), pooling both sides.
-    advanced = {}
-    for k in ADVANCED_LABELS:
-        pairs = []
-        for r in records:
-            for side in ("home", "away"):
-                pairs.append((r["adv_pred"][side][k], r["adv_actual"][side][k]))
-        advanced[k] = _stat_errors(pairs)
-
-    return {
-        "win": win,
-        "spread": spread,
-        "team_accuracy": team_acc,
-        "team_reliability": team_reliability,
-        "player_accuracy": player_acc,
-        "player_reliability": player_reliability,
-        "advanced": advanced,
-        "headline": {
-            "pick_accuracy": win["pick_accuracy"],
-            "brier": win["brier"],
-            "spread_mae": spread["mae"],
-            "points_mae": team_acc["pts"]["mae"],
-        },
-    }
-
-
 def evaluate_holdout(*, n_sims: int = DEFAULT_SIMS, games: int | None = None,
                      data_dir: str = "./data", processed_dir: str = "./data/processed",
                      artifacts_root: str = DEFAULT_ARTIFACTS_ROOT,
                      reports_root: str = DEFAULT_REPORTS_ROOT, seed0: int = 0,
-                     run_name: str | None = None) -> dict:
+                     run_name: str | None = None,
+                     batch_size: int = ROLLOUT_BATCH_SIZE) -> dict:
     """Evaluate every holdout game ``n_sims`` times, write a report, return the report dict."""
     from reporting.eval_report import build_report, write_eval_report
 
@@ -386,8 +287,8 @@ def evaluate_holdout(*, n_sims: int = DEFAULT_SIMS, games: int | None = None,
         game = df[df["game_id"] == int(gid)].sort_values("time")
         if game.empty:
             continue
-        print(f"  evaluating game {gid} ({n_sims} sims)...")
-        records.append(evaluate_game(sim, game, n_sims=n_sims, seed0=seed0))
+        print(f"  evaluating game {gid} ({n_sims} sims, batch {batch_size})...")
+        records.append(evaluate_game(sim, game, n_sims=n_sims, seed0=seed0, batch_size=batch_size))
 
     aggregate = _aggregate(records)
     report = build_report(records=records, aggregate=aggregate, n_sims=n_sims,
@@ -402,7 +303,9 @@ def evaluate_holdout(*, n_sims: int = DEFAULT_SIMS, games: int | None = None,
 def _print_summary(agg: dict, n_games: int, n_sims: int) -> None:
     h = agg["headline"]
     print(f"\n=== holdout evaluation  ({n_games} games x {n_sims} sims) ===")
-    print(f"  win-pick accuracy   {h['pick_accuracy'] * 100:5.1f}%   (Brier {h['brier']:.3f})")
+    print(f"  win-pick (vote)     {h['pick_accuracy'] * 100:5.1f}%   (Brier {h['brier']:.3f})")
+    print(f"  win-pick (score)    {h['score_pick_accuracy'] * 100:5.1f}%   "
+          f"(Brier {h['score_brier']:.3f})")
     print(f"  point-spread MAE    {h['spread_mae']:5.1f} pts   (bias {agg['spread']['bias']:+.1f})")
     print(f"  team points MAE     {h['points_mae']:5.1f} pts")
 
@@ -418,10 +321,14 @@ def main():
     ap.add_argument("--reports-root", default=DEFAULT_REPORTS_ROOT)
     ap.add_argument("--seed0", type=int, default=0, help="First seed (sims use seed0..seed0+sims-1).")
     ap.add_argument("--run-name", default=None, help="Optional human label appended to the run id.")
+    ap.add_argument("--batch-size", type=int, default=ROLLOUT_BATCH_SIZE,
+                    help=f"Concurrent game-sims batched per GPU pass (default: {ROLLOUT_BATCH_SIZE}; "
+                         f"1 = one-at-a-time).")
     args = ap.parse_args()
     evaluate_holdout(n_sims=args.sims, games=args.games, data_dir=args.data_dir,
                      processed_dir=args.processed_dir, artifacts_root=args.artifacts_root,
-                     reports_root=args.reports_root, seed0=args.seed0, run_name=args.run_name)
+                     reports_root=args.reports_root, seed0=args.seed0, run_name=args.run_name,
+                     batch_size=args.batch_size)
 
 
 if __name__ == "__main__":
@@ -430,5 +337,5 @@ if __name__ == "__main__":
 
 __all__ = [
     "simulate_repeated", "average_box", "std_box", "evaluate_game", "build_game_record",
-    "spread_metrics", "win_metrics", "evaluate_holdout",
+    "spread_metrics", "win_metrics", "score_win_view", "evaluate_holdout",
 ]

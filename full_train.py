@@ -7,6 +7,7 @@ delete it yourself whenever). Each command is user-launched; nothing auto-advanc
 
     python full_train.py setup                 # compute the mid-2023 cut + the next-100 holdout
     python full_train.py train                 # one fresh full train (recency-weighted), then STOP
+    python full_train.py retrain-shot-type     # retrain ONLY shot_type on existing tensors (live FGs)
     python full_train.py eval                  # predict the next 10 holdout games, then STOP
     python full_train.py eval                  # ... repeat until all 100 are done ...
     python full_train.py status                # progress
@@ -34,6 +35,8 @@ def main() -> None:
     p_setup.add_argument("--batch-size", type=int, default=32)
 
     sub.add_parser("train", help="One fresh full train of every model (recency-weighted).")
+    sub.add_parser("retrain-shot-type",
+                   help="Retrain ONLY shot_type on the existing cond_*.npz (live FGs {2pt,3pt} only).")
     sub.add_parser("eval", help="Predict the next batch of holdout games, then stop.")
     sub.add_parser("status", help="Show progress.")
     sub.add_parser("report", help="Rebuild the aggregate report over finished games.")
@@ -46,6 +49,8 @@ def main() -> None:
                   epochs=args.epochs, batch_size=args.batch_size)
     elif args.command == "train":
         run.train()
+    elif args.command == "retrain-shot-type":
+        run.retrain_shot_type()
     elif args.command == "eval":
         run.eval()
     elif args.command == "status":

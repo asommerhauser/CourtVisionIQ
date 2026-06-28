@@ -25,7 +25,7 @@ import json
 import re
 from pathlib import Path
 
-from config import HOLDOUT_MANIFEST_NAME, STAGE_SIMS
+from config import HOLDOUT_MANIFEST_NAME, ROLLOUT_BATCH_SIZE, STAGE_SIMS
 from data_loading import load_all_cleaned
 from models.artifacts import DEFAULT_ARTIFACTS_ROOT
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
@@ -114,7 +114,8 @@ def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
                    data_dir: str = "./data", processed_dir: str = "./data/processed",
                    artifacts_root: str = DEFAULT_ARTIFACTS_ROOT,
                    reports_root: str = DEFAULT_REPORTS_ROOT,
-                   predictions_root: str = DEFAULT_OUTPUT_ROOT, seed0: int = 0) -> dict:
+                   predictions_root: str = DEFAULT_OUTPUT_ROOT, seed0: int = 0,
+                   batch_size: int = ROLLOUT_BATCH_SIZE) -> dict:
     """Predict a stage's holdout games (``n_sims`` each), write per-game folders + a stage report.
 
     ``holdout_ids`` defaults to the manifest the stage's preprocess wrote (``holdout_games.json``).
@@ -168,6 +169,7 @@ def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
         boxes, histories = simulate_repeated(
             sim, spec, home_starters, away_starters, n_sims=n_sims, seed0=seed0,
             home_team=home_team, away_team=away_team, return_histories=True,
+            batch_size=batch_size, show_progress=True,
         )
         record = build_game_record(game, boxes, n_sims=n_sims,
                                    home_team=home_team, away_team=away_team)

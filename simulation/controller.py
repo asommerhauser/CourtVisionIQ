@@ -23,9 +23,11 @@ from __future__ import annotations
 import numpy as np
 
 from config import (
-    EVENT_TEMPERATURE, FOUL_OUT_LIMIT, PLAYER_TEMPERATURE, SUB_FATIGUE_WEIGHT,
-    SUB_MAX_GAP_SECONDS,
+    DEADBALL_REBOUND_PROB, DELTA_TIME_SCALE, EVENT_TEMPERATURE, FOUL_OUT_LIMIT,
+    HOME_COURT_SHOT_BIAS, MAX_DELTA, PLAYER_TEMPERATURE, SHOT_RESULT_BIAS,
+    SUB_FATIGUE_WEIGHT, SUB_MAX_GAP_SECONDS,
 )
+from models.conditional_time_model import ConditionalTimeModel
 from models.stint_length_model import StintLengthModel
 from models.substitution_model import START_TOKEN
 from simulation.game_simulator import GameSimulator, HOME, AWAY
@@ -34,7 +36,6 @@ from simulation.game_simulator import GameSimulator, HOME, AWAY
 PERIOD_LENGTH = 720          # 12:00 regulation quarter (seconds)
 OT_LENGTH = 300              # 5:00 overtime period
 REGULATION = 4 * PERIOD_LENGTH  # 2880s (48:00)
-MAX_DELTA = 40.0             # clamp the time head so one bad Δt can't blow up the clock
 MAX_EVENTS = 4000            # hard safety cap on rollout length (≈ 8× a real game)
 
 # Legal next-events the event head is masked to, per context. Substitution is intentionally NOT
@@ -67,20 +68,14 @@ COMMON_FOULS = {"personal", "loose ball", "away from play"}
 TEAM_FOUL_TYPES = {"shooting", "personal", "loose ball", "away from play",
                    "flagrant-1", "flagrant-2"}
 
-# Out-of-bounds / dropped "team rebound": a miss that yields no individual rebound (the cleaner
-# drops raw team rebounds, data_cleaner.py:321), so the ball just changes hands with no row.
-# The off/def split itself is modeled by the rebound-type head (predicted before the rebounder),
-# not inferred from which player happens to be sampled.
-DEADBALL_REBOUND_PROB = 0.06
-
-
 class GameController:
     """Drive a full single-game rollout off a loaded :class:`GameSimulator`, enforcing rules."""
 
     def __init__(self, sim: GameSimulator, *, seed: int | None = None, greedy: bool = False,
                  player_temp: float | None = None,
                  sub_fatigue_weight: float | None = None,
-                 sub_max_gap: float | None = None):
+                 sub_max_gap: float | None = None,
+                 home_court_bias: float | None = None):
         self.sim = sim
         self.greedy = greedy
         # Sampling/rotation dials (config defaults, overridable per run/test). The rebounder is
@@ -90,6 +85,10 @@ class GameController:
         self.sub_fatigue_weight = (SUB_FATIGUE_WEIGHT if sub_fatigue_weight is None
                                    else sub_fatigue_weight)
         self.sub_max_gap = SUB_MAX_GAP_SECONDS if sub_max_gap is None else sub_max_gap
+        # Logit nudge to the home offense's made-shot outcome (away gets the negation): the rollout's
+        # one source of home/away asymmetry, so win prediction isn't a coin flip. See config.
+        self.home_court_bias = (HOME_COURT_SHOT_BIAS if home_court_bias is None
+                                else home_court_bias)
         if seed is not None:
             self.sim.rng = np.random.default_rng(seed)
         self.rng = self.sim.rng
@@ -136,6 +135,14 @@ class GameController:
         self.stint_target_clock: dict[str, float] = {}
         self.open_play_events: list[str] = list(OPEN_PLAY_EVENTS)
 
+        # --- Conditional time head (event→player→Δt) ---
+        # When loaded, the authoritative clock advance comes from ConditionalTimeModel — Δt
+        # conditioned on the sampled event + actor — instead of the EventTimeModel's marginal time
+        # head. Absent (older bundle / minimal test): fall back to the marginal Δt so the rollout
+        # still runs. The event head's marginal Δt is still read each step and used to condition the
+        # actor pick (PlayerModel's unchanged next_delta_time contract).
+        self.use_condtime: bool = ConditionalTimeModel.KEY in self.sim.heads
+
     # ===================================================================== #
     # --- Setup + main loop                                                --
     # ===================================================================== #
@@ -181,26 +188,31 @@ class GameController:
         return self.sim.history
 
     def _step(self) -> None:
-        """Sample and resolve one top-level event (a "play"), updating all game context."""
+        """Sample and resolve one top-level event (a "play"), updating all game context.
+
+        Order is event → actor → Δt: the event head picks the play and a *marginal* Δt (used only to
+        condition the actor pick); each handler samples its primary actor, then advances the clock by
+        the authoritative Δt from the conditional time head (``_advance_for``) before resolving the
+        rest of the play. The clock is advanced exactly once per step, inside the handler.
+        """
         post_miss = self.pending_rebound
         self.pending_rebound = False
         allowed = POST_MISS_EVENTS if post_miss else self.open_play_events
 
-        event, delta = self._sample_event(allowed)
-        self._advance_clock(delta)
+        event, marginal = self._sample_event(allowed)
 
         if event == "shot":
-            self._do_shot(delta)
+            self._do_shot(marginal)
         elif event == "assist":
-            self._do_assist(delta)
+            self._do_assist(marginal)
         elif event == "turnover":
-            self._do_turnover(delta)
+            self._do_turnover(marginal)
         elif event == "foul":
-            self._do_foul(delta, rebounding=post_miss)
+            self._do_foul(marginal, rebounding=post_miss)
         elif event == "rebound":
-            self._do_rebound(delta)
+            self._do_rebound(marginal)
         elif event == "substitution":
-            self._do_substitution(delta)
+            self._do_substitution(marginal)
 
         self._check_period()
         if self.use_scheduler:
@@ -208,27 +220,53 @@ class GameController:
         self._maybe_force_sub()   # cadence backstop (and the legacy in-game sub path's safety net)
 
     def _sample_event(self, allowed: list[str]) -> tuple[str, float]:
-        """Run the event/time head and pick the next event from ``allowed`` (masked)."""
+        """Run the event/time head and pick the next event from ``allowed`` (masked).
+
+        Returns the event and the **marginal** Δt (the EventTimeModel time head's average gap). The
+        authoritative clock advance is computed per play from the conditional time head once the
+        actor is known (see :meth:`_advance_for`); the marginal is the actor head's Δt conditioning.
+        """
         pred = self.sim.predict_next()
         event = self.sim._masked_sample(pred["event_logits"], allowed,
                                         self.sim.encoder.encode_event, greedy=self.greedy,
                                         temperature=EVENT_TEMPERATURE)
         return event, pred["delta_seconds"]
 
+    def _advance_for(self, event: str, actor: str | None, marginal: float) -> float:
+        """Advance the clock by the play's Δt and return it (real seconds, pre-clamp).
+
+        When the conditional time head is loaded and we have an actor, Δt follows the sampled play
+        (``predict_delta``); otherwise we fall back to the event head's marginal Δt. The returned
+        value conditions the play's type/result heads. ``_advance_clock`` applies DELTA_TIME_SCALE
+        and the MAX_DELTA clamp.
+        """
+        if self.use_condtime and actor is not None:
+            delta = self.sim.predict_delta(event, actor)
+        else:
+            delta = marginal
+        self._advance_clock(delta)
+        return delta
+
     # ===================================================================== #
     # --- Play handlers (each emits 1+ rows and updates context)           --
     # ===================================================================== #
 
     def _do_shot(self, delta: float) -> None:
-        """Unassisted shot: sample shooter/type/result, then expand block/miss consequences."""
+        """Unassisted shot: sample shooter, advance Δt(shot, shooter), then type/result + consequences.
+
+        ``delta`` enters as the event head's marginal Δt (conditions the shooter pick), then is
+        reassigned to the authoritative Δt from the conditional time head (conditions type/result).
+        """
         offense = self.possession
         shooter = self.sim.predict_player("shot", self._offense_five(),
                                           delta_seconds=delta, greedy=self.greedy,
                                           temperature=self.player_temp)
+        delta = self._advance_for("shot", shooter, delta)
         stype = self.sim.predict_type("shot_type", "shot", shooter, SHOT_TYPES,
                                       delta_seconds=delta, greedy=self.greedy)
         result = self.sim.predict_result(shooter, stype, LIVE_SHOT_RESULTS,
-                                         delta_seconds=delta, greedy=self.greedy)
+                                         delta_seconds=delta, greedy=self.greedy,
+                                         bias=self._shot_result_bias(offense))
         self._append("shot", shooter, stype, result)
 
         if result == "made":
@@ -245,16 +283,31 @@ class GameController:
         else:  # missed
             self.pending_rebound = True
 
+    def _shot_result_bias(self, offense: str) -> dict[str, float] | None:
+        """Per-shot result-logit bias: the global SHOT_RESULT_BIAS plus the home-court made nudge.
+
+        The home offense gets ``+home_court_bias`` on "made", the away offense ``-home_court_bias``
+        (symmetric, so the pooled make rate is preserved while the home/away split is tilted). Returns
+        ``None`` when nothing applies so ``predict_result`` takes its raw path.
+        """
+        bias = dict(SHOT_RESULT_BIAS)
+        if self.home_court_bias:
+            nudge = self.home_court_bias if offense == HOME else -self.home_court_bias
+            bias["made"] = bias.get("made", 0.0) + nudge
+        return bias or None
+
     def _do_assist(self, delta: float) -> None:
         """Assist → a *made* shot of the same type by a different teammate (data_cleaner.py:250).
 
         The assist row precedes the made shot in the cleaned data; the shooter is still sampled
-        (the player head), constrained to the assister's team minus the assister.
+        (the player head), constrained to the assister's team minus the assister. ``delta`` enters
+        as the marginal Δt and is reassigned to the authoritative Δt after the assister is chosen.
         """
         offense = self.possession
         assister = self.sim.predict_player("assist", self._offense_five(),
                                            delta_seconds=delta, greedy=self.greedy,
                                            temperature=self.player_temp)
+        delta = self._advance_for("assist", assister, delta)
         atype = self.sim.predict_type("assist_type", "assist", assister, SHOT_TYPES,
                                       delta_seconds=delta, greedy=self.greedy)
         self._append("assist", assister, atype, "score")
@@ -272,6 +325,7 @@ class GameController:
         committer = self.sim.predict_player("turnover", self._offense_five(),
                                             delta_seconds=delta, greedy=self.greedy,
                                             temperature=self.player_temp)
+        delta = self._advance_for("turnover", committer, delta)
         ttype = self.sim.predict_type("turnover_type", "turnover", committer, TURNOVER_TYPES,
                                       delta_seconds=delta, greedy=self.greedy)
         if ttype == "steal":
@@ -296,28 +350,32 @@ class GameController:
         """
         offense = self.possession  # team that just missed
         if self.rng.random() < DEADBALL_REBOUND_PROB:
+            self._advance_clock(delta)                 # no rebounder to time on → marginal gap
             self.possession = self._other(offense)     # out of bounds → other team
             return
+        # Off/def type then the rebounder are sampled on the marginal Δt; the authoritative Δt for the
+        # clock is then conditioned on the decided rebounder.
         rtype = self.sim.predict_type("rebound_type", "rebound", None, REBOUND_TYPES,
                                       delta_seconds=delta, greedy=self.greedy)
+        five = self._offense_five() if rtype == "offensive" else self._defense_five()
+        rebounder = self.sim.predict_player("rebound", five,
+                                            delta_seconds=delta, greedy=self.greedy,
+                                            temperature=self.player_temp)
+        self._advance_for("rebound", rebounder, delta)
         if rtype == "offensive":                       # offensive rebound — offense retains
-            rebounder = self.sim.predict_player("rebound", self._offense_five(),
-                                                delta_seconds=delta, greedy=self.greedy,
-                                                temperature=self.player_temp)
             self._append("rebound", rebounder, "offensive", "null")
         else:                                          # defensive rebound — possession flips
-            rebounder = self.sim.predict_player("rebound", self._defense_five(),
-                                                delta_seconds=delta, greedy=self.greedy,
-                                                temperature=self.player_temp)
             self._append("rebound", rebounder, "defensive", "cop")
             self.possession = self._other(offense)
 
     def _do_substitution(self, delta: float) -> None:
         """One in-game substitution (outgoing from the floor, incoming from the bench).
 
-        Outgoing/incoming are still sampled by the model; we only add a fatigue nudge so a
-        long-stint player (a star included) is more likely — not certain — to be the one pulled.
+        Legacy path — the event head is not trained to emit substitutions (rotation is owned by the
+        scheduler), so this is effectively unreachable; kept for completeness. Advances the clock by
+        the marginal Δt so the per-step clock invariant holds if it is ever reached.
         """
+        self._advance_clock(delta)
         outgoing, incoming = self.sim.sample_substitution(
             delta_seconds=delta, greedy=self.greedy, outgoing_bias=self._fatigue_bias())
         self._apply_sub(outgoing, incoming)
@@ -406,11 +464,14 @@ class GameController:
         A foul drawn during a rebound is masked to common (non-shooting) types. A shooting foul
         is handled specially for free-throw *count*: a 3pt shooting foul is 3 FTs, a 2pt is 2,
         and a foul on a basket that just went in is an **and-1** (the basket counts, plus 1 FT).
+        ``delta`` enters as the marginal Δt and is reassigned to the authoritative Δt after the
+        fouler is chosen.
         """
         allowed_types = REBOUNDING_FOUL_TYPES if rebounding else FOUL_TYPES
         fouler = self.sim.predict_player("foul", self._all_ten(),
                                          delta_seconds=delta, greedy=self.greedy,
                                          temperature=self.player_temp)
+        delta = self._advance_for("foul", fouler, delta)
         ftype = self.sim.predict_type("foul_type", "foul", fouler, allowed_types,
                                       delta_seconds=delta, greedy=self.greedy)
 
@@ -529,7 +590,9 @@ class GameController:
     # ===================================================================== #
 
     def _advance_clock(self, delta: float) -> None:
-        inc = max(0.0, min(float(delta), MAX_DELTA))
+        # DELTA_TIME_SCALE calibrates pace (>1 slows the clock → fewer possessions); MAX_DELTA clamps
+        # the rare blown gap. Scale first, then clamp.
+        inc = max(0.0, min(float(delta) * DELTA_TIME_SCALE, MAX_DELTA))
         # Credit the lineup on the floor over this interval (mirrors box_score minutes accounting:
         # the pre-resolution rosters are who played the elapsed seconds). Subs this step happen
         # afterwards at the advanced clock, so their stints start clean.

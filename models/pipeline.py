@@ -23,6 +23,7 @@ from __future__ import annotations
 from config import HOLDOUT_FRAC
 from encoder.encoder import Encoder
 from models.artifacts import DEFAULT_ARTIFACTS_ROOT
+from models.conditional_time_model import ConditionalTimeModel
 from models.conditional_type_model import CONDITIONAL_MODEL_CLASSES
 from models.event_time_model import EventTimeModel
 from models.model_bundle import ModelBundle
@@ -31,8 +32,40 @@ from models.stint_length_model import StintLengthModel
 from models.substitution_model import SubstitutionModel
 
 
+# Heavier heads that get a capped batch so the chain fits a tight (~10 GB) GPU alongside the shared
+# roster encoder (~8 GB at batch 32). PlayerModel + SubstitutionModel emit logits over the large
+# *player* vocab (+~0.5–1 GB of logits/gradients — the actual OOM cause); StintLengthModel has a
+# scalar output but is the substitution model's sibling (two player-embedding conditioning inputs),
+# capped here too as a precaution since it's the last head to train. Every other head (event / type /
+# result / conditional-time — tiny outputs) trains at the full batch_size.
+LARGE_OUTPUT_MODELS = {PlayerModel.KEY, SubstitutionModel.KEY, StintLengthModel.KEY}
+LARGE_OUTPUT_BATCH = 24
+
+
+def _batch_for(key: str, batch_size: int) -> int:
+    """Per-head batch size: cap the player-vocab heads so the chain fits on a tight GPU."""
+    return min(batch_size, LARGE_OUTPUT_BATCH) if key in LARGE_OUTPUT_MODELS else batch_size
+
+
+def _free_gpu() -> None:
+    """Release the previous model's graph + VRAM before the next one builds.
+
+    Every head trains sequentially in one process; without this, TF holds the prior model's
+    allocations and the chain can OOM on a later (heavier) head. Best-effort: a failure here must
+    never abort a multi-day run.
+    """
+    try:
+        import gc
+        import keras
+        keras.backend.clear_session()
+        gc.collect()
+    except Exception:
+        pass
+
+
 def run_all(data_dir: str = "./data", artifacts_root: str = DEFAULT_ARTIFACTS_ROOT,
             holdout_frac: float = HOLDOUT_FRAC, epochs: int = 50, batch_size: int = 64,
+            lr: float = 3e-4, patience: int = 15, dropout: float = 0.15, warmup_epochs: int = 2,
             report: bool = True, run_name: str | None = None,
             skip_preprocess: bool = False, train: bool = True) -> ModelBundle | None:
     """
@@ -43,8 +76,11 @@ def run_all(data_dir: str = "./data", artifacts_root: str = DEFAULT_ARTIFACTS_RO
     so the shared vocab/tensors are built once, in the right order, before each train.
     """
     def _train(model, key: str):
-        print(f"\n{'=' * 70}\n[pipeline] training '{key}'\n{'=' * 70}")
-        model.train(epochs=epochs, batch_size=batch_size, artifacts_root=artifacts_root,
+        _free_gpu()
+        bs = _batch_for(key, batch_size)
+        print(f"\n{'=' * 70}\n[pipeline] training '{key}' (batch {bs})\n{'=' * 70}")
+        model.train(epochs=epochs, batch_size=bs, lr=lr, patience=patience,
+                    dropout=dropout, warmup_epochs=warmup_epochs, artifacts_root=artifacts_root,
                     report=report, run_name=run_name)
 
     # 1) Event/Time — builds + freezes the shared vocab language (rebuild_vocabs=True).
@@ -62,6 +98,14 @@ def run_all(data_dir: str = "./data", artifacts_root: str = DEFAULT_ARTIFACTS_RO
         pl.preprocess(rebuild_vocabs=False, holdout_frac=holdout_frac)
     if train:
         _train(pl, PlayerModel.KEY)
+
+    # 2b) Conditional time head — own preprocess (condtime_*.npz, raw stream), then train.
+    ct = ConditionalTimeModel(Encoder(), path=data_dir)
+    if not skip_preprocess:
+        print("[pipeline] preprocess 'event_time_cond' (condtime_*.npz)")
+        ct.preprocess(rebuild_vocabs=False, holdout_frac=holdout_frac)
+    if train:
+        _train(ct, ConditionalTimeModel.KEY)
 
     # 3) Conditional type/result heads — one shared preprocess, then train each.
     for i, cls in enumerate(CONDITIONAL_MODEL_CLASSES):
@@ -99,8 +143,11 @@ def run_all(data_dir: str = "./data", artifacts_root: str = DEFAULT_ARTIFACTS_RO
 def run_stage(data_dir: str, game_partition, *, artifacts_root: str = DEFAULT_ARTIFACTS_ROOT,
               warm_start_root: str | None = None, warm_start: bool = True,
               refit_norm_stats: bool = False, epochs: int = 50, batch_size: int = 32,
+              lr: float = 3e-4, patience: int = 15, dropout: float = 0.15,
+              warmup_epochs: int = 2,
               report: bool = True, run_name: str | None = None,
-              done: list[str] | None = None, on_trained=None) -> list[str]:
+              done: list[str] | None = None, on_trained=None,
+              subset_keys=None, subset_train_games=None) -> list[str]:
     """Train every model on ``game_partition`` (one stage / one full train) and return the keys
     trained this call.
 
@@ -116,19 +163,39 @@ def run_stage(data_dir: str, game_partition, *, artifacts_root: str = DEFAULT_AR
     group is done, their preprocess — is skipped, so an interruption picks up at the next unfinished
     model. ``on_trained(key)`` (when given) is called right after each model finishes so the caller
     can persist progress before the next (crash-resilient) model starts.
+
+    ``subset_keys`` / ``subset_train_games`` (optional): the small heads listed in ``subset_keys``
+    preprocess + train on ``subset_train_games`` instead of the full train pool — a compact,
+    recency-weighted, coverage-complete slice (see ``training.subset``). Their val/holdout stay the
+    full partition's, so early stopping + the reserved holdout are unchanged; only the train set
+    shrinks. Heads not listed (player / substitution / stint_length) keep the full corpus.
     """
     warm_start_root = (warm_start_root or artifacts_root) if warm_start else None
     done = set(done or [])
     trained: list[str] = []
-    pp = dict(rebuild_vocabs=False, game_partition=game_partition, refit_norm_stats=refit_norm_stats)
+
+    subset_keys = set(subset_keys or ())
+    _, _val, _holdout = game_partition
+    subset_partition = (
+        ({int(g) for g in subset_train_games}, set(_val), set(_holdout))
+        if subset_keys and subset_train_games is not None else None
+    )
+
+    def _pp(key: str) -> dict:
+        """Preprocess kwargs for one head: the subset partition for the small heads, else full."""
+        part = subset_partition if (key in subset_keys and subset_partition is not None) else game_partition
+        return dict(rebuild_vocabs=False, game_partition=part, refit_norm_stats=refit_norm_stats)
 
     def _train(model, key: str) -> None:
         if key in done:
             print(f"[stage] '{key}' already trained this call — skipping")
             return
+        _free_gpu()
+        bs = _batch_for(key, batch_size)
         origin = warm_start_root if warm_start_root else "fresh init"
-        print(f"\n{'=' * 70}\n[stage] training '{key}' ({origin})\n{'=' * 70}")
-        model.train(epochs=epochs, batch_size=batch_size, artifacts_root=artifacts_root,
+        print(f"\n{'=' * 70}\n[stage] training '{key}' ({origin}, batch {bs})\n{'=' * 70}")
+        model.train(epochs=epochs, batch_size=bs, lr=lr, patience=patience,
+                    dropout=dropout, warmup_epochs=warmup_epochs, artifacts_root=artifacts_root,
                     report=report, run_name=run_name, init_weights_root=warm_start_root)
         trained.append(key)
         if on_trained is not None:
@@ -137,30 +204,38 @@ def run_stage(data_dir: str, game_partition, *, artifacts_root: str = DEFAULT_AR
     # 1) Event/Time, 2) Player — each its own preprocess + train.
     et = EventTimeModel(Encoder(), path=data_dir)
     if EventTimeModel.KEY not in done:
-        et.preprocess(**pp)
+        et.preprocess(**_pp(EventTimeModel.KEY))
         _train(et, EventTimeModel.KEY)
 
     pl = PlayerModel(Encoder(), path=data_dir)
     if PlayerModel.KEY not in done:
-        pl.preprocess(**pp)
+        pl.preprocess(**_pp(PlayerModel.KEY))
         _train(pl, PlayerModel.KEY)
 
+    # 2b) Conditional time head — own preprocess + train (raw stream; conditions on event + actor).
+    ct = ConditionalTimeModel(Encoder(), path=data_dir)
+    if ConditionalTimeModel.KEY not in done:
+        ct.preprocess(**_pp(ConditionalTimeModel.KEY))
+        _train(ct, ConditionalTimeModel.KEY)
+
     # 3) Conditional heads — one shared preprocess (only if a head still needs training), then each.
+    # They share one cond_*.npz file, so they share one partition: all conditional heads are in
+    # subset_keys together (see config.SUBSET_MODEL_KEYS) or none are.
     cond_keys = [cls.KEY for cls in CONDITIONAL_MODEL_CLASSES]
     if any(k not in done for k in cond_keys):
-        CONDITIONAL_MODEL_CLASSES[0](Encoder(), path=data_dir).preprocess(**pp)
+        CONDITIONAL_MODEL_CLASSES[0](Encoder(), path=data_dir).preprocess(**_pp(cond_keys[0]))
     for cls in CONDITIONAL_MODEL_CLASSES:
         _train(cls(Encoder(), path=data_dir), cls.KEY)
 
     # 4) Substitution, 5) Stint-length — self-contained preprocess + train.
     sub = SubstitutionModel(Encoder(), path=data_dir)
     if SubstitutionModel.KEY not in done:
-        sub.preprocess(**pp)
+        sub.preprocess(**_pp(SubstitutionModel.KEY))
         _train(sub, SubstitutionModel.KEY)
 
     stint = StintLengthModel(Encoder(), path=data_dir)
     if StintLengthModel.KEY not in done:
-        stint.preprocess(**pp)
+        stint.preprocess(**_pp(StintLengthModel.KEY))
         _train(stint, StintLengthModel.KEY)
 
     print(f"\n[stage] trained this call: {trained}")

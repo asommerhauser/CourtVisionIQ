@@ -41,7 +41,7 @@ DEFAULT_STATE_PATH = "./training/curriculum_state.json"
 
 # Every model trained per stage, in dependency order (matches pipeline.run_stage).
 STAGE_MODEL_KEYS = [
-    "event_time", "player", *[c.KEY for c in CONDITIONAL_MODEL_CLASSES],
+    "event_time", "player", "event_time_cond", *[c.KEY for c in CONDITIONAL_MODEL_CLASSES],
     "substitution", "stint_length",
 ]
 
@@ -126,6 +126,7 @@ class Curriculum:
         by stage 1's slice.
         """
         from encoder.encoder import Encoder
+        from models.conditional_time_model import ConditionalTimeModel
         from models.event_time_model import EventTimeModel
         from models.player_model import PlayerModel
         from models.stint_length_model import StintLengthModel
@@ -140,6 +141,7 @@ class Curriculum:
 
         _fit(EventTimeModel(Encoder(), **common), rebuild=True)       # builds + freezes vocab
         _fit(PlayerModel(Encoder(), **common), rebuild=False)
+        _fit(ConditionalTimeModel(Encoder(), **common), rebuild=False)
         _fit(CONDITIONAL_MODEL_CLASSES[0](Encoder(), **common), rebuild=False)
         _fit(SubstitutionModel(Encoder(), **common), rebuild=False)
         _fit(StintLengthModel(Encoder(), **common), rebuild=False)
