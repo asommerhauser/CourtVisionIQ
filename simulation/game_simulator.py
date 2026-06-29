@@ -329,6 +329,29 @@ class GameSimulator:
         return self._masked_sample(logits, candidates, self.encoder.encode_player,
                                    greedy=greedy, temperature=temperature, bias=bias)
 
+    def _avail_mask(self) -> np.ndarray:
+        """(1, V) availability over the player vocab for the player-picking heads.
+
+        Mirrors the per-game training mask (``game_available_mask``): 1.0 for every player
+        on either full roster (everyone available this game) — plus the current on-court
+        five as a safety net — and 0.0 elsewhere, so the Player / Substitution heads' masked
+        softmax matches train time. If no rosters are known yet (availability unknown), fall
+        back to an all-ones mask (no masking), preserving the pre-mask behavior. The other
+        heads ignore this key. PAD is always 0.
+        """
+        enc = self.encoder
+        V = enc.player_vocab.next_token
+        players = {*self.home_full, *self.away_full, *self.home_roster, *self.away_roster}
+        if not players:
+            return np.ones((1, V), dtype=np.float32)
+        mask = np.zeros((1, V), dtype=np.float32)
+        for p in players:
+            i = enc.encode_player(p)
+            if 0 <= i < V:
+                mask[0, i] = 1.0
+        mask[0, enc.encode_player("PAD")] = 0.0
+        return mask
+
     def _conditioned_inputs(self, *, next_event: str, delta_seconds: float,
                             next_player: str | None = None,
                             next_type: str | None = None,
@@ -340,8 +363,9 @@ class GameSimulator:
         ``next_player`` (the decided actor), the result head also adds ``next_type`` (the type
         the shot is about to be), and the stint-length head adds ``next_secondary_player`` (the
         decided incoming player, whose stint it predicts). Only the requested conditioning is
-        attached, so a head is never handed an input it doesn't define. A head ignores any
-        *extra* keys, so the shared ``base`` is safe to pass to all of them.
+        attached, so a head is never handed an input it doesn't define — Keras functional models
+        reject a dict with unknown keys, so the player-vocab ``avail_mask`` is attached only on the
+        player / substitution path (:meth:`_next_step_inputs`), not here.
         """
         base = self.build_model_inputs()
         SEQ = self.sequence_length
@@ -371,10 +395,14 @@ class GameSimulator:
         return inputs
 
     def _next_step_inputs(self, *, outgoing: str | None, delta_seconds: float) -> dict:
-        """Substitution-head conditioning (``next_event`` = ``substitution`` + the outgoing
-        player). Thin wrapper over :meth:`_conditioned_inputs` kept for the sub helpers."""
-        return self._conditioned_inputs(next_event=SUB_EVENT, delta_seconds=delta_seconds,
-                                        next_player=outgoing)
+        """Player- / substitution-head conditioning (``next_event`` = ``substitution`` + the
+        outgoing player). Thin wrapper over :meth:`_conditioned_inputs` kept for the sub helpers.
+        Adds the player-vocab ``avail_mask`` here (these two heads define that input; the others
+        do not), masking the pick to the game's available players exactly as at train time."""
+        inputs = self._conditioned_inputs(next_event=SUB_EVENT, delta_seconds=delta_seconds,
+                                          next_player=outgoing)
+        inputs["avail_mask"] = self._avail_mask()
+        return inputs
 
     def _infer(self, model_key: str, inputs: dict) -> dict:
         """Run one head's forward pass and return its outputs as numpy (batch dim kept).

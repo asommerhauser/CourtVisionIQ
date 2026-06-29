@@ -37,6 +37,7 @@ from keras import layers, Input
 
 from config import (
     NORM_STATS_PATH, ROSTER_SIZE, SEED, TEST_FRAC, HOLDOUT_FRAC, HOLDOUT_MANIFEST_NAME,
+    NUM_LAYERS, NUM_HEADS, FF_DIM,
 )
 from data_loading import resolve_partition
 from models.norm_stats_io import load_norm_stats, save_norm_stats
@@ -68,6 +69,7 @@ from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
 _PROCESSED = {"train": "stint_train.npz", "test": "stint_test.npz", "holdout": "stint_holdout.npz"}
 
 
+@keras.saving.register_keras_serializable(package="cviq")
 class StintSecondsMAE(keras.metrics.Mean):
     """Masked MAE in real game-seconds, inverting the standardized log1p(stint) target.
 
@@ -356,7 +358,7 @@ class StintLengthModel(SubstitutionModel):
     # --- Model / Train ---
     # =====================
 
-    def model(self, num_layers=4, num_heads=8, ff_dim=1024, dropout=0.2):
+    def model(self, num_layers=NUM_LAYERS, num_heads=NUM_HEADS, ff_dim=FF_DIM, dropout=0.2):
         """Build the causal stint-length transformer.
 
         Inputs: the Event/Time history inputs, the always-on ``next_event`` / ``next_delta_time``
@@ -485,7 +487,7 @@ class StintLengthModel(SubstitutionModel):
     def train(self, epochs=50, batch_size=64, lr=3e-4,
               patience=10, artifacts_root=DEFAULT_ARTIFACTS_ROOT,
               mixed_precision=True, jit_compile=False,
-              num_layers=4, num_heads=8, ff_dim=1024, dropout=0.2,
+              num_layers=NUM_LAYERS, num_heads=NUM_HEADS, ff_dim=FF_DIM, dropout=0.2,
               warmup_epochs=1, lr_alpha=0.05,
               report=True, run_name=None, reports_root=DEFAULT_REPORTS_ROOT,
               init_weights_root=None):

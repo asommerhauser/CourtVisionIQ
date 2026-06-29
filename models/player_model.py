@@ -10,6 +10,7 @@ from keras import layers, Input
 from config import (
     MAX_SEQUENCE_LENGTH, ROSTER_SIZE, NORM_STATS_PATH,
     SEED, TEST_FRAC, HOLDOUT_FRAC, HOLDOUT_MANIFEST_NAME,
+    MODEL_DIM, NUM_LAYERS, NUM_HEADS, FF_DIM, ROSTER_SAB_LAYERS,
 )
 from data_loading import load_all_cleaned, resolve_partition
 from models.norm_stats_io import load_norm_stats, save_norm_stats
@@ -17,11 +18,13 @@ from encoder.encoder import Encoder
 from models.artifacts import ModelArtifacts, DEFAULT_ARTIFACTS_ROOT, warm_start_weights
 from models.event_time_model import (
     AddPositionalEmbedding,
+    ApplyAvailabilityMask,
     KeyPaddingMask,
     EMBED_DIMS,
     ROSTER_DIM,
     CATEGORICAL_FIELDS,
     ROSTER_COLS,
+    game_available_mask,
 )
 from models.roster_set_encoder import (
     RosterEncoderParams,
@@ -68,7 +71,7 @@ class PlayerModel:
 
     def __init__(self, encoder: Encoder,
                  sequence_length=MAX_SEQUENCE_LENGTH,
-                 model_dim=256,
+                 model_dim=MODEL_DIM,
                  path="./data",
                  processed_dir="./data/processed"):
 
@@ -231,13 +234,19 @@ class PlayerModel:
 
         batches = {k: [] for k in (*keys_1d, *keys_roster, *keys_cont, *SEASON_INPUT_KEYS,
                                    "next_event", "next_delta_time",
-                                   "player_target", "pad_mask", "loss_mask")}
+                                   "player_target", "pad_mask", "loss_mask", "avail_mask")}
 
+        player_vocab_size = self.encoder.player_vocab.next_token
         game_ids_sorted = [g for g in np.unique(game_id) if g in games]
         for g in game_ids_sorted:
             idx = np.where(game_id == g)[0]
             idx = idx[:SEQ]  # truncate overlong games
             n = len(idx)
+
+            # Per-game availability over the player vocab (everyone who saw the floor);
+            # masks the player head's softmax to the co-available set at train time.
+            batches["avail_mask"].append(
+                game_available_mask(cols, idx, player_vocab_size, PAD_PLAYER))
 
             def pad1d(arr, pad_val, dtype):
                 buf = np.full((SEQ,), pad_val, dtype=dtype)
@@ -290,14 +299,14 @@ class PlayerModel:
             roster_size=ROSTER_SIZE,
             num_players=num_players,
             roster_dim=ROSTER_DIM,
-            num_sab_layers=2,
+            num_sab_layers=ROSTER_SAB_LAYERS,
             num_heads=4,
             d_ff=256,
             dropout=dropout,
         )
         return SequenceRosterEncoder(params, name="roster_vec")
 
-    def model(self, num_layers=4, num_heads=8, ff_dim=1024, dropout=0.2):
+    def model(self, num_layers=NUM_LAYERS, num_heads=NUM_HEADS, ff_dim=FF_DIM, dropout=0.2):
         """
         Build the causal Player transformer.
 
@@ -329,6 +338,7 @@ class PlayerModel:
         next_event = Input(shape=(SEQ,), dtype="int32", name="next_event")
         next_delta_time = Input(shape=(SEQ, 1), dtype="float32", name="next_delta_time")
         pad_mask = Input(shape=(SEQ,), dtype="float32", name="pad_mask")
+        avail_mask = Input(shape=(player_vocab_size,), dtype="float32", name="avail_mask")
 
         # ---- Per-field embeddings ----
         # player and secondary_player share one Embedding table (weight-tied).
@@ -390,7 +400,10 @@ class PlayerModel:
         x = layers.LayerNormalization(epsilon=1e-6, name="final_ln")(x)
 
         # ---- Output head (float32 keeps logits stable under mixed_float16) ----
-        player_logits = layers.Dense(player_vocab_size, dtype="float32", name="player_output")(x)
+        player_logits = layers.Dense(player_vocab_size, dtype="float32", name="player_logits")(x)
+        # Mask to the per-game available players so the softmax denominator (and gradient)
+        # spans only co-available players, not the whole league (relative freq, not volume).
+        player_logits = ApplyAvailabilityMask(name="player_output")(player_logits, avail_mask)
 
         inputs = {
             **cat_inputs,
@@ -398,7 +411,7 @@ class PlayerModel:
             "time_abs": time_abs, "delta_time": delta_time,
             "rest_home": rest_home, "rest_away": rest_away, **team_inputs,
             "next_event": next_event, "next_delta_time": next_delta_time,
-            "pad_mask": pad_mask,
+            "pad_mask": pad_mask, "avail_mask": avail_mask,
         }
         return keras.Model(
             inputs=inputs,
@@ -414,7 +427,7 @@ class PlayerModel:
         "event", "player", "type", "result", "season", "secondary_player",
         "home_roster", "away_roster", "time_abs", "delta_time",
         *SEASON_INPUT_KEYS,
-        "next_event", "next_delta_time", "pad_mask",
+        "next_event", "next_delta_time", "pad_mask", "avail_mask",
     )
 
     def _load_processed(self, name: str) -> dict:
@@ -454,7 +467,7 @@ class PlayerModel:
     def train(self, epochs=50, batch_size=64, lr=3e-4,
               patience=10, artifacts_root=DEFAULT_ARTIFACTS_ROOT,
               mixed_precision=True, jit_compile=False,
-              num_layers=4, num_heads=8, ff_dim=1024, dropout=0.2,
+              num_layers=NUM_LAYERS, num_heads=NUM_HEADS, ff_dim=FF_DIM, dropout=0.2,
               warmup_epochs=1, lr_alpha=0.05,
               report=True, run_name=None, reports_root=DEFAULT_REPORTS_ROOT,
               init_weights_root=None):

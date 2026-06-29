@@ -11,6 +11,17 @@ MAX_SEQUENCE_LENGTH = 600
 # Fixed number of on-court player slots per roster (PAD-filled below this)
 ROSTER_SIZE = 5
 
+# --- Model capacity (shared backbone dims; one place so train + reload always agree) ---
+# Every head's __init__/model()/train() default to these, and from_artifacts rebuilds with them,
+# so changing a value here re-sizes the whole chain consistently (requires a fresh train — old
+# weights are shaped to the old values). Train 2 bumps these from the original 256/4/8/1024/2 for
+# more learning headroom; the per-field embedding dims live in models/event_time_model.EMBED_DIMS.
+MODEL_DIM = 384            # transformer width (was 256)
+NUM_LAYERS = 6             # causal transformer blocks per head (was 4)
+NUM_HEADS = 8              # attention heads (key_dim = MODEL_DIM // NUM_HEADS = 48)
+FF_DIM = 1536              # feed-forward inner dim per block (was 1024)
+ROSTER_SAB_LAYERS = 3      # Set-Attention blocks in the roster set-encoder (was 2)
+
 # --- Rollout sampling (GameController / GameSimulator) ---
 # Per-head softmax temperature for the rollout: <1 sharpens (emphasizes the head's preference),
 # >1 flattens toward uniform, 1.0 is the raw model. Every categorical pick routes through
@@ -177,7 +188,10 @@ RECENCY_FLOOR = 0.05
 FINAL_SEASON_FRACTION = 0.5
 FINAL_HOLDOUT_GAMES = 100
 EVAL_BATCH = 10
-FULL_ARTIFACTS_ROOT = "./artifacts_full"
+# Train 2 (availability masking + capacity bump) writes to its own root so train 1's weights under
+# ./artifacts_full are preserved for comparison. The new graph (avail_mask input + bigger dims) is
+# not weight-compatible with train 1, so they cannot share a root anyway.
+FULL_ARTIFACTS_ROOT = "./artifacts_full2"
 
 # --- Representative subset for the small heads (training/subset.py) ---
 # The small categorical/regression heads (event/type/result/conditional-time) saturate long before

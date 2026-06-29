@@ -31,7 +31,9 @@ from training.curriculum import STAGE_MODEL_KEYS
 from training.subset import load_subset_games
 
 DEFAULT_STATE_PATH = "./training/full_run_state.json"
-RUN_NAME = "full_train"
+# Train 2: availability masking on the player-vocab heads + Moderate capacity bump. Distinct run
+# label so train-2 report dirs / eval aggregate group separately from train 1's "full_train".
+RUN_NAME = "full_train_2"
 
 
 class FullRun:

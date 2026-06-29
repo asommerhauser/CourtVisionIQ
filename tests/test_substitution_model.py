@@ -22,6 +22,14 @@ HOME = ["A", "B", "C", "D", "E"]
 AWAY = ["F", "G", "H", "I", "J"]
 BENCH = ["K", "L"]  # players who come in via real subs
 
+# Season-context columns the (post-season-enrichment) preprocess consumes; every row carries them
+# so the fixture matches the enriched cleaned-data schema the models train on.
+_SEASON = {
+    "rest_home": str([2.0] * 5), "rest_away": str([2.0] * 5),
+    "home_games_played": 0.5, "away_games_played": 0.5,
+    "home_days_rest": 2.0, "away_days_rest": 2.0,
+}
+
 
 def _roster(players):
     return str(list(players))
@@ -30,7 +38,7 @@ def _roster(players):
 def _game_rows(gid):
     """A small game: start (full fives) -> two shots -> a real sub -> end."""
     full = {"roster_home": _roster(HOME), "roster_away": _roster(AWAY),
-            "season": "2003", "playoff": 1}
+            "season": "2003", "playoff": 1, **_SEASON}
     rows = [
         {**full, "game_id": gid, "time": 0, "event": "start", "player": "start",
          "type": "start", "result": "start", "secondary_player": "none", "home/away": 0},
@@ -42,7 +50,7 @@ def _game_rows(gid):
         {"game_id": gid, "roster_home": _roster(["K", "B", "C", "D", "E"]),
          "roster_away": _roster(AWAY), "season": "2003", "playoff": 1, "time": 48,
          "event": SUB_EVENT, "player": "A", "type": SUB_EVENT, "result": SUB_EVENT,
-         "secondary_player": "K", "home/away": 1},
+         "secondary_player": "K", "home/away": 1, **_SEASON},
         {**full, "game_id": gid, "time": 60, "event": "end", "player": "end",
          "type": "end", "result": "end", "secondary_player": "none", "home/away": 0},
     ]
@@ -164,6 +172,31 @@ def test_model_output_is_over_player_vocab(tmp_path):
     out = model.outputs[0]
     assert m.output_name == "secondary_player_output"
     assert out.shape[-1] == m.encoder.player_vocab.next_token
+
+
+def test_avail_mask_restricts_logits_to_available_players(tmp_path):
+    """The per-game availability mask is emitted and the head's logits for unavailable
+    players (e.g. PAD) are pushed to ~-inf, while available players stay finite."""
+    (tmp_path / "data").mkdir()
+    _make_cleaned_csv(tmp_path / "data" / "season_clean.csv", games=(1, 2))
+    m = _model(tmp_path)
+    train, _ = m.preprocess(rebuild_vocabs=True, test_frac=0.0, holdout_frac=0.0)
+
+    V = m.encoder.player_vocab.next_token
+    n_games = train["pad_mask"].shape[0]
+    assert train["avail_mask"].shape == (n_games, V)
+
+    pad = m.encoder.encode_player("PAD")
+    a_id = m.encoder.encode_player("A")  # a real on-court player -> available every game
+    assert (train["avail_mask"][:, pad] == 0.0).all()
+    assert (train["avail_mask"][:, a_id] == 1.0).all()
+
+    # Forward pass: masked logits at unavailable ids are strongly negative; available finite.
+    model = m.model(num_layers=1, num_heads=2, ff_dim=32)
+    inputs = {k: train[k] for k in m.INPUT_KEYS}
+    logits = model(inputs, training=False)[m.output_name].numpy()  # (G, SEQ, V)
+    assert logits[:, :, pad].max() < -1e8
+    assert np.isfinite(logits[:, :, a_id]).all() and logits[:, :, a_id].max() > -1e8
 
 # Train / from_artifacts / full-keras-load / ModelBundle round-trip coverage lives in
 # tests/test_model_persistence.py (the shared parametrized adapter for every model).

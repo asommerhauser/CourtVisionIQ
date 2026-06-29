@@ -46,6 +46,7 @@ from keras import layers, Input
 from config import (
     MAX_SEQUENCE_LENGTH, ROSTER_SIZE, NORM_STATS_PATH,
     SEED, TEST_FRAC, HOLDOUT_FRAC, HOLDOUT_MANIFEST_NAME,
+    MODEL_DIM, NUM_LAYERS, NUM_HEADS, FF_DIM, ROSTER_SAB_LAYERS,
 )
 from data_loading import load_all_cleaned, resolve_partition
 from models.norm_stats_io import load_norm_stats, save_norm_stats
@@ -136,7 +137,7 @@ class ConditionalTypeModel:
 
     def __init__(self, spec: TypeGenSpec, encoder: Encoder,
                  sequence_length=MAX_SEQUENCE_LENGTH,
-                 model_dim=256,
+                 model_dim=MODEL_DIM,
                  path="./data",
                  processed_dir="./data/processed"):
         self.spec = spec
@@ -378,14 +379,14 @@ class ConditionalTypeModel:
             roster_size=ROSTER_SIZE,
             num_players=num_players,
             roster_dim=ROSTER_DIM,
-            num_sab_layers=2,
+            num_sab_layers=ROSTER_SAB_LAYERS,
             num_heads=4,
             d_ff=256,
             dropout=dropout,
         )
         return SequenceRosterEncoder(params, name="roster_vec")
 
-    def model(self, num_layers=4, num_heads=8, ff_dim=1024, dropout=0.2):
+    def model(self, num_layers=NUM_LAYERS, num_heads=NUM_HEADS, ff_dim=FF_DIM, dropout=0.2):
         """
         Build the causal conditional transformer for this spec.
 
@@ -563,7 +564,7 @@ class ConditionalTypeModel:
     def train(self, epochs=50, batch_size=64, lr=3e-4,
               patience=10, artifacts_root=DEFAULT_ARTIFACTS_ROOT,
               mixed_precision=True, jit_compile=False,
-              num_layers=4, num_heads=8, ff_dim=1024, dropout=0.2,
+              num_layers=NUM_LAYERS, num_heads=NUM_HEADS, ff_dim=FF_DIM, dropout=0.2,
               warmup_epochs=1, lr_alpha=0.05,
               report=True, run_name=None, reports_root=DEFAULT_REPORTS_ROOT,
               init_weights_root=None):

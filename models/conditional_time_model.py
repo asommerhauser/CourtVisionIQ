@@ -34,7 +34,7 @@ import tensorflow as tf
 import keras
 from keras import layers, Input
 
-from config import NORM_STATS_PATH
+from config import NORM_STATS_PATH, NUM_LAYERS, NUM_HEADS, FF_DIM
 from data_loading import resolve_partition
 from models.norm_stats_io import load_norm_stats, save_norm_stats
 from models.artifacts import DEFAULT_ARTIFACTS_ROOT, warm_start_weights
@@ -248,7 +248,7 @@ class ConditionalTimeModel(SubstitutionModel):
     # --- Model / Train ---
     # =====================
 
-    def model(self, num_layers=4, num_heads=8, ff_dim=1024, dropout=0.2):
+    def model(self, num_layers=NUM_LAYERS, num_heads=NUM_HEADS, ff_dim=FF_DIM, dropout=0.2):
         """Build the causal conditional-time transformer.
 
         Inputs: the Event/Time history inputs plus ``next_event`` and ``next_player`` (the decided
@@ -371,7 +371,7 @@ class ConditionalTimeModel(SubstitutionModel):
     def train(self, epochs=50, batch_size=64, lr=3e-4,
               patience=10, artifacts_root=DEFAULT_ARTIFACTS_ROOT,
               mixed_precision=True, jit_compile=False,
-              num_layers=4, num_heads=8, ff_dim=1024, dropout=0.2,
+              num_layers=NUM_LAYERS, num_heads=NUM_HEADS, ff_dim=FF_DIM, dropout=0.2,
               warmup_epochs=1, lr_alpha=0.05,
               report=True, run_name=None, reports_root=DEFAULT_REPORTS_ROOT,
               init_weights_root=None):

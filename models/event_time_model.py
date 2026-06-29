@@ -10,6 +10,7 @@ from keras import layers, Input
 from config import (
     MAX_SEQUENCE_LENGTH, ROSTER_SIZE, NORM_STATS_PATH,
     SEED, TEST_FRAC, HOLDOUT_FRAC, HOLDOUT_MANIFEST_NAME,
+    MODEL_DIM, NUM_LAYERS, NUM_HEADS, FF_DIM, ROSTER_SAB_LAYERS,
 )
 from data_loading import load_all_cleaned, resolve_partition
 from encoder.encoder import Encoder
@@ -33,7 +34,9 @@ from reporting import ReportCollector, RunConfig
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
 
 # Per-field embedding dimensions (categoricals never enter the model as raw scalars).
-EMBED_DIMS = {"event": 32, "player": 128, "type": 32, "result": 16, "season": 16}
+# player bumped 128 -> 192 for train 2 (richer per-player representation, weight-tied with
+# secondary_player); other fields are low-cardinality and stay put.
+EMBED_DIMS = {"event": 32, "player": 192, "type": 32, "result": 16, "season": 16}
 ROSTER_DIM = 128
 
 
@@ -84,6 +87,34 @@ class KeyPaddingMask(layers.Layer):
 
 
 @keras.saving.register_keras_serializable(package="cviq")
+class ApplyAvailabilityMask(layers.Layer):
+    """Mask player logits to the per-game available set before the loss/softmax.
+
+    A head over the player vocab (Player / Substitution) emits logits for *every* player,
+    so its cross-entropy denominator spans the whole league and the gradient learns global
+    appearance *volume*. Adding a large-negative bias to the logits of players who were not
+    available that game restricts the softmax to the co-available set, so the head learns
+    *relative* appearance frequency among players who could actually have been picked.
+
+    A registered layer (not a Lambda) so the full .keras model reloads under Keras 3 safe
+    mode without custom code execution, mirroring KeyPaddingMask / AddPositionalEmbedding.
+
+    Inputs: ``logits`` (B, SEQ, V) and ``avail_mask`` (B, V) with 1.0 for available players
+    and 0.0 otherwise. The mask is per-game (constant across the sequence) and broadcasts
+    over the SEQ axis.
+    """
+
+    NEG = -1e9
+
+    def call(self, logits, avail_mask):
+        bias = (1.0 - tf.cast(avail_mask, logits.dtype)) * self.NEG  # (B, V)
+        return logits + tf.expand_dims(bias, axis=1)                 # broadcast over SEQ
+
+    def compute_output_shape(self, logits_shape, avail_mask_shape=None):
+        return logits_shape
+
+
+@keras.saving.register_keras_serializable(package="cviq")
 class DeltaSecondsMAE(keras.metrics.MeanAbsoluteError):
     """Time-head MAE expressed in real seconds.
 
@@ -113,6 +144,29 @@ CATEGORICAL_FIELDS = ["event", "player", "type", "result", "season", "secondary_
 ROSTER_COLS = {"home_roster": "roster_home", "away_roster": "roster_away"}
 
 
+def game_available_mask(cols, idx, player_vocab_size: int, pad_player_id: int) -> np.ndarray:
+    """Per-game availability over the player vocab for the player-picking heads.
+
+    "Available" = every player id that appears in this game's on-court rosters or as an
+    actor / secondary actor across rows ``idx`` (i.e. everyone who saw the floor) — the
+    set the Player / Substitution heads should normalize their softmax over so they learn
+    *relative* appearance frequency rather than league-wide volume (see
+    ``ApplyAvailabilityMask``). PAD is always 0. ``player`` and ``secondary_player`` share
+    the player vocab (weight-tied), so their ids are valid indices here.
+    """
+    mask = np.zeros((player_vocab_size,), dtype=np.float32)
+    ids = np.unique(np.concatenate([
+        cols["home_roster"][idx].reshape(-1),
+        cols["away_roster"][idx].reshape(-1),
+        cols["player"][idx].reshape(-1),
+        cols["secondary_player"][idx].reshape(-1),
+    ]))
+    ids = ids[(ids >= 0) & (ids < player_vocab_size)]
+    mask[ids] = 1.0
+    mask[pad_player_id] = 0.0
+    return mask
+
+
 class EventTimeModel:
     """
     Core Event/Time Transformer.
@@ -129,7 +183,7 @@ class EventTimeModel:
 
     def __init__(self, encoder: Encoder,
                  sequence_length=MAX_SEQUENCE_LENGTH,
-                 model_dim=256,
+                 model_dim=MODEL_DIM,
                  event_classes=7,
                  path="./data",
                  processed_dir="./data/processed"):
@@ -359,7 +413,7 @@ class EventTimeModel:
             roster_size=ROSTER_SIZE,
             num_players=num_players,
             roster_dim=ROSTER_DIM,
-            num_sab_layers=2,
+            num_sab_layers=ROSTER_SAB_LAYERS,
             num_heads=4,
             d_ff=256,
             dropout=dropout,
@@ -368,7 +422,7 @@ class EventTimeModel:
         # TimeDistributed, which unrolls SEQ in graph mode and exhausts memory).
         return SequenceRosterEncoder(params, name="roster_vec")
 
-    def model(self, num_layers=4, num_heads=8, ff_dim=1024, dropout=0.2):
+    def model(self, num_layers=NUM_LAYERS, num_heads=NUM_HEADS, ff_dim=FF_DIM, dropout=0.2):
         """
         Build the causal Event/Time Transformer.
 
@@ -540,7 +594,7 @@ class EventTimeModel:
     def train(self, epochs=50, batch_size=64, lr=3e-4, time_loss_weight=0.5,
               patience=10, artifacts_root=DEFAULT_ARTIFACTS_ROOT,
               mixed_precision=True, jit_compile=False,
-              num_layers=4, num_heads=8, ff_dim=1024, dropout=0.2,
+              num_layers=NUM_LAYERS, num_heads=NUM_HEADS, ff_dim=FF_DIM, dropout=0.2,
               warmup_epochs=1, lr_alpha=0.05,
               report=True, run_name=None, reports_root=DEFAULT_REPORTS_ROOT,
               init_weights_root=None):
