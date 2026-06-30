@@ -114,19 +114,21 @@ python full_train.py eval-all     # predict ALL 100 holdout games straight throu
   stopping). It resumes too — finished games are skipped. (The old `eval` still exists for the
   local "10 games then stop" workflow.)
 
-### Capacity knobs to raise on a bigger card
-The defaults are tuned for a tight ~10 GB GPU. With 24 GB+ you can go faster / do more:
+### Capacity knobs (already set for a high-VRAM paid GPU)
+Train batch is **64** for every head out of the box now (`--batch-size` default 64 +
+`LARGE_OUTPUT_BATCH=64`), which assumes a roomy card. The rest you can still raise:
 
 | Knob | File | Default | Raise to | Effect |
 |---|---|---|---|---|
-| `LARGE_OUTPUT_BATCH` | `models/pipeline.py` | 16 | 24–48 | Bigger train batch for the player-vocab heads → fewer steps. |
-| `batch_size` | passed to `setup` (`--batch-size`) | 32 | 64–128 | Train batch for the small heads. |
+| `batch_size` | passed to `setup` (`--batch-size`) | 64 | 96–128 | Train batch for all heads. Pass e.g. `setup --batch-size 96`. |
+| `LARGE_OUTPUT_BATCH` | `models/pipeline.py` | 64 | match `batch_size` | Per-head cap for the player-vocab heads. Keep == `batch_size` so they aren't capped; **lower** it (24/16) only on a tight GPU. |
 | `ROLLOUT_BATCH_SIZE` | `config.py` | 16 | 32–64 | More concurrent game-sims pooled per GPU forward pass → faster eval. Pure throughput, no effect on results. |
 | `FINAL_HOLDOUT_GAMES` | `config.py` | 100 | 200+ | Predict more holdout games (more robust eval). Re-run `setup` after changing. |
 | `STAGE_SIMS` | `config.py` | 11 | 15–21 | More sims per game → tighter averaged box scores (and bigger error bars estimate). |
 
-Watch the first training epoch's memory; if it OOMs, drop `LARGE_OUTPUT_BATCH`. If there's lots
-of headroom, raise it (and `ROLLOUT_BATCH_SIZE` for eval).
+Watch the first training epoch's memory. If a player-vocab head OOMs, lower `LARGE_OUTPUT_BATCH`
+(it only caps those heads); if there's lots of headroom, raise `batch_size` and
+`ROLLOUT_BATCH_SIZE`.
 
 ---
 

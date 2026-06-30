@@ -33,7 +33,7 @@ def main() -> None:
     p_setup.add_argument("--data-dir", default="./data")
     p_setup.add_argument("--processed-dir", default="./data/processed")
     p_setup.add_argument("--epochs", type=int, default=50)
-    p_setup.add_argument("--batch-size", type=int, default=32)
+    p_setup.add_argument("--batch-size", type=int, default=64)  # paid GPU has VRAM for it
 
     sub.add_parser("train", help="One fresh full train of every model (recency-weighted).")
     sub.add_parser("retrain-shot-type",

@@ -39,10 +39,11 @@ from models.substitution_model import SubstitutionModel
 # capped here too as a precaution since it's the last head to train. Every other head (event / type /
 # result / conditional-time — tiny outputs) trains at the full batch_size.
 LARGE_OUTPUT_MODELS = {PlayerModel.KEY, SubstitutionModel.KEY, StintLengthModel.KEY}
-# Lowered 24 -> 16 for the train-2 capacity bump (model_dim 384, player embed 192): the bigger
-# backbone + player-vocab logits/gradients need more headroom on a tight (~10 GB) GPU. Raise back
-# toward 24 if the first epoch shows VRAM to spare.
-LARGE_OUTPUT_BATCH = 16
+# Per-head cap for the player-vocab heads (their logits/gradients over the player vocab are the
+# real OOM risk). Set to 64 for the paid-GPU train 2 (provisioning a high-VRAM card), matching the
+# global batch_size so these heads also train at 64 — i.e. effectively uncapped. Lower this (e.g.
+# 24/16) if you ever run the chain on a tight (~10 GB) GPU and a player-vocab head OOMs.
+LARGE_OUTPUT_BATCH = 64
 
 
 def _batch_for(key: str, batch_size: int) -> int:

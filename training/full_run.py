@@ -54,7 +54,7 @@ class FullRun:
 
     # --------------------------------------------------------------- setup
     def setup(self, *, data_dir: str = "./data", processed_dir: str = "./data/processed",
-              epochs: int = 50, batch_size: int = 32) -> None:
+              epochs: int = 50, batch_size: int = 64) -> None:
         """Compute the train/holdout cut from the already-cleaned data (no re-clean / re-warmup)."""
         idx = game_index(data_dir)
         last_season = int(idx["season"].max())
