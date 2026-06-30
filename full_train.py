@@ -10,6 +10,7 @@ delete it yourself whenever). Each command is user-launched; nothing auto-advanc
     python full_train.py retrain-shot-type     # retrain ONLY shot_type on existing tensors (live FGs)
     python full_train.py eval                  # predict the next 10 holdout games, then STOP
     python full_train.py eval                  # ... repeat until all 100 are done ...
+    python full_train.py eval-all              # predict ALL holdout games straight (paid GPU), report every 10
     python full_train.py status                # progress
     python full_train.py report                # rebuild the aggregate report over finished games
 
@@ -38,6 +39,8 @@ def main() -> None:
     sub.add_parser("retrain-shot-type",
                    help="Retrain ONLY shot_type on the existing cond_*.npz (live FGs {2pt,3pt} only).")
     sub.add_parser("eval", help="Predict the next batch of holdout games, then stop.")
+    sub.add_parser("eval-all",
+                   help="Predict ALL holdout games straight through (paid-GPU run), reporting every batch.")
     sub.add_parser("status", help="Show progress.")
     sub.add_parser("report", help="Rebuild the aggregate report over finished games.")
 
@@ -53,6 +56,8 @@ def main() -> None:
         run.retrain_shot_type()
     elif args.command == "eval":
         run.eval()
+    elif args.command == "eval-all":
+        run.eval_all()
     elif args.command == "status":
         run.status()
     elif args.command == "report":

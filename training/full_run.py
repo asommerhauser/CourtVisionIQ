@@ -166,6 +166,28 @@ class FullRun:
             print("  When ready, predict the next batch:  python full_train.py eval")
         print("=" * 70)
 
+    # --------------------------------------------------------------- eval-all
+    def eval_all(self) -> None:
+        """Predict the WHOLE holdout straight through in one process (no stopping), writing an
+        intermediate report every ``eval_batch`` games. For an uninterrupted paid-GPU run; the
+        batched ``eval`` above is the local interrupt-friendly path. Resumes over finished games."""
+        from simulation.stage_eval import evaluate_stage
+
+        self._require()
+        if self.state["status"] != "trained":
+            print("[eval-all] not trained yet — run:  python full_train.py train")
+            return
+        report = evaluate_stage(
+            RUN_NAME, holdout_ids=self.state["holdout_game_ids"], n_sims=STAGE_SIMS,
+            max_new=None, report_every=self.state["eval_batch"], data_dir=self.state["data_dir"],
+            processed_dir=self.state["processed_dir"], artifacts_root=self.state["artifacts_root"],
+            reports_root=self.state["reports_root"],
+        )
+        print("\n" + "=" * 70)
+        print(f"DONE — all {report['done']}/{report['total']} holdout games predicted. Final report:")
+        print(f"  {report['run_dir']}")
+        print("=" * 70)
+
     # ------------------------------------------------------- retrain-shot-type
     def retrain_shot_type(self) -> None:
         """Targeted retrain of ONLY the shot_type head, reusing the existing cond_*.npz.

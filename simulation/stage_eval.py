@@ -111,6 +111,7 @@ def _write_game_folder(out_dir: Path, game, spec, boxes, histories, record,
 
 def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
                    n_sims: int = STAGE_SIMS, max_new: int | None = None,
+                   report_every: int | None = None,
                    data_dir: str = "./data", processed_dir: str = "./data/processed",
                    artifacts_root: str = DEFAULT_ARTIFACTS_ROOT,
                    reports_root: str = DEFAULT_REPORTS_ROOT,
@@ -121,9 +122,11 @@ def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
     ``holdout_ids`` defaults to the manifest the stage's preprocess wrote (``holdout_games.json``).
     Finished games (those with a cached ``record.json``) are reloaded rather than re-simulated, so a
     killed eval resumes. ``max_new`` caps how many *new* games are simulated this call (the rest are
-    left for a later call) — used to predict the holdout a batch at a time. Already-finished games
-    still load into the report, so the report covers everything done so far. Returns the report dict
-    (with ``run_dir``, ``done``, ``total``).
+    left for a later call) — used to predict the holdout a batch at a time; pass ``None`` to run the
+    whole holdout straight through in one process (a paid-GPU run). ``report_every`` (when set) writes
+    an intermediate report every N newly-finished games so progress is visible during a straight run;
+    a final report is always written at the end. Already-finished games still load into the report, so
+    it covers everything done so far. Returns the report dict (with ``run_dir``, ``done``, ``total``).
     """
     from reporting.eval_report import build_report, write_eval_report
 
@@ -138,6 +141,18 @@ def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
     df = load_all_cleaned(data_dir, parse_rosters=True)
     stage_dir = Path(predictions_root) / stage_name
     sim = None  # lazily loaded only if there's an unfinished game to simulate
+
+    def _flush_report() -> dict:
+        """Build + write the eval report over everything finished so far; return the report dict."""
+        aggregate = _aggregate(records)
+        rep = build_report(records=records, aggregate=aggregate, n_sims=n_sims, run_name=stage_name)
+        rd = write_eval_report(rep, reports_root=reports_root)
+        _print_summary(aggregate, len(records), n_sims)
+        rep["run_dir"] = str(rd)
+        rep["predictions_dir"] = str(stage_dir)
+        rep["done"] = len(records)
+        rep["total"] = len(holdout_ids)
+        return rep
 
     records: list[dict] = []
     new_done = 0
@@ -177,18 +192,15 @@ def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
         records.append(record)
         new_done += 1
 
-    aggregate = _aggregate(records)
-    report = build_report(records=records, aggregate=aggregate, n_sims=n_sims, run_name=stage_name)
-    run_dir = write_eval_report(report, reports_root=reports_root)
-    _print_summary(aggregate, len(records), n_sims)
+        if report_every and new_done % report_every == 0:
+            print(f"  [report] {new_done} new games done — flushing intermediate report...")
+            _flush_report()
+
+    report = _flush_report()
     print(f"\n  {len(records)}/{len(holdout_ids)} holdout games done "
           f"({new_done} predicted this call)")
     print(f"  per-game predictions -> {stage_dir.resolve()}")
-    print(f"  stage report        -> {run_dir.resolve()}")
-    report["run_dir"] = str(run_dir)
-    report["predictions_dir"] = str(stage_dir)
-    report["done"] = len(records)
-    report["total"] = len(holdout_ids)
+    print(f"  stage report        -> {report['run_dir']}")
     return report
 
 
