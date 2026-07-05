@@ -364,8 +364,9 @@ class GameSimulator:
         the shot is about to be), and the stint-length head adds ``next_secondary_player`` (the
         decided incoming player, whose stint it predicts). Only the requested conditioning is
         attached, so a head is never handed an input it doesn't define — Keras functional models
-        reject a dict with unknown keys, so the player-vocab ``avail_mask`` is attached only on the
-        player / substitution path (:meth:`_next_step_inputs`), not here.
+        reject a dict with unknown keys, so the player-vocab ``avail_mask`` is attached only on
+        the incoming-substitution path (:meth:`_next_step_inputs`), not here. The Player head's
+        on-court candidate mask is built in-graph from the roster inputs already in ``base``.
         """
         base = self.build_model_inputs()
         SEQ = self.sequence_length
@@ -395,13 +396,16 @@ class GameSimulator:
         return inputs
 
     def _next_step_inputs(self, *, outgoing: str | None, delta_seconds: float) -> dict:
-        """Player- / substitution-head conditioning (``next_event`` = ``substitution`` + the
-        outgoing player). Thin wrapper over :meth:`_conditioned_inputs` kept for the sub helpers.
-        Adds the player-vocab ``avail_mask`` here (these two heads define that input; the others
-        do not), masking the pick to the game's available players exactly as at train time."""
+        """Substitution-path conditioning (``next_event`` = ``substitution`` + the outgoing
+        player). Thin wrapper over :meth:`_conditioned_inputs` kept for the sub helpers.
+        Adds the player-vocab ``avail_mask`` only when the incoming (Substitution) head is the
+        consumer — it is the only head that defines that input (its OnCourtCandidateMask
+        subtracts the on-court ten from it in-graph, matching the legal bench at train time).
+        The Player head's mask is built entirely from the roster inputs already present."""
         inputs = self._conditioned_inputs(next_event=SUB_EVENT, delta_seconds=delta_seconds,
                                           next_player=outgoing)
-        inputs["avail_mask"] = self._avail_mask()
+        if outgoing is not None:  # incoming pick (SubstitutionModel) — the avail-defined head
+            inputs["avail_mask"] = self._avail_mask()
         return inputs
 
     def _infer(self, model_key: str, inputs: dict) -> dict:

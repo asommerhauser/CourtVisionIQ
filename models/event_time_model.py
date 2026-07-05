@@ -115,6 +115,76 @@ class ApplyAvailabilityMask(layers.Layer):
 
 
 @keras.saving.register_keras_serializable(package="cviq")
+class OnCourtCandidateMask(layers.Layer):
+    """Mask player logits to the row's on-court candidate set (train/inference legality parity).
+
+    The Player head picks among the players actually on the floor and the Substitution head
+    picks off the bench, but both emit logits over the whole player vocab — historically the
+    legality restriction was applied only at sampling time, so the training softmax normalized
+    over a much larger set (the whole league, or the ~25-player game pool under
+    ``ApplyAvailabilityMask``) and the gradient still carried an appearance-volume prior.
+    This layer builds the candidate set **in-graph** from the row's ``home_roster`` /
+    ``away_roster`` inputs (the cleaned data's on-court fives at that row), so the training
+    denominator matches what inference actually samples from.
+
+    Two modes:
+      * ``exclude_on_court=False`` (Player/actor head): candidates = the on-court ten. The
+        row's rosters are the lineup *during* that row's event, and rosters only change on
+        substitution rows, so the current row's ten covers both the next actor (next row's
+        lineup == this row's except across a sub) and the outgoing pick of a next-row sub
+        (the outgoing player is on court *now*, and the data's sub rows carry post-sub
+        rosters that already drop them).
+      * ``exclude_on_court=True`` (Substitution/incoming head): candidates = ``avail_mask``
+        minus the on-court ten — the legal bench at the decision, exactly the candidate set
+        ``predict_incoming`` samples from. Covers the synthesized opening subs too (partial
+        built-up lineup -> the remaining roster stays candidate).
+
+    Off-candidate logits get a large-negative additive bias (finite, not -inf, so masked-out
+    rows still produce finite losses under a zero sample_weight). PAD is never a candidate.
+    Rows whose target falls outside the candidate set must be zeroed in the loss mask by the
+    caller (see the target-in-candidates guards in the heads' ``_build_split``).
+
+    Inputs: ``logits`` (B, SEQ, V), ``home_roster`` / ``away_roster`` (B, SEQ, ROSTER_SIZE)
+    int ids, and — in exclude mode — ``avail_mask`` (B, V).
+    """
+
+    NEG = -1e9
+    PAD_ID = 0  # player vocab reserves PAD=0 (encoder/vocab.py)
+
+    def __init__(self, exclude_on_court: bool = False, **kwargs):
+        super().__init__(**kwargs)
+        self.exclude_on_court = bool(exclude_on_court)
+
+    def call(self, logits, home_roster, away_roster, avail_mask=None):
+        V = tf.shape(logits)[-1]
+        ids = tf.concat([home_roster, away_roster], axis=-1)  # (B, SEQ, 2*ROSTER_SIZE)
+        # One-hot one roster slot at a time and max-accumulate: peak memory 2x(B,SEQ,V)
+        # instead of the (B,SEQ,10,V) a single one_hot would materialize.
+        oncourt = None
+        for j in range(ids.shape[-1]):
+            oh = tf.one_hot(ids[:, :, j], V, dtype=tf.float32)  # (B, SEQ, V)
+            oncourt = oh if oncourt is None else tf.maximum(oncourt, oh)
+        if self.exclude_on_court:
+            if avail_mask is None:
+                raise ValueError("exclude_on_court=True requires avail_mask")
+            cand = tf.expand_dims(tf.cast(avail_mask, tf.float32), 1) * (1.0 - oncourt)
+        else:
+            cand = oncourt
+        # PAD (id 0) is never a candidate (roster buffers pad with it).
+        pad_col = tf.one_hot(tf.fill(tf.shape(ids)[:2], self.PAD_ID), V, dtype=tf.float32)
+        cand = cand * (1.0 - pad_col)
+        return logits + tf.cast((1.0 - cand) * self.NEG, logits.dtype)
+
+    def compute_output_shape(self, logits_shape, *_, **__):
+        return logits_shape
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"exclude_on_court": self.exclude_on_court})
+        return cfg
+
+
+@keras.saving.register_keras_serializable(package="cviq")
 class DeltaSecondsMAE(keras.metrics.MeanAbsoluteError):
     """Time-head MAE expressed in real seconds.
 
@@ -165,6 +235,19 @@ def game_available_mask(cols, idx, player_vocab_size: int, pad_player_id: int) -
     mask[ids] = 1.0
     mask[pad_player_id] = 0.0
     return mask
+
+
+def target_on_court(target: np.ndarray, home_buf: np.ndarray, away_buf: np.ndarray) -> np.ndarray:
+    """(SEQ,) 1.0 where ``target[t]`` appears in the row's on-court rosters, else 0.0.
+
+    The numpy-side companion of ``OnCourtCandidateMask``: a head whose logits are masked to
+    the row's candidate set must zero the loss on rows whose target is *outside* it (the
+    pre-``end`` sentinel row, the rare cleaned-data row whose actor isn't in the recorded
+    lineup) — otherwise the target sits on a large-negative logit and the row trains on
+    noise. ``home_buf`` / ``away_buf`` are the padded (SEQ, ROSTER_SIZE) roster buffers.
+    """
+    oncourt = np.concatenate([home_buf, away_buf], axis=1)     # (SEQ, 2*ROSTER_SIZE)
+    return (target[:, None] == oncourt).any(axis=1).astype(np.float32)
 
 
 class EventTimeModel:

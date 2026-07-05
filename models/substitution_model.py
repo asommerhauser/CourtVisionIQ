@@ -48,13 +48,14 @@ from encoder.encoder import Encoder
 from models.artifacts import ModelArtifacts, DEFAULT_ARTIFACTS_ROOT, warm_start_weights
 from models.event_time_model import (
     AddPositionalEmbedding,
-    ApplyAvailabilityMask,
     KeyPaddingMask,
+    OnCourtCandidateMask,
     EMBED_DIMS,
     ROSTER_DIM,
     CATEGORICAL_FIELDS,
     ROSTER_COLS,
     game_available_mask,
+    target_on_court,
 )
 from models.roster_set_encoder import (
     RosterEncoderParams,
@@ -366,19 +367,22 @@ class SubstitutionModel:
             n = len(idx)
 
             # Per-game availability over the player vocab (everyone who saw the floor),
-            # incl. the synthesized opening-sub rows; masks the incoming-player head's
-            # softmax to the co-available set at train time.
-            batches["avail_mask"].append(
-                game_available_mask(cols, idx, player_vocab_size, PAD_PLAYER))
+            # incl. the synthesized opening-sub rows. OnCourtCandidateMask subtracts the
+            # row's on-court ten from this in-graph, so the incoming-pick softmax spans
+            # exactly the legal bench at each decision.
+            game_avail = game_available_mask(cols, idx, player_vocab_size, PAD_PLAYER)
+            batches["avail_mask"].append(game_avail)
 
             for k in keys_1d:
                 buf = np.full((SEQ,), pad_scalar[k], dtype=np.int32)
                 buf[:n] = cols[k][idx]
                 batches[k].append(buf)
 
+            roster_bufs = {}
             for k in keys_roster:
                 buf = np.full((SEQ, ROSTER_SIZE), PAD_PLAYER, dtype=np.int32)
                 buf[:n] = cols[k][idx]
+                roster_bufs[k] = buf
                 batches[k].append(buf)
 
             for k in keys_cont:
@@ -388,10 +392,12 @@ class SubstitutionModel:
 
             append_season_batches(batches, cols, idx, n, SEQ)
 
+            next_bufs = {}
             for k in keys_next_cat:
                 buf = np.full((SEQ,), next_pad[k], dtype=np.int32)
                 if n > 1:
                     buf[: n - 1] = cols[next_src[k]][idx][1:]
+                next_bufs[k] = buf
                 batches[k].append(buf)
             next_delta = np.zeros((SEQ, 1), dtype=np.float32)
             if n > 1:
@@ -402,6 +408,15 @@ class SubstitutionModel:
             pad_mask[:n] = 1.0
             loss_mask = np.zeros((SEQ,), dtype=np.float32)
             loss_mask[: max(n - 1, 0)] = 1.0  # last real row has no next target
+            # Target-in-candidates guard (see OnCourtCandidateMask): the incoming pick
+            # trains against avail-minus-on-court, so zero the loss on rows whose target
+            # incoming player is already on the floor at the decision or outside the
+            # game's availability set — its logit sits at -1e9 and would train on noise.
+            target = next_bufs["next_secondary_player"]
+            in_avail = game_avail[np.clip(target, 0, player_vocab_size - 1)]
+            on_court = target_on_court(
+                target, roster_bufs["home_roster"], roster_bufs["away_roster"])
+            loss_mask *= in_avail * (1.0 - on_court)
             batches["pad_mask"].append(pad_mask)
             batches["loss_mask"].append(loss_mask)
 
@@ -519,9 +534,11 @@ class SubstitutionModel:
 
         # ---- Output head (float32 keeps logits stable under mixed_float16) ----
         logits = layers.Dense(target_vocab_size, dtype="float32", name="secondary_player_logits")(x)
-        # Mask to the per-game available players so the incoming-pick softmax (and gradient)
-        # spans only co-available players, not the whole league (relative freq, not volume).
-        logits = ApplyAvailabilityMask(name=self.output_name)(logits, avail_mask)
+        # Mask to the legal bench — the game's available players minus the row's on-court
+        # ten — so the incoming-pick softmax (and gradient) spans exactly the candidate set
+        # inference samples from (train/inference legality parity).
+        logits = OnCourtCandidateMask(exclude_on_court=True, name=self.output_name)(
+            logits, home_roster, away_roster, avail_mask)
 
         inputs = {
             **cat_inputs,

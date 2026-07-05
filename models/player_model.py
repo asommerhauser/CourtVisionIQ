@@ -18,13 +18,13 @@ from encoder.encoder import Encoder
 from models.artifacts import ModelArtifacts, DEFAULT_ARTIFACTS_ROOT, warm_start_weights
 from models.event_time_model import (
     AddPositionalEmbedding,
-    ApplyAvailabilityMask,
     KeyPaddingMask,
+    OnCourtCandidateMask,
     EMBED_DIMS,
     ROSTER_DIM,
     CATEGORICAL_FIELDS,
     ROSTER_COLS,
-    game_available_mask,
+    target_on_court,
 )
 from models.roster_set_encoder import (
     RosterEncoderParams,
@@ -234,19 +234,13 @@ class PlayerModel:
 
         batches = {k: [] for k in (*keys_1d, *keys_roster, *keys_cont, *SEASON_INPUT_KEYS,
                                    "next_event", "next_delta_time",
-                                   "player_target", "pad_mask", "loss_mask", "avail_mask")}
+                                   "player_target", "pad_mask", "loss_mask")}
 
-        player_vocab_size = self.encoder.player_vocab.next_token
         game_ids_sorted = [g for g in np.unique(game_id) if g in games]
         for g in game_ids_sorted:
             idx = np.where(game_id == g)[0]
             idx = idx[:SEQ]  # truncate overlong games
             n = len(idx)
-
-            # Per-game availability over the player vocab (everyone who saw the floor);
-            # masks the player head's softmax to the co-available set at train time.
-            batches["avail_mask"].append(
-                game_available_mask(cols, idx, player_vocab_size, PAD_PLAYER))
 
             def pad1d(arr, pad_val, dtype):
                 buf = np.full((SEQ,), pad_val, dtype=dtype)
@@ -256,9 +250,11 @@ class PlayerModel:
             for k in keys_1d:
                 batches[k].append(pad1d(cols[k], pad_scalar[k], np.int32))
 
+            roster_bufs = {}
             for k in keys_roster:
                 buf = np.full((SEQ, ROSTER_SIZE), PAD_PLAYER, dtype=np.int32)
                 buf[:n] = cols[k][idx]
+                roster_bufs[k] = buf
                 batches[k].append(buf)
 
             for k in keys_cont:
@@ -284,6 +280,12 @@ class PlayerModel:
             pad_mask[:n] = 1.0
             loss_mask = np.zeros((SEQ,), dtype=np.float32)
             loss_mask[: max(n - 1, 0)] = 1.0  # last real row has no next target
+            # Target-in-candidates guard (see OnCourtCandidateMask): the head's softmax is
+            # masked to the row's on-court ten, so a row whose target actor is outside it
+            # (the pre-"end" sentinel row, rare lineup glitches) would train on a -1e9
+            # target logit — pure noise. Zero those rows out of the loss instead.
+            loss_mask *= target_on_court(
+                player_t, roster_bufs["home_roster"], roster_bufs["away_roster"])
             batches["pad_mask"].append(pad_mask)
             batches["loss_mask"].append(loss_mask)
 
@@ -338,7 +340,6 @@ class PlayerModel:
         next_event = Input(shape=(SEQ,), dtype="int32", name="next_event")
         next_delta_time = Input(shape=(SEQ, 1), dtype="float32", name="next_delta_time")
         pad_mask = Input(shape=(SEQ,), dtype="float32", name="pad_mask")
-        avail_mask = Input(shape=(player_vocab_size,), dtype="float32", name="avail_mask")
 
         # ---- Per-field embeddings ----
         # player and secondary_player share one Embedding table (weight-tied).
@@ -401,9 +402,11 @@ class PlayerModel:
 
         # ---- Output head (float32 keeps logits stable under mixed_float16) ----
         player_logits = layers.Dense(player_vocab_size, dtype="float32", name="player_logits")(x)
-        # Mask to the per-game available players so the softmax denominator (and gradient)
-        # spans only co-available players, not the whole league (relative freq, not volume).
-        player_logits = ApplyAvailabilityMask(name="player_output")(player_logits, avail_mask)
+        # Mask to the row's on-court ten so the softmax denominator (and gradient) spans only
+        # the players inference actually samples from (train/inference legality parity) —
+        # the head learns who acts among those on the floor, not league appearance volume.
+        player_logits = OnCourtCandidateMask(name="player_output")(
+            player_logits, home_roster, away_roster)
 
         inputs = {
             **cat_inputs,
@@ -411,7 +414,7 @@ class PlayerModel:
             "time_abs": time_abs, "delta_time": delta_time,
             "rest_home": rest_home, "rest_away": rest_away, **team_inputs,
             "next_event": next_event, "next_delta_time": next_delta_time,
-            "pad_mask": pad_mask, "avail_mask": avail_mask,
+            "pad_mask": pad_mask,
         }
         return keras.Model(
             inputs=inputs,
@@ -427,7 +430,7 @@ class PlayerModel:
         "event", "player", "type", "result", "season", "secondary_player",
         "home_roster", "away_roster", "time_abs", "delta_time",
         *SEASON_INPUT_KEYS,
-        "next_event", "next_delta_time", "pad_mask", "avail_mask",
+        "next_event", "next_delta_time", "pad_mask",
     )
 
     def _load_processed(self, name: str) -> dict:

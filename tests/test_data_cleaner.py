@@ -232,12 +232,13 @@ def test_end_event_roster_never_exceeds_five(tmp_path):
 def test_assist_home_away_reflects_assister_not_shooter(tmp_path):
     """
     Shooter is 'Alice' (home). Assister is 'Frank' (away).
-    The assist event must have home/away == 0 (away), not 1.
+    The assist event must have home/away == 2 (home_indicator's away code), not 1
+    (home) — i.e. attribution follows the assister, not the shooter.
     """
     row = {"event_type": "shot", "player": "Alice", "assist": "Frank", "result": "made"}
     cleaned = _parse(tmp_path, [row])
     assist_event = cleaned[cleaned["event"] == "assist"].iloc[0]
-    assert assist_event["home/away"] == 0  # Frank is away
+    assert assist_event["home/away"] == 2  # Frank is away (home_indicator: 1=home, 2=away)
 
 def test_assist_home_away_when_assister_is_home(tmp_path):
     """Assister 'Bob' is home → home/away == 1."""
@@ -328,13 +329,13 @@ def test_block_creates_shot_and_block_events(tmp_path):
 
 
 def test_block_home_away_is_opposite_of_shooter(tmp_path):
-    """Shooter Alice is home (1); blocker Frank is away (0)."""
+    """Shooter Alice is home (1); blocker Frank is away (2)."""
     row = {"event_type": "shot", "player": "Alice", "block": "Frank"}
     cleaned = _parse(tmp_path, [row])
     shot = cleaned[cleaned["event"] == "shot"].iloc[0]
     block = cleaned[cleaned["event"] == "block"].iloc[0]
     assert shot["home/away"] == 1
-    assert block["home/away"] == 0
+    assert block["home/away"] == 2  # home_indicator: 1=home, 2=away
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +379,7 @@ def test_steal_home_away_for_both_events(tmp_path):
     turnovers = cleaned[cleaned["event"] == "turnover"]
     steal_evt = turnovers[turnovers["result"] == "steal"].iloc[0]
     cop_evt = turnovers[turnovers["result"] == "cop"].iloc[0]
-    assert steal_evt["home/away"] == 0   # Frank is away
+    assert steal_evt["home/away"] == 2   # Frank is away (home_indicator: 1=home, 2=away)
     assert cop_evt["home/away"] == 1     # Alice is home
 
 
@@ -536,7 +537,7 @@ def test_regular_season_parsed(tmp_path):
     row = {"event_type": "shot", "data_set": "2002-03 regular season"}
     cleaned = _parse(tmp_path, [row])
     # season = 2002+1 = 2003 (set by run(); verify parse_file inherits it)
-    assert (cleaned["playoff"] == 0).all()
+    assert (cleaned["playoff"] == 1).all()  # playoff column: 1=regular season, 2=playoffs
 
 
 def test_playoff_flag_set(tmp_path):
@@ -552,9 +553,10 @@ def test_playoff_flag_set(tmp_path):
     dc = DataCleaner()
     dc.season = 2003
     _, cleaned = dc.parse_file(csv_path)
-    # The start-of-period row should set playoff=1; all events in that game inherit it.
+    # The start-of-period row should flag the playoffs; all events in that game inherit
+    # it (playoff column: 1=regular season, 2=playoffs).
     game_events = cleaned[cleaned["event"] != "end"]
-    assert (game_events["playoff"] == 1).all()
+    assert (game_events["playoff"] == 2).all()
 
 
 # ---------------------------------------------------------------------------
@@ -580,8 +582,8 @@ def test_shot_home_player_has_home_indicator_1(tmp_path):
     assert shot["home/away"] == 1
 
 
-def test_shot_away_player_has_home_indicator_0(tmp_path):
+def test_shot_away_player_has_home_indicator_2(tmp_path):
     row = {"event_type": "shot", "player": "Frank"}  # Frank is in AWAY
     cleaned = _parse(tmp_path, [row])
     shot = cleaned[cleaned["event"] == "shot"].iloc[0]
-    assert shot["home/away"] == 0
+    assert shot["home/away"] == 2  # home_indicator: 1=home, 2=away
