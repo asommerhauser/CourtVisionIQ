@@ -40,7 +40,7 @@ import numpy as np
 
 from config import (
     MAX_SEQUENCE_LENGTH, RESULT_TEMPERATURE, ROSTER_SIZE, STINT_MAX_SECONDS,
-    STINT_SAMPLE_SIGMA, SUB_INCOMING_TEMPERATURE, SUB_TEMPERATURE, TYPE_TEMPERATURE,
+    STINT_SAMPLE_SIGMA, SUB_INCOMING_TEMPERATURE, SUB_TEMPERATURE, TYPE_BIAS, TYPE_TEMPERATURE,
 )
 from models.conditional_time_model import ConditionalTimeModel
 from encoder.encoder import Encoder
@@ -529,18 +529,24 @@ class GameSimulator:
 
     def predict_type(self, key: str, next_event: str, next_player: str, allowed: list[str], *,
                      delta_seconds: float = 0.0, greedy: bool = False,
-                     temperature: float = TYPE_TEMPERATURE) -> str:
+                     temperature: float = TYPE_TEMPERATURE,
+                     bias: dict[str, float] | None = None) -> str:
         """Sample an event's ``type`` from ``allowed`` via a conditional type head.
 
         ``key`` is the head (``shot_type`` / ``assist_type`` / ``turnover_type`` /
         ``foul_type``); ``allowed`` is the legal token set (e.g. ``{"2pt", "3pt"}`` for a live
         field goal). The head outputs ``type_output`` and conditions on the decided actor.
+
+        ``bias`` adds a per-token logit offset on top of the head's ``TYPE_BIAS`` calibration
+        entry (config.py, keyed by ``key``) — e.g. ``{"turnover_type": {"steal": -0.2}}`` pulls
+        steal-type turnovers down without moving the overall turnover rate.
         """
         inputs = self._conditioned_inputs(next_event=next_event, delta_seconds=delta_seconds,
                                           next_player=next_player)
         logits = self._head_logits(key, "type_output", inputs)
+        eff_bias = {**TYPE_BIAS.get(key, {}), **(bias or {})} or None
         return self._masked_sample(logits, allowed, self.encoder.encode_type, greedy=greedy,
-                                   temperature=temperature)
+                                   temperature=temperature, bias=eff_bias)
 
     def predict_result(self, next_player: str, next_type: str, allowed: list[str], *,
                        delta_seconds: float = 0.0, greedy: bool = False,

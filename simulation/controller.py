@@ -23,7 +23,7 @@ from __future__ import annotations
 import numpy as np
 
 from config import (
-    DEADBALL_REBOUND_PROB, DELTA_TIME_SCALE, EVENT_TEMPERATURE, FOUL_OUT_LIMIT,
+    DEADBALL_REBOUND_PROB, DELTA_TIME_SCALE, EVENT_BIAS, EVENT_TEMPERATURE, FOUL_OUT_LIMIT,
     HOME_COURT_SHOT_BIAS, MAX_DELTA, PLAYER_TEMPERATURE, SHOT_RESULT_BIAS,
     SUB_FATIGUE_WEIGHT, SUB_MAX_GAP_SECONDS,
 )
@@ -227,9 +227,11 @@ class GameController:
         actor is known (see :meth:`_advance_for`); the marginal is the actor head's Δt conditioning.
         """
         pred = self.sim.predict_next()
+        # EVENT_BIAS: per-event logit calibration dial (config.py) — the event-head sibling of
+        # SHOT_RESULT_BIAS, for pulling the event mix (fouls/assists/turnovers) to real rates.
         event = self.sim._masked_sample(pred["event_logits"], allowed,
                                         self.sim.encoder.encode_event, greedy=self.greedy,
-                                        temperature=EVENT_TEMPERATURE)
+                                        temperature=EVENT_TEMPERATURE, bias=EVENT_BIAS)
         return event, pred["delta_seconds"]
 
     def _advance_for(self, event: str, actor: str | None, marginal: float) -> float:

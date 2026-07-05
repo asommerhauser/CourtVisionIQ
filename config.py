@@ -64,6 +64,17 @@ RESULT_TEMPERATURE = 1.0   # shot_result (made / missed / blocked)
 # over-produced (+53% in the stage eval), which drags eFG/FG% down; if eFG stays low after the
 # pace fix, push "blocked" negative (and/or "made" positive) here to pull make/block rates to real.
 SHOT_RESULT_BIAS: dict[str, float] = {}
+# Per-event-token logit offset applied to the next-event pick (GameController._sample_event), the
+# event-head sibling of SHOT_RESULT_BIAS. Default {} = raw model. Tune post-train from the eval
+# report's team-bias table: e.g. the Train-1 holdout under-produced fouls (PF -3.6 / FTA -3.9 per
+# game — the model can't see bonus/clutch contexts) and over-produced assists (+3.9) / turnovers
+# (+2.25), which would suggest something like {"foul": +0.2, "assist": -0.15, "turnover": -0.1}.
+# Re-measure before touching: the game-state features change the whole event mix.
+EVENT_BIAS: dict[str, float] = {}
+# Per-head per-token logit offset on the conditional type heads (GameSimulator.predict_type),
+# keyed by head then token, e.g. {"turnover_type": {"steal": -0.2}} to pull steal-type turnovers
+# down without moving the overall turnover rate. Default {} = raw model.
+TYPE_BIAS: dict[str, dict[str, float]] = {}
 # Home-court edge. The rollout is otherwise home/away symmetric (HOME just inbounds first), so the
 # sim can't separate winners and win-pick accuracy sits near a coin flip. This adds a logit nudge to
 # the live-shot "made" outcome: +HOME_COURT_SHOT_BIAS for the home offense, -HOME_COURT_SHOT_BIAS for
@@ -118,7 +129,7 @@ _TUNING_KEYS = (
     "PLAYER_TEMPERATURE", "EVENT_TEMPERATURE", "TYPE_TEMPERATURE", "RESULT_TEMPERATURE",
     "SUB_TEMPERATURE", "SUB_INCOMING_TEMPERATURE", "SUB_FATIGUE_WEIGHT", "SUB_MAX_GAP_SECONDS",
     "STINT_SAMPLE_SIGMA", "STINT_MAX_SECONDS", "FOUL_OUT_LIMIT", "SHOT_RESULT_BIAS",
-    "HOME_COURT_SHOT_BIAS",
+    "EVENT_BIAS", "TYPE_BIAS", "HOME_COURT_SHOT_BIAS",
 )
 
 
@@ -126,8 +137,9 @@ def tuning_snapshot() -> dict:
     """The live values of every rollout dial (read from this module at call time).
 
     Reading the module globals means edits to this file between runs are reflected accurately, so
-    each evaluation report records exactly the tuning that produced it. ``SHOT_RESULT_BIAS`` is
-    JSON-encoded to a compact string so it sits cleanly in a single Parquet column.
+    each evaluation report records exactly the tuning that produced it. Dict-valued dials
+    (``SHOT_RESULT_BIAS`` / ``EVENT_BIAS`` / ``TYPE_BIAS``) are JSON-encoded to a compact string
+    so each sits cleanly in a single Parquet column.
     """
     import json as _json
     g = globals()
