@@ -173,7 +173,10 @@ HOLDOUT_MANIFEST_NAME = "holdout_games.json"
 # Number of sequential games held out for evaluation after each stage's training boundary.
 HOLDOUT_GAMES = 10
 # Predictions run per holdout game when scoring a stage (the simulator is stochastic; we average).
-STAGE_SIMS = 11
+# Bumped 11 -> 21: the eval averages the per-game sims before scoring, so more sims tighten the
+# box-score means (cuts sampling-noise MAE) and halve the win-vote quantization (1/11 -> 1/21),
+# which flattered the Brier score. eval-all cost scales ~linearly (the batched rollout absorbs it).
+STAGE_SIMS = 21
 # Seasons of training added between stops. A stop is placed every SEASONS_PER_STAGE seasons
 # (the first stop after the first SEASONS_PER_STAGE seasons), and the stop POINT cycles through
 # BOUNDARY_CYCLE across those stops. So with 3: train ~3 seasons -> stop 25% in -> +3 seasons ->
