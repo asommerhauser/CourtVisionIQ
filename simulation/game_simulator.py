@@ -51,6 +51,9 @@ from models.player_model import PlayerModel
 from models.season_features import (
     DEFAULT_REST_DAYS, REST_CLIP_DAYS, TEAM_SCALAR_COLS,
 )
+from models.game_state_features import (
+    GAME_STATE_KEYS, derive_game_state, normalize_game_state,
+)
 from models.stint_length_model import StintLengthModel
 from models.substitution_model import START_TOKEN, SUB_EVENT, SubstitutionModel
 
@@ -822,6 +825,17 @@ class GameSimulator:
         for name in TEAM_SCALAR_COLS:
             buf = np.zeros((SEQ, 1), dtype=np.float32)
             buf[:n, 0] = team_values[name]
+            inputs[name] = buf
+
+        # Game state — running score / period-clock / per-period team fouls. Derived over the
+        # FULL history (inclusive running sums) with the SAME derive_game_state scan used in
+        # preprocess, then windowed to the trailing SEQ — so training and inference see identical
+        # values at each row (the live controller score matches the inclusive per-row sum).
+        gs_raw = derive_game_state(self.history)
+        gs_norm = normalize_game_state(gs_raw)
+        for name in GAME_STATE_KEYS:
+            buf = np.zeros((SEQ, 1), dtype=np.float32)
+            buf[:n, 0] = gs_norm[name][-SEQ:]
             inputs[name] = buf
 
         # 1 for real steps, 0 for padding (attention key-padding mask).

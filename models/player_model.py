@@ -39,6 +39,13 @@ from models.season_features import (
     attach_recency_weights,
     apply_recency,
 )
+from models.game_state_features import (
+    GAME_STATE_INPUT_KEYS,
+    merge_game_state_features,
+    append_game_state_batches,
+    make_game_state_inputs,
+    game_state_projections,
+)
 from reporting import ReportCollector, RunConfig
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
 
@@ -183,6 +190,7 @@ class PlayerModel:
             df, cols, rosters, self.encoder.encode_player("PAD"), train_mask, self.norm_stats,
             refit=refit_norm_stats,
         )
+        merge_game_state_features(df, cols)  # running score / period-clock / team fouls
         train = self._build_split(cols, game_id, train_games)
         test = self._build_split(cols, game_id, test_games)
         holdout = self._build_split(cols, game_id, holdout_games)
@@ -233,6 +241,7 @@ class PlayerModel:
         keys_cont = ["time_abs", "delta_time"]
 
         batches = {k: [] for k in (*keys_1d, *keys_roster, *keys_cont, *SEASON_INPUT_KEYS,
+                                   *GAME_STATE_INPUT_KEYS,
                                    "next_event", "next_delta_time",
                                    "player_target", "pad_mask", "loss_mask")}
 
@@ -263,6 +272,7 @@ class PlayerModel:
                 batches[k].append(buf)
 
             append_season_batches(batches, cols, idx, n, SEQ)
+            append_game_state_batches(batches, cols, idx, n, SEQ)
 
             # Conditioning inputs + target: next-step shift within this game.
             next_event = np.full((SEQ,), PAD_EVENT, dtype=np.int32)
@@ -337,6 +347,7 @@ class PlayerModel:
         time_abs = Input(shape=(SEQ, 1), dtype="float32", name="time_abs")
         delta_time = Input(shape=(SEQ, 1), dtype="float32", name="delta_time")
         rest_home, rest_away, team_inputs = make_season_inputs(SEQ)
+        game_state_inputs = make_game_state_inputs(SEQ)
         next_event = Input(shape=(SEQ,), dtype="int32", name="next_event")
         next_delta_time = Input(shape=(SEQ, 1), dtype="float32", name="next_delta_time")
         pad_mask = Input(shape=(SEQ,), dtype="float32", name="pad_mask")
@@ -368,10 +379,11 @@ class PlayerModel:
         t_delta = layers.Dense(16, name="delta_time_proj")(delta_time)
         t_next_delta = layers.Dense(16, name="next_delta_time_proj")(next_delta_time)
         t_team = season_team_projections(team_inputs)  # games-played + team rest per side
+        t_gs = game_state_projections(game_state_inputs)  # score / period-clock / team fouls
 
         # ---- Fusion ----
         x = layers.Concatenate(axis=-1, name="fusion_concat")(
-            [*embs, next_event_emb, home_vec, away_vec, t_abs, t_delta, t_next_delta, *t_team]
+            [*embs, next_event_emb, home_vec, away_vec, t_abs, t_delta, t_next_delta, *t_team, *t_gs]
         )
         x = layers.Dense(D, name="fusion_projection")(x)
         x = layers.LayerNormalization(epsilon=1e-6, name="fusion_ln")(x)
@@ -413,6 +425,7 @@ class PlayerModel:
             "home_roster": home_roster, "away_roster": away_roster,
             "time_abs": time_abs, "delta_time": delta_time,
             "rest_home": rest_home, "rest_away": rest_away, **team_inputs,
+            **game_state_inputs,
             "next_event": next_event, "next_delta_time": next_delta_time,
             "pad_mask": pad_mask,
         }
@@ -429,7 +442,7 @@ class PlayerModel:
     INPUT_KEYS = (
         "event", "player", "type", "result", "season", "secondary_player",
         "home_roster", "away_roster", "time_abs", "delta_time",
-        *SEASON_INPUT_KEYS,
+        *SEASON_INPUT_KEYS, *GAME_STATE_INPUT_KEYS,
         "next_event", "next_delta_time", "pad_mask",
     )
 
