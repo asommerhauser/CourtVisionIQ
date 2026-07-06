@@ -1,8 +1,8 @@
 # Next-Train Observations
 
-> A running log of issues we've diagnosed and the changes we intend to make on the
-> **next full train**. Nothing here is applied to the live code yet — this is the
-> staging ground so we don't lose the reasoning between trains.
+> A running log of issues we've diagnosed and the changes made across trains. Entries
+> start as OPEN/STAGED reasoning and are marked `APPLIED` (with commit) once they land.
+> Entries 01–04 are the **Train 2.5** scope (in the working tree, pending the cloud run).
 
 Each entry records: what we observed, the root cause, the planned change, why, and
 status. Keep entries append-only; mark a change `APPLIED` (with commit) once it lands
@@ -59,18 +59,20 @@ in a train.
   role from context (the company he keeps + his in-game behavior) rather than from his
   row count.
 
-- **Status:** STAGED (for next train)
+- **Status:** APPLIED (`7a067de`, Train 2.5) — but via **in-graph** candidate masking,
+  not a per-row preprocess mask. `OnCourtCandidateMask` (`models/event_time_model.py`)
+  builds the legal set from the roster inputs already in the graph and biases off-set
+  logits to −1e9 in both train and inference. The substitution head's denominator is
+  `avail_mask` minus the on-court ten (the legal bench).
 
-- **Open questions:**
-  - Build the per-row candidate mask in preprocess vs. the logit-adjustment shortcut —
-    which first?
-  - Outgoing pick is currently identity-blind to stardom (the fatigue nudge pulls a
-    star mid-stint as readily as a scrub). Does the masked-loss fix to the *incoming*
-    head plus the stint head close the gap, or does the outgoing/actor head need the
-    same treatment? (→ Entry 02)
-  - Orthogonal data check: is the sim's available roster the **game-day active list**,
-    not a season-level player set? Inactive players in the pool dilute star minutes
-    regardless of any head change.
+- **Resolved open questions:**
+  - *Per-row mask vs. logit-adjustment:* neither — the in-graph roster-derived mask
+    avoids a ~130 GB per-row npz and the appearance-frequency shortcut entirely.
+  - *Does the incoming fix suffice, or does the actor head need it too?* The actor head
+    got the same treatment this train (→ Entry 02, also APPLIED).
+  - *Game-day active list vs. season pool?* **Answered by code inspection:** the eval's
+    availability set is the union of per-row lineups (`GameInput.home_roster/away_roster`),
+    i.e. the game-day actives minus DNPs — not a diluted season pool. No dilution bug.
 
 ---
 
@@ -99,11 +101,63 @@ in a train.
   (the player-vocab heads); leave the full softmax where inference already uses ~the
   full vocab.
 
-- **Status:** OPEN — decide whether to roll the masked loss into the actor head this
-  train alongside the substitution head, or stage the actor head separately to isolate
-  its effect.
+- **Status:** APPLIED (`7a067de`, Train 2.5) — rolled into the actor head **this** train
+  alongside the substitution head. Actor-head denominator = the on-court ten (both teams;
+  the head also serves the fouler pool); inference still restricts to the acting five, a
+  far smaller train/inference gap than the old ~25-player game pool. A `target_on_court`
+  loss-mask guard zeroes rows whose target isn't in the candidate set (e.g. the pre-`end`
+  sentinel) so a −1e9 target logit can't produce NaN loss.
 
 - **Open questions:**
-  - If the masked loss alone doesn't recover star role, the next lever is model
-    **capacity/layers** (not external features) — revisit only after measuring the
-    masked-loss train.
+  - The `PLAYER_TEMPERATURE=2.0` flattening was a *band-aid* for the un-normalized actor
+    softmax. After this train, retune it **down** (expect ~1.0–1.3) from the lineup probe —
+    a properly normalized head shouldn't need heavy flattening, and the flattening was
+    itself destroying star-vs-role usage separation (a driver of the baseline-MAE loss).
+  - If masked loss alone doesn't recover star role, the next lever is model
+    **capacity/layers** (not external features) — revisit only after measuring this train.
+
+---
+
+### 03. Score-blindness — game-state features into every head
+
+- **Observed:** Sims drift as unanchored random walks. Eval: spread bias **+3.48**, margin
+  correlation **0.197**, FTA **−3.9** / PF **−3.6** per team-game (no catch-up/bonus fouling),
+  and the model loses to the season-to-date baseline on **all 12** per-player counting stats.
+
+- **Root cause:** `GameController` tracks score / possession / period / team fouls, but none
+  of it entered `GameSimulator.build_model_inputs()`. The fusion saw event tokens, rosters,
+  absolute game time, and season context — never the *state of the game*. A transformer can't
+  reconstruct the running score by exact arithmetic over ~500 event tokens, so score-conditional
+  behavior (leaders sitting on leads, trailers fouling/shooting threes, garbage-time margin
+  compression, the bonus manufacturing FTs) was unlearnable.
+
+- **Change:** New `models/game_state_features.py` (mirrors `season_features.py`) feeds six
+  per-row scalars — `score_diff`, `score_total`, `period_idx`, `period_time_left`,
+  `team_fouls_home/away` — `Dense(16)`-projected into the fusion of all six heads. One pure
+  `derive_game_state()` scan feeds BOTH preprocess and the simulator, so train/inference values
+  are identical by construction (fixed-constant normalization, no new `norm_stats` keys).
+
+- **Why:** Same philosophy as feeding rest days explicitly and the controller enforcing rules:
+  hand the model the state, spend capacity on the conditional behavior, not on bookkeeping.
+
+- **Status:** APPLIED (`827f3a1`, Train 2.5).
+
+- **Open questions:**
+  - Deferred to a later train (roster-parallel plumbing): **possession** indicator and
+    **per-player foul counts** for the on-court ten (foul-trouble anticipation).
+  - After the train, re-measure the FTA/PF deficit; residual is a `EVENT_BIAS["foul"]` dial,
+    not a retrain.
+
+---
+
+### 04. Post-train inference dials (no retrain) + eval resolution
+
+- **`EVENT_BIAS` / `TYPE_BIAS`** (`config.py`, APPLIED `7fb87b7`): per-event and per-head-token
+  logit offsets threaded through `_sample_event` / `predict_type` (same hook as `SHOT_RESULT_BIAS`).
+  Default `{}` = no-op. Tune post-train from the eval team-bias table (expect `foul` +, `assist` −,
+  `turnover`/`steal` −) once the game-state features have shifted the base event mix.
+- **`STAGE_SIMS` 11 → 21** (`config.py`, APPLIED `b806fa7`): the eval averages sims before scoring,
+  so more sims cut box-score sampling-noise MAE and halve the win-vote quantization (1/11 → 1/21)
+  that flattered Brier.
+- **Status:** APPLIED. These are the levers to reach for **after** the weights come back, before
+  any thought of another train.
