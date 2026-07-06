@@ -52,5 +52,5 @@
     "23": "transition take"
   },
   "next_token": 24,
-  "frozen": true
+  "frozen": false
 }
