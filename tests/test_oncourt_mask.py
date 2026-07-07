@@ -97,9 +97,9 @@ def test_layer_restricts_to_on_court(tmp_path):
     on = {1, 2, 3}
     for v in range(V):
         if v in on:
-            assert out[v] > -1e8, f"on-court id {v} should stay finite"
+            assert out[v] > -1e3, f"on-court id {v} should stay ~unchanged"
         else:
-            assert out[v] < -1e8, f"id {v} (incl. PAD 0) should be masked"
+            assert -1e5 < out[v] < -1e3, f"id {v} (incl. PAD 0) should be masked (finite)"
 
 
 def test_layer_excludes_on_court_from_avail(tmp_path):
@@ -110,9 +110,24 @@ def test_layer_excludes_on_court_from_avail(tmp_path):
     away = tf.constant([[[3, 0]]], dtype=tf.int32)
     avail = tf.constant([[0, 1, 1, 1, 1, 1, 0, 0]], dtype=tf.float32)  # ids 1..5 in the game
     out = OnCourtCandidateMask(exclude_on_court=True)(logits, home, away, avail).numpy()[0, 0]
-    assert out[4] > -1e8 and out[5] > -1e8          # available, off-court -> bench
+    assert out[4] > -1e3 and out[5] > -1e3          # available, off-court -> bench
     for v in (0, 1, 2, 3, 6, 7):                    # PAD / on-court / out of game
-        assert out[v] < -1e8, f"id {v} should be masked"
+        assert -1e5 < out[v] < -1e3, f"id {v} should be masked (finite)"
+
+
+def test_mask_is_finite_and_float32_under_float16_logits():
+    """Regression: under mixed precision the logits reach the layer as float16. A -1e9 bias
+    would overflow to -inf there and make a masked target's cross-entropy NaN (0*inf on a
+    loss-masked row). The mask must stay finite and emit float32."""
+    V = 8
+    logits = tf.zeros((1, 1, V), dtype=tf.float16)          # what mixed_float16 feeds the layer
+    home = tf.constant([[[1, 2]]], dtype=tf.int32)
+    away = tf.constant([[[3, 0]]], dtype=tf.int32)
+    out = OnCourtCandidateMask()(logits, home, away)
+    assert out.dtype == tf.float32                          # stable logits into cross-entropy
+    arr = out.numpy()[0, 0]
+    assert np.isfinite(arr).all()                           # no -inf anywhere
+    assert arr[5] < -1e3 and arr[1] > -1e3                  # still masks off-court, keeps on-court
 
 
 def test_layer_serialization_round_trip():
@@ -165,13 +180,14 @@ def test_player_logits_masked_to_on_court(tmp_path):
     a_id = m.encoder.encode_player("A")
     k_id = m.encoder.encode_player("K")
     pad = m.encoder.encode_player("PAD")
+    # Masked logits are large-negative but FINITE (float16-safe NEG=-1e4), not < -1e8.
     # Row 1 (first shot): full fives on court, K on the bench.
-    assert logits[0, 1, a_id] > -1e8
-    assert logits[0, 1, k_id] < -1e8
+    assert logits[0, 1, a_id] > -1e3
+    assert logits[0, 1, k_id] < -1e3
     # Row 4 (post-sub shot): K on court, A subbed out.
-    assert logits[0, 4, k_id] > -1e8
-    assert logits[0, 4, a_id] < -1e8
-    assert logits[:, :, pad].max() < -1e8
+    assert logits[0, 4, k_id] > -1e3
+    assert logits[0, 4, a_id] < -1e3
+    assert logits[:, :, pad].max() < -1e3
 
 
 def test_player_masked_loss_is_finite(tmp_path):

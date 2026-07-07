@@ -111,11 +111,16 @@ class ApplyAvailabilityMask(layers.Layer):
     over the SEQ axis.
     """
 
-    NEG = -1e9
+    # Float16-safe: -1e9 overflows to -inf in float16 (mixed precision), and a masked target
+    # then yields an infinite cross-entropy -> 0*inf = NaN on loss-masked rows. -1e4 is finite
+    # in float16 yet still zeroes the softmax (exp(-1e4)=0). Compute + output in float32 so the
+    # logits feeding cross-entropy are stable regardless of the mixed-precision policy.
+    NEG = -1e4
 
     def call(self, logits, avail_mask):
-        bias = (1.0 - tf.cast(avail_mask, logits.dtype)) * self.NEG  # (B, V)
-        return logits + tf.expand_dims(bias, axis=1)                 # broadcast over SEQ
+        logits = tf.cast(logits, tf.float32)
+        bias = (1.0 - tf.cast(avail_mask, tf.float32)) * self.NEG  # (B, V)
+        return logits + tf.expand_dims(bias, axis=1)               # broadcast over SEQ
 
     def compute_output_shape(self, logits_shape, avail_mask_shape=None):
         return logits_shape
@@ -151,11 +156,16 @@ class OnCourtCandidateMask(layers.Layer):
     Rows whose target falls outside the candidate set must be zeroed in the loss mask by the
     caller (see the target-in-candidates guards in the heads' ``_build_split``).
 
+    ``NEG`` is float16-safe: -1e9 overflows to -inf under mixed precision, and a masked target
+    then gives an infinite cross-entropy -> 0*inf = NaN on the loss-masked guard rows. -1e4 is
+    finite in float16 yet still zeroes the softmax (exp(-1e4)=0); the masked logits are emitted
+    in float32 so cross-entropy is stable no matter the global mixed-precision policy.
+
     Inputs: ``logits`` (B, SEQ, V), ``home_roster`` / ``away_roster`` (B, SEQ, ROSTER_SIZE)
     int ids, and — in exclude mode — ``avail_mask`` (B, V).
     """
 
-    NEG = -1e9
+    NEG = -1e4
     PAD_ID = 0  # player vocab reserves PAD=0 (encoder/vocab.py)
 
     def __init__(self, exclude_on_court: bool = False, **kwargs):
@@ -180,7 +190,8 @@ class OnCourtCandidateMask(layers.Layer):
         # PAD (id 0) is never a candidate (roster buffers pad with it).
         pad_col = tf.one_hot(tf.fill(tf.shape(ids)[:2], self.PAD_ID), V, dtype=tf.float32)
         cand = cand * (1.0 - pad_col)
-        return logits + tf.cast((1.0 - cand) * self.NEG, logits.dtype)
+        # float32 output + float16-safe NEG so a masked target can't become -inf -> NaN loss.
+        return tf.cast(logits, tf.float32) + (1.0 - cand) * self.NEG
 
     def compute_output_shape(self, logits_shape, *_, **__):
         return logits_shape

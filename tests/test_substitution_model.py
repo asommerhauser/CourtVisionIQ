@@ -195,8 +195,8 @@ def test_avail_mask_restricts_logits_to_available_players(tmp_path):
     model = m.model(num_layers=1, num_heads=2, ff_dim=32)
     inputs = {k: train[k] for k in m.INPUT_KEYS}
     logits = model(inputs, training=False)[m.output_name].numpy()  # (G, SEQ, V)
-    assert logits[:, :, pad].max() < -1e8
-    assert np.isfinite(logits[:, :, a_id]).all() and logits[:, :, a_id].max() > -1e8
+    assert logits[:, :, pad].max() < -1e3      # masked, large-negative but float16-safe finite
+    assert np.isfinite(logits[:, :, a_id]).all() and logits[:, :, a_id].max() > -1e3
 
 # Train / from_artifacts / full-keras-load / ModelBundle round-trip coverage lives in
 # tests/test_model_persistence.py (the shared parametrized adapter for every model).
