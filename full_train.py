@@ -20,6 +20,12 @@ mid-eval? Re-run `eval` — finished games are skipped.
 from __future__ import annotations
 
 import argparse
+import os
+
+# Let several sharded eval-all processes share one GPU: each grows its allocation instead of
+# grabbing all VRAM up front (otherwise the 2nd process OOMs). Must be set before TF imports,
+# and importing FullRun pulls in keras, so set it here at the very top.
+os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
 
 from training.full_run import DEFAULT_STATE_PATH, FullRun
 
@@ -39,8 +45,17 @@ def main() -> None:
     sub.add_parser("retrain-shot-type",
                    help="Retrain ONLY shot_type on the existing cond_*.npz (live FGs {2pt,3pt} only).")
     sub.add_parser("eval", help="Predict the next batch of holdout games, then stop.")
-    sub.add_parser("eval-all",
-                   help="Predict ALL holdout games straight through (paid-GPU run), reporting every batch.")
+    p_eval_all = sub.add_parser(
+        "eval-all",
+        help="Predict ALL holdout games straight through (paid-GPU run), reporting every batch.")
+    p_eval_all.add_argument(
+        "--num-shards", type=int, default=1,
+        help="Split the holdout across N parallel processes (run one per shard on the same GPU "
+             "to bypass the single-process CPU/GIL bottleneck). Rebuild the full report with a "
+             "final unsharded `eval-all` once every shard finishes.")
+    p_eval_all.add_argument(
+        "--shard", type=int, default=0,
+        help="Which shard (0..num-shards-1) this process handles: holdout games [shard::num-shards].")
     sub.add_parser("status", help="Show progress.")
     sub.add_parser("report", help="Rebuild the aggregate report over finished games.")
 
@@ -57,7 +72,7 @@ def main() -> None:
     elif args.command == "eval":
         run.eval()
     elif args.command == "eval-all":
-        run.eval_all()
+        run.eval_all(shard=args.shard, num_shards=args.num_shards)
     elif args.command == "status":
         run.status()
     elif args.command == "report":

@@ -167,25 +167,50 @@ class FullRun:
         print("=" * 70)
 
     # --------------------------------------------------------------- eval-all
-    def eval_all(self) -> None:
+    def eval_all(self, *, shard: int = 0, num_shards: int = 1) -> None:
         """Predict the WHOLE holdout straight through in one process (no stopping), writing an
         intermediate report every ``eval_batch`` games. For an uninterrupted paid-GPU run; the
-        batched ``eval`` above is the local interrupt-friendly path. Resumes over finished games."""
+        batched ``eval`` above is the local interrupt-friendly path. Resumes over finished games.
+
+        The rollout is CPU/GIL-bound (one process leaves the GPU mostly idle), so ``num_shards``
+        lets you run several processes in parallel — each takes the disjoint slice
+        ``holdout[shard::num_shards]``, writes its own per-game folders, and they share the GPU
+        (allocation grows per process; see ``TF_FORCE_GPU_ALLOW_GROWTH`` in full_train.py). Because
+        every game is cached to its own folder, the aggregate report is just a final **unsharded**
+        ``eval-all`` once the shards finish: it re-reads every cached game and writes the real
+        report without re-simulating anything."""
         from simulation.stage_eval import evaluate_stage
 
         self._require()
         if self.state["status"] != "trained":
             print("[eval-all] not trained yet — run:  python full_train.py train")
             return
+
+        holdout = self.state["holdout_game_ids"]
+        sharded = num_shards > 1
+        if sharded:
+            if not 0 <= shard < num_shards:
+                raise SystemExit(f"--shard must be in [0, {num_shards}); got {shard}.")
+            holdout = holdout[shard::num_shards]
+            print(f"[eval-all] shard {shard + 1}/{num_shards}: {len(holdout)} of "
+                  f"{len(self.state['holdout_game_ids'])} holdout games "
+                  f"(run all {num_shards} shards, then one plain `eval-all` for the full report).")
+
         report = evaluate_stage(
-            RUN_NAME, holdout_ids=self.state["holdout_game_ids"], n_sims=STAGE_SIMS,
-            max_new=None, report_every=self.state["eval_batch"], data_dir=self.state["data_dir"],
-            processed_dir=self.state["processed_dir"], artifacts_root=self.state["artifacts_root"],
-            reports_root=self.state["reports_root"],
+            RUN_NAME, holdout_ids=holdout, n_sims=STAGE_SIMS,
+            # A sharded process only covers its slice, so its report is partial — skip the
+            # intermediate report writes (the final unsharded pass builds the real one).
+            max_new=None, report_every=None if sharded else self.state["eval_batch"],
+            data_dir=self.state["data_dir"], processed_dir=self.state["processed_dir"],
+            artifacts_root=self.state["artifacts_root"], reports_root=self.state["reports_root"],
         )
         print("\n" + "=" * 70)
-        print(f"DONE — all {report['done']}/{report['total']} holdout games predicted. Final report:")
-        print(f"  {report['run_dir']}")
+        if sharded:
+            print(f"DONE — shard {shard + 1}/{num_shards}: {report['done']} games simulated. "
+                  f"When ALL shards finish, run:  python full_train.py eval-all")
+        else:
+            print(f"DONE — all {report['done']}/{report['total']} holdout games predicted. "
+                  f"Final report:\n  {report['run_dir']}")
         print("=" * 70)
 
     # ------------------------------------------------------- retrain-shot-type
