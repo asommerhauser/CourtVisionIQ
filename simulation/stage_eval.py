@@ -25,12 +25,12 @@ import json
 import re
 from pathlib import Path
 
-from config import HOLDOUT_MANIFEST_NAME, ROLLOUT_BATCH_SIZE, STAGE_SIMS
+from config import EVAL_GAMES_PER_BATCH, HOLDOUT_MANIFEST_NAME, ROLLOUT_BATCH_SIZE, STAGE_SIMS
 from data_loading import load_all_cleaned
 from models.artifacts import DEFAULT_ARTIFACTS_ROOT
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
 from simulation.box_score import BoxScore, PlayerLine, generate_box_score
-from simulation.evaluation import _aggregate, _print_summary, build_game_record, simulate_repeated
+from simulation.evaluation import _aggregate, _print_summary, build_game_record, simulate_games
 from simulation.game_input import extract_game_input
 from simulation.game_simulator import GameSimulator
 from simulation.predict_game import (
@@ -116,7 +116,8 @@ def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
                    artifacts_root: str = DEFAULT_ARTIFACTS_ROOT,
                    reports_root: str = DEFAULT_REPORTS_ROOT,
                    predictions_root: str = DEFAULT_OUTPUT_ROOT, seed0: int = 0,
-                   batch_size: int = ROLLOUT_BATCH_SIZE) -> dict:
+                   batch_size: int = ROLLOUT_BATCH_SIZE,
+                   games_per_batch: int = EVAL_GAMES_PER_BATCH) -> dict:
     """Predict a stage's holdout games (``n_sims`` each), write per-game folders + a stage report.
 
     ``holdout_ids`` defaults to the manifest the stage's preprocess wrote (``holdout_games.json``).
@@ -156,6 +157,9 @@ def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
 
     records: list[dict] = []
     new_done = 0
+
+    # Pass 1: reload cached (finished) games; collect the rest as pending work.
+    pending: list[dict] = []
     for gid in holdout_ids:
         game = df[df["game_id"] == int(gid)].sort_values("time")
         if game.empty:
@@ -170,31 +174,44 @@ def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
             records.append(json.loads(cached.read_text(encoding="utf-8")))
             continue
 
-        if max_new is not None and new_done >= max_new:
-            continue  # batch limit hit — leave this (unfinished) game for a later call
+        pending.append({"gid": gid, "game": game, "home_team": home_team,
+                        "away_team": away_team, "out_dir": out_dir})
 
-        if sim is None:
-            sim = GameSimulator.load(artifacts_root=artifacts_root)
-        print(f"  game {gid} ({away_team} at {home_team}): {n_sims} sims...")
-        spec = extract_game_input(game)
-        try:
-            home_starters, away_starters = _real_starters(game)
-        except ValueError:
-            home_starters = away_starters = None
-        boxes, histories = simulate_repeated(
-            sim, spec, home_starters, away_starters, n_sims=n_sims, seed0=seed0,
-            home_team=home_team, away_team=away_team, return_histories=True,
-            batch_size=batch_size, show_progress=True,
-        )
-        record = build_game_record(game, boxes, n_sims=n_sims,
-                                   home_team=home_team, away_team=away_team)
-        _write_game_folder(out_dir, game, spec, boxes, histories, record, home_team, away_team)
-        records.append(record)
-        new_done += 1
+    if max_new is not None:
+        pending = pending[:max_new]  # cap NEW games this call; the rest wait for a later call
 
-        if report_every and new_done % report_every == 0:
-            print(f"  [report] {new_done} new games done — flushing intermediate report...")
-            _flush_report()
+    # Pass 2: simulate the pending games in pools of ``games_per_batch`` so each batched rollout
+    # fills the GPU (one game alone leaves it ~10% utilized). Resolve each game's matchup + real
+    # starters once, then pool their sims into a single run.
+    if pending:
+        sim = GameSimulator.load(artifacts_root=artifacts_root)
+        for p in pending:
+            p["spec"] = extract_game_input(p["game"])
+            try:
+                p["home_starters"], p["away_starters"] = _real_starters(p["game"])
+            except ValueError:
+                p["home_starters"] = p["away_starters"] = None
+
+        total_new = len(pending)
+        for start in range(0, total_new, games_per_batch):
+            chunk = pending[start:start + games_per_batch]
+            gids = ", ".join(str(p["gid"]) for p in chunk)
+            print(f"  simulating games {start + 1}-{start + len(chunk)}/{total_new} "
+                  f"({n_sims} sims each, {len(chunk)} games pooled): {gids} ...")
+            game_specs = [(p["spec"], p["home_starters"], p["away_starters"],
+                           p["home_team"], p["away_team"]) for p in chunk]
+            results = simulate_games(sim, game_specs, n_sims=n_sims, seed0=seed0,
+                                     batch_size=batch_size, show_progress=True)
+            for p, (boxes, histories) in zip(chunk, results):
+                record = build_game_record(p["game"], boxes, n_sims=n_sims,
+                                           home_team=p["home_team"], away_team=p["away_team"])
+                _write_game_folder(p["out_dir"], p["game"], p["spec"], boxes, histories,
+                                   record, p["home_team"], p["away_team"])
+                records.append(record)
+                new_done += 1
+                if report_every and new_done % report_every == 0:
+                    print(f"  [report] {new_done} new games done — flushing intermediate report...")
+                    _flush_report()
 
     report = _flush_report()
     print(f"\n  {len(records)}/{len(holdout_ids)} holdout games done "

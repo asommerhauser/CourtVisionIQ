@@ -102,6 +102,43 @@ def simulate_repeated(sim: GameSimulator, spec, home_starters, away_starters, *,
     return (boxes, histories) if return_histories else boxes
 
 
+def simulate_games(sim: GameSimulator, games: list, *, n_sims: int, seed0: int,
+                   batch_size: int = ROLLOUT_BATCH_SIZE, show_progress: bool = False):
+    """Pool ``n_sims`` sims for **several** games into ONE batched rollout, then split back per game.
+
+    A single game only keeps ~2 sims on the same head at once (its sims desync across the event/
+    actor/type/… heads), so the GPU sits mostly idle. Pooling many games' sims fills the batch. This
+    is pure scheduling — every job keeps its own seed, so each game's box scores are identical to
+    running it alone (deterministic heads) / distribution-equivalent (sampled heads). One process, so
+    no cross-process VRAM contention.
+
+    ``games`` is a list of ``(spec, home_starters, away_starters, home_team, away_team)``. Returns a
+    list of ``(boxes, histories)`` aligned to ``games``.
+    """
+    from simulation.batched_rollout import GameJob, run_jobs_batched
+
+    jobs: list[GameJob] = []
+    spans: list[tuple[int, int, str, str]] = []   # (start, end, home_team, away_team) per game
+    for spec, home_starters, away_starters, home_team, away_team in games:
+        start = len(jobs)
+        for s in range(n_sims):
+            jobs.append(GameJob(
+                home_roster=spec.home_roster, away_roster=spec.away_roster,
+                season=str(spec.season), home_starters=home_starters, away_starters=away_starters,
+                season_context=spec.season_context(), seed=seed0 + s))
+        spans.append((start, len(jobs), home_team, away_team))
+
+    histories = run_jobs_batched(sim, jobs, batch_size=batch_size, show_progress=show_progress)
+
+    out: list[tuple[list[BoxScore], list[list[dict]]]] = []
+    for start, end, home_team, away_team in spans:
+        game_histories = histories[start:end]
+        boxes = [generate_box_score(h, home_team=home_team, away_team=away_team)
+                 for h in game_histories]
+        out.append((boxes, game_histories))
+    return out
+
+
 # --------------------------------------------------------------------------- box aggregation
 
 def _side_lines(box: BoxScore, side: str):

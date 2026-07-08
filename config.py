@@ -95,9 +95,17 @@ SUB_MAX_GAP_SECONDS = 420.0
 # Number of independent game-sims the batched rollout runs concurrently, pooling their per-event
 # forward passes into one batched GPU call (simulation/batched_rollout.py). >1 enables batching; 1 is
 # the original one-at-a-time path. The win comes from amortizing batch-1 kernel-launch overhead, so
-# size it to how many games fit in VRAM (the model is small — dozens are fine). It does NOT affect
-# results (pure scheduling), so it's a perf knob, not a tuning dial.
-ROLLOUT_BATCH_SIZE = 16
+# size it to how many concurrent sims fit in VRAM (the heads are small — dozens are fine). It does NOT
+# affect results (pure scheduling), so it's a perf knob, not a tuning dial. 48 keeps the batch full
+# across the pooled games (see EVAL_GAMES_PER_BATCH) so the GPU isn't starved by a single game's ~2-wide
+# effective batch (its sims desync across heads). Lower it if concurrent workers pressure the GPU.
+ROLLOUT_BATCH_SIZE = 48
+# Eval pools this many holdout games' sims into ONE batched rollout so the GPU sees a full batch
+# (one game alone only keeps ~2 sims on the same head at a time -> the card sat ~10% utilized). With
+# STAGE_SIMS sims each, the pool is EVAL_GAMES_PER_BATCH*STAGE_SIMS concurrent sims, run in cohorts of
+# ROLLOUT_BATCH_SIZE. Pure scheduling — results are unchanged (each sim keeps its own seed). Runs in a
+# single process (no cross-process VRAM contention). Lower it if system RAM/thread pressure is high.
+EVAL_GAMES_PER_BATCH = 6
 
 # --- Stint-length scheduler (StintLengthModel + GameController hybrid scheduler) ---
 # When the stint-length head is loaded, the Controller commits each entering player to a stint:
