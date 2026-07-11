@@ -25,8 +25,8 @@ from datetime import datetime
 from pathlib import Path
 
 from config import (
-    DEFAULT_VERSION, EVAL_BATCH, FINAL_HOLDOUT_GAMES, FINAL_SEASON_FRACTION,
-    SEED, STAGE_SIMS, SUBSET_MODEL_KEYS, TEST_FRAC,
+    DEFAULT_VERSION, EVAL_BATCH, EVAL_GAMES_PER_BATCH, FINAL_HOLDOUT_GAMES, FINAL_SEASON_FRACTION,
+    ROLLOUT_BATCH_SIZE, SEED, STAGE_SIMS, SUBSET_MODEL_KEYS, TEST_FRAC,
 )
 from models.artifacts import version_root
 from models.registry import STAGE_MODEL_KEYS
@@ -155,7 +155,19 @@ class FullRun:
         print("=" * 70)
 
     # --------------------------------------------------------------- eval
-    def eval(self) -> None:
+    def eval(self, *, version: str | None = None, name: str | None = None,
+             n_sims: int | None = None, concurrency: int | None = None,
+             max_new: int | None = None, report_every: int | None = None) -> None:
+        """Predict the holdout into a results run at results/v<version>/<eval-name>/.
+
+        ``version`` defaults to the trained run's version. ``name`` names the eval folder (default:
+        auto-increment ``eval-NNN``, resuming the latest incomplete one). ``n_sims`` = Monte-Carlo
+        sims per game (--monte-carlo); ``concurrency`` = holdout games simulated in parallel, whose
+        sims are pooled into one batched GPU pass (--concurrency). ``max_new`` caps NEW games this
+        call (batched / interrupt-friendly); ``None`` runs the whole holdout, flushing an intermediate
+        report every ``report_every`` games.
+        """
+        from reporting.eval_report import resolve_results_run_dir
         from simulation.stage_eval import evaluate_stage
 
         self._require()
@@ -163,47 +175,31 @@ class FullRun:
             print("[eval] not trained yet — run:  python train.py --full --version "
                   f"{self.state.get('version', DEFAULT_VERSION)} --batch-size {self.state['batch_size']}")
             return
+
+        version = version or self.state.get("version", DEFAULT_VERSION)
+        n_sims = n_sims or STAGE_SIMS
+        games_per_batch = concurrency or EVAL_GAMES_PER_BATCH
+        # Cohort wide enough to run every pooled sim (concurrency games × n_sims) at once, so the
+        # pool isn't split across cohorts; GameSimulator batches them into one forward pass per head.
+        batch_size = max(ROLLOUT_BATCH_SIZE, games_per_batch * n_sims)
+        holdout = self.state["holdout_game_ids"]
+        run_dir = resolve_results_run_dir(version, name=name, holdout_total=len(holdout))
+        self.state["last_eval_name"] = run_dir.name
+        self._save()
+
         report = evaluate_stage(
-            self.state["run_name"], holdout_ids=self.state["holdout_game_ids"], n_sims=STAGE_SIMS,
-            max_new=self.state["eval_batch"], data_dir=self.state["data_dir"],
-            processed_dir=self.state["processed_dir"], artifacts_root=self.state["artifacts_root"],
-            reports_root=self.state["reports_root"],
+            f"v{version}", holdout_ids=holdout, n_sims=n_sims, max_new=max_new,
+            report_every=report_every, data_dir=self.state["data_dir"],
+            processed_dir=self.state["processed_dir"], artifacts_root=version_root(version),
+            results_run_dir=run_dir, batch_size=batch_size, games_per_batch=games_per_batch,
         )
         done, total = report["done"], report["total"]
         print("\n" + "=" * 70)
         if done >= total:
-            print(f"STOP — all {total} holdout games predicted. Final report:")
-            print(f"  {report['run_dir']}")
+            print(f"DONE — all {total} holdout games predicted. Report:")
         else:
-            print(f"STOP — {done}/{total} holdout games done. Take a break if you like.")
-            print(f"  When ready, predict the next batch:  python evaluate.py --version "
-                  f"{self.state.get('version', DEFAULT_VERSION)}")
-        print("=" * 70)
-
-    # --------------------------------------------------------------- eval-all
-    def eval_all(self) -> None:
-        """Predict the WHOLE holdout straight through in one process (no stopping), writing an
-        intermediate report every ``eval_batch`` games. For an uninterrupted paid-GPU run; the
-        batched ``eval`` above is the local interrupt-friendly path. Resumes over finished games.
-
-        The rollout pools ``EVAL_GAMES_PER_BATCH`` games' sims into each batched forward pass so the
-        GPU stays fed (a single game alone leaves it ~10% utilized); it's one process, so there's no
-        cross-process VRAM contention."""
-        from simulation.stage_eval import evaluate_stage
-
-        self._require()
-        if self.state["status"] != "trained":
-            print("[eval-all] not trained yet — run:  python train.py --full --version "
-                  f"{self.state.get('version', DEFAULT_VERSION)} --batch-size {self.state['batch_size']}")
-            return
-        report = evaluate_stage(
-            self.state["run_name"], holdout_ids=self.state["holdout_game_ids"], n_sims=STAGE_SIMS,
-            max_new=None, report_every=self.state["eval_batch"], data_dir=self.state["data_dir"],
-            processed_dir=self.state["processed_dir"], artifacts_root=self.state["artifacts_root"],
-            reports_root=self.state["reports_root"],
-        )
-        print("\n" + "=" * 70)
-        print(f"DONE — all {report['done']}/{report['total']} holdout games predicted. Final report:")
+            print(f"STOP — {done}/{total} holdout games done. Re-run to continue:")
+            print(f"  python evaluate.py --version {version} --name {run_dir.name}")
         print(f"  {report['run_dir']}")
         print("=" * 70)
 
@@ -279,20 +275,26 @@ class FullRun:
         print("[retrain-shot-type] done — shot_type now trained on {2pt, 3pt} only.")
 
     # --------------------------------------------------------------- report / status
-    def report(self) -> None:
+    def report(self, *, version: str | None = None, name: str | None = None) -> None:
+        """Rebuild the aggregate report over an eval run's finished games (no new sims)."""
+        from reporting.eval_report import resolve_results_run_dir
         from simulation.stage_eval import evaluate_stage
 
         self._require()
+        version = version or self.state.get("version", DEFAULT_VERSION)
+        name = name or self.state.get("last_eval_name")
+        holdout = self.state["holdout_game_ids"]
+        run_dir = resolve_results_run_dir(version, name=name, holdout_total=len(holdout))
         report = evaluate_stage(
-            self.state["run_name"], holdout_ids=self.state["holdout_game_ids"], n_sims=STAGE_SIMS, max_new=0,
+            f"v{version}", holdout_ids=holdout, n_sims=STAGE_SIMS, max_new=0,
             data_dir=self.state["data_dir"], processed_dir=self.state["processed_dir"],
-            artifacts_root=self.state["artifacts_root"], reports_root=self.state["reports_root"],
+            artifacts_root=version_root(version), results_run_dir=run_dir,
         )
         print(f"[report] {report['done']}/{report['total']} games -> {report['run_dir']}")
 
     def status(self) -> None:
         self._require()
-        print(f"Full run: status={self.state['status']}, "
+        print(f"Full run: version={self.state.get('version', '?')}, status={self.state['status']}, "
               f"models trained {len(self.state.get('trained_models', []))}/{len(STAGE_MODEL_KEYS)}, "
               f"holdout {len(self.state['holdout_game_ids'])} games, "
               f"weights {self.state['artifacts_root']}")

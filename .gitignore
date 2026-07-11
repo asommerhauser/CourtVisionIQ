@@ -28,3 +28,6 @@ htmlcov/
 # Cloud-upload tarballs / local report backups
 seasons.tgz
 reports_train1_backup.tgz
+
+# Evaluation / test-run outputs (results/v<version>/<eval-name>/); regenerated, not tracked
+/results/

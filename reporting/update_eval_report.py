@@ -11,10 +11,10 @@ By default it rewrites the report in place (same run id / folder), preserving th
 identity, timestamp, git commit, and tuning snapshot. Pass ``--out-root`` to write a fresh copy
 under a different reports root instead.
 
-    # update the report the conversation referenced, in place
-    python -m reporting.update_eval_report reports/evaluation/20260628-074942-a9a72f-full-train
+    # update one results run, in place
+    python -m reporting.update_eval_report results/v1.0/eval-001
 
-    # update every evaluation report under the default root
+    # update every evaluation report under the default results root
     python -m reporting.update_eval_report --all
 """
 from __future__ import annotations
@@ -23,8 +23,7 @@ import argparse
 import json
 from pathlib import Path
 
-from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
-from reporting.eval_report import build_report, write_eval_report
+from reporting.eval_report import DEFAULT_RESULTS_ROOT, build_report, write_eval_report
 from simulation.eval_metrics import _aggregate
 
 
@@ -58,18 +57,18 @@ def update_report(run_dir: str | Path, *, out_root: str | None = None) -> Path:
         if report.get(field) is not None:
             rebuilt[field] = report[field]
 
-    # In place: write back under this run's reports root (<root>/evaluation/<run_id>/).
-    reports_root = out_root if out_root is not None else str(run_dir.parent.parent)
-    written = write_eval_report(rebuilt, reports_root=reports_root)
+    # In place (results layout): report.html + report.json at the run root, parquet under data/.
+    target = (Path(out_root) / run_dir.name) if out_root is not None else run_dir
+    written = write_eval_report(rebuilt, run_dir=target)
     return written
 
 
-def _discover(reports_root: str) -> list[Path]:
-    """Every evaluation run dir (one with a report.json) under ``reports_root``."""
-    base = Path(reports_root) / "evaluation"
+def _discover(results_root: str) -> list[Path]:
+    """Every evaluation run dir (one with a report.json) under results/v<version>/<eval-name>/."""
+    base = Path(results_root)
     if not base.exists():
         return []
-    return sorted(p.parent for p in base.glob("*/report.json"))
+    return sorted(p.parent for p in base.glob("v*/*/report.json"))
 
 
 def main() -> None:
@@ -77,17 +76,17 @@ def main() -> None:
     ap.add_argument("run_dir", nargs="?", default=None,
                     help="Path to a run dir (the folder containing report.json).")
     ap.add_argument("--all", action="store_true",
-                    help="Update every evaluation report under --reports-root.")
-    ap.add_argument("--reports-root", default=DEFAULT_REPORTS_ROOT,
-                    help="Reports root for --all discovery / default in-place root.")
+                    help="Update every evaluation report under --results-root.")
+    ap.add_argument("--results-root", default=DEFAULT_RESULTS_ROOT,
+                    help="Results root for --all discovery.")
     ap.add_argument("--out-root", default=None,
                     help="Write the rebuilt report(s) under this root instead of in place.")
     args = ap.parse_args()
 
     if args.all:
-        targets = _discover(args.reports_root)
+        targets = _discover(args.results_root)
         if not targets:
-            print(f"No evaluation reports found under {args.reports_root}/evaluation/.")
+            print(f"No evaluation reports found under {args.results_root}/v*/.")
             return
     elif args.run_dir:
         targets = [Path(args.run_dir)]

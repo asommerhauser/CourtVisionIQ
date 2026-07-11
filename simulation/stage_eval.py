@@ -28,6 +28,7 @@ from pathlib import Path
 from config import EVAL_GAMES_PER_BATCH, HOLDOUT_MANIFEST_NAME, ROLLOUT_BATCH_SIZE, STAGE_SIMS
 from data_loading import load_all_cleaned
 from models.artifacts import DEFAULT_ARTIFACTS_ROOT
+from reporting.game_report import render_game_html
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
 from simulation.box_score import BoxScore, PlayerLine, generate_box_score
 from simulation.evaluation import _aggregate, _print_summary, build_game_record, simulate_games
@@ -78,23 +79,31 @@ def _averaged_box(record: dict, home_team: str, away_team: str) -> BoxScore:
 
 def _write_game_folder(out_dir: Path, game, spec, boxes, histories, record,
                        home_team: str, away_team: str) -> None:
-    """Persist one game's actual + averaged-prediction box scores and all sim play-by-plays."""
+    """Persist one game's actual + averaged-prediction box scores, an HTML report, and all sim
+    play-by-plays. Box CSVs + ``game.html`` + ``record.json`` sit at the game folder root; the
+    generated (and actual) play-by-plays go in a deeper ``playbyplay/`` folder."""
     out_dir.mkdir(parents=True, exist_ok=True)
 
     actual_box = generate_box_score(game, home_team=home_team, away_team=away_team)
     actual_box.to_frame("home").to_csv(out_dir / "actual_boxscore_home.csv", index=False)
     actual_box.to_frame("away").to_csv(out_dir / "actual_boxscore_away.csv", index=False)
     (out_dir / "actual_boxscore.txt").write_text(actual_box.render(), encoding="utf-8")
-    game.reindex(columns=CLEANED_COLUMNS).to_csv(out_dir / "actual_playbyplay.csv", index=False)
 
     pred_box = _averaged_box(record, home_team, away_team)
     pred_box.to_frame("home").to_csv(out_dir / "pred_boxscore_home.csv", index=False)
     pred_box.to_frame("away").to_csv(out_dir / "pred_boxscore_away.csv", index=False)
     (out_dir / "pred_boxscore.txt").write_text(pred_box.render(), encoding="utf-8")
 
+    # Per-game HTML: predicted (mean) / actual (raw) / variance box scores.
+    (out_dir / "game.html").write_text(
+        render_game_html(record, home_team=home_team, away_team=away_team), encoding="utf-8")
+
+    pbp_dir = out_dir / "playbyplay"
+    pbp_dir.mkdir(parents=True, exist_ok=True)
+    game.reindex(columns=CLEANED_COLUMNS).to_csv(pbp_dir / "actual_playbyplay.csv", index=False)
     for i, history in enumerate(histories, start=1):
         frame = history_to_cleaned_frame(history, spec, game_id=int(record["game_id"]))
-        frame.to_csv(out_dir / f"sim_{i:02d}_playbyplay.csv", index=False)
+        frame.to_csv(pbp_dir / f"sim_{i:02d}_playbyplay.csv", index=False)
 
     run_meta = {
         "game_id": record["game_id"],
@@ -117,7 +126,8 @@ def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
                    reports_root: str = DEFAULT_REPORTS_ROOT,
                    predictions_root: str = DEFAULT_OUTPUT_ROOT, seed0: int = 0,
                    batch_size: int = ROLLOUT_BATCH_SIZE,
-                   games_per_batch: int = EVAL_GAMES_PER_BATCH) -> dict:
+                   games_per_batch: int = EVAL_GAMES_PER_BATCH,
+                   results_run_dir: str | Path | None = None) -> dict:
     """Predict a stage's holdout games (``n_sims`` each), write per-game folders + a stage report.
 
     ``holdout_ids`` defaults to the manifest the stage's preprocess wrote (``holdout_games.json``).
@@ -140,14 +150,21 @@ def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
         raise ValueError(f"stage '{stage_name}' has an empty holdout — nothing to evaluate.")
 
     df = load_all_cleaned(data_dir, parse_rosters=True)
-    stage_dir = Path(predictions_root) / stage_name
+    # Results layout (new): per-game folders under <results_run_dir>/games/, report at the run root.
+    # Legacy layout: per-game folders under artifacts/predictions/<stage_name>/, report in reports/.
+    results_run_dir = Path(results_run_dir) if results_run_dir is not None else None
+    stage_dir = (results_run_dir / "games") if results_run_dir is not None \
+        else (Path(predictions_root) / stage_name)
     sim = None  # lazily loaded only if there's an unfinished game to simulate
 
     def _flush_report() -> dict:
         """Build + write the eval report over everything finished so far; return the report dict."""
         aggregate = _aggregate(records)
         rep = build_report(records=records, aggregate=aggregate, n_sims=n_sims, run_name=stage_name)
-        rd = write_eval_report(rep, reports_root=reports_root)
+        if results_run_dir is not None:
+            rd = write_eval_report(rep, run_dir=results_run_dir)
+        else:
+            rd = write_eval_report(rep, reports_root=reports_root)
         _print_summary(aggregate, len(records), n_sims)
         rep["run_dir"] = str(rd)
         rep["predictions_dir"] = str(stage_dir)

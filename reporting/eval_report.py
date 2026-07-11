@@ -23,8 +23,10 @@ import html as _html
 import io
 import json
 import platform
+import re
 import subprocess
 from datetime import datetime
+from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")  # headless
@@ -34,6 +36,43 @@ import pandas as pd
 from reporting.report_artifacts import ReportArtifacts, new_run_id, DEFAULT_REPORTS_ROOT
 from simulation.stats import ADVANCED_LABELS, BOX_STATS
 from simulation.eval_metrics import score_win_view
+
+# Evaluation ("test run") outputs live under results/, split from the model-training reports/ tree.
+# One folder per eval run: results/v<version>/<eval-name>/ with report.html + report.json at the
+# root and the queryable parquet under data/. (See resolve_results_run_dir / write_eval_report.)
+DEFAULT_RESULTS_ROOT = "./results"
+
+
+def resolve_results_run_dir(version: str, *, name: str | None = None,
+                            holdout_total: int | None = None,
+                            results_root: str = DEFAULT_RESULTS_ROOT) -> Path:
+    """Pick (and create) the results run dir for an evaluation under results/v<version>/.
+
+    With ``name`` -> results/v<version>/<name> (stable; a re-run resumes it). Without a name -> the
+    latest ``eval-NNN`` if it is still incomplete (fewer per-game ``record.json`` than
+    ``holdout_total``), so a batched eval keeps filling one folder; otherwise the next ``eval-NNN``.
+    """
+    base = Path(results_root) / f"v{version}"
+    base.mkdir(parents=True, exist_ok=True)
+
+    if name:
+        slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(name)).strip("-") or "eval"
+        run = base / slug
+        run.mkdir(parents=True, exist_ok=True)
+        return run
+
+    existing = sorted((d for d in base.iterdir()
+                       if d.is_dir() and re.fullmatch(r"eval-\d+", d.name)),
+                      key=lambda d: int(d.name.split("-")[1]))
+    if existing:
+        latest = existing[-1]
+        done = len(list((latest / "games").glob("*/record.json")))
+        if holdout_total is None or done < holdout_total:
+            return latest  # resume the in-progress run instead of spawning a new folder
+    nxt = (int(existing[-1].name.split("-")[1]) + 1) if existing else 1
+    run = base / f"eval-{nxt:03d}"
+    run.mkdir(parents=True, exist_ok=True)
+    return run
 
 # Friendly labels for the box-accuracy stat keys.
 _STAT_LABELS = {
@@ -560,21 +599,34 @@ def _run_summary_frame(report: dict) -> pd.DataFrame:
     return pd.DataFrame([row])
 
 
-def write_eval_report(report: dict, *, reports_root: str = DEFAULT_REPORTS_ROOT):
-    """Write report.html / report.json / the Parquet tables. Returns the run dir Path."""
-    arts = ReportArtifacts.for_run("evaluation", report["run_id"], root=reports_root)
-    run_dir = arts.ensure_dir()
+def write_eval_report(report: dict, *, reports_root: str = DEFAULT_REPORTS_ROOT,
+                      run_dir: str | Path | None = None):
+    """Write report.html / report.json / the Parquet tables. Returns the run dir Path.
 
-    arts.html_path.write_text(render_html(report), encoding="utf-8")
-    arts.json_path.write_text(json.dumps(report, indent=2, default=_json_default),
-                              encoding="utf-8")
-    _games_frame(report["records"]).to_parquet(run_dir / "games.parquet", index=False)
-    _box_players_frame(report["records"]).to_parquet(run_dir / "box_players.parquet", index=False)
-    _summary_frame(report["aggregate"]).to_parquet(run_dir / "summary.parquet", index=False)
-    _run_summary_frame(report).to_parquet(run_dir / "run_summary.parquet", index=False)
+    ``run_dir`` (the new results layout): write report.html + report.json at the folder root and the
+    parquet under ``<run_dir>/data/``. Without it (legacy), write everything flat under
+    ``<reports_root>/evaluation/<run_id>/``.
+    """
+    if run_dir is not None:
+        run_dir = Path(run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        html_path, json_path = run_dir / "report.html", run_dir / "report.json"
+        data_dir = run_dir / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        arts = ReportArtifacts.for_run("evaluation", report["run_id"], root=reports_root)
+        run_dir = arts.ensure_dir()
+        html_path, json_path, data_dir = arts.html_path, arts.json_path, run_dir
+
+    html_path.write_text(render_html(report), encoding="utf-8")
+    json_path.write_text(json.dumps(report, indent=2, default=_json_default), encoding="utf-8")
+    _games_frame(report["records"]).to_parquet(data_dir / "games.parquet", index=False)
+    _box_players_frame(report["records"]).to_parquet(data_dir / "box_players.parquet", index=False)
+    _summary_frame(report["aggregate"]).to_parquet(data_dir / "summary.parquet", index=False)
+    _run_summary_frame(report).to_parquet(data_dir / "run_summary.parquet", index=False)
     prog = _progression_frame(report["aggregate"])
     if not prog.empty:
-        prog.to_parquet(run_dir / "progression.parquet", index=False)
+        prog.to_parquet(data_dir / "progression.parquet", index=False)
     return run_dir
 
 
