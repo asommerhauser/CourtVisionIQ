@@ -211,10 +211,13 @@ RECENCY_FLOOR = 0.05
 FINAL_SEASON_FRACTION = 0.5
 FINAL_HOLDOUT_GAMES = 100
 EVAL_BATCH = 10
-# Train 2 (availability masking + capacity bump) writes to its own root so train 1's weights under
-# ./artifacts_full are preserved for comparison. The new graph (avail_mask input + bigger dims) is
-# not weight-compatible with train 1, so they cannot share a root anyway.
-FULL_ARTIFACTS_ROOT = "./artifacts_full2"
+# Model versions live one-per-dir under ./artifacts/v<MAJOR.MINOR>/ (see models.artifacts.
+# version_root / latest_version). The current weights (formerly ./artifacts_full2, "train 2.5") are
+# christened v1.0. FULL_ARTIFACTS_ROOT is the default/latest root; a full train writes a new version
+# dir chosen on the CLI (train.py --full --version X.Y). Keep this string equal to
+# version_root(DEFAULT_VERSION) — tests/test_full_run.py asserts it.
+DEFAULT_VERSION = "1.0"
+FULL_ARTIFACTS_ROOT = "./artifacts/v1.0"
 
 # --- Representative subset for the small heads (training/subset.py) ---
 # The small categorical/regression heads (event/type/result/conditional-time) saturate long before

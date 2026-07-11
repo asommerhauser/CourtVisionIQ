@@ -213,7 +213,7 @@ def extract(*, recent_rates=SUBSET_RECENT_SEASON_RATES,
         print(f"[subset]   {s}: {b['chosen']:>4}/{b['total']:<4} ({b['chosen']/b['total']:.0%}, "
               f"target rate {b['rate']:.0%})")
     print(f"[subset] saved -> {Path(out_path).resolve()}")
-    print("[subset] now resume training:  python full_train.py train")
+    print("[subset] now (re)start training:  python train.py --full --version <X.Y> --batch-size <N>")
     return payload
 
 

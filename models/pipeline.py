@@ -151,7 +151,8 @@ def run_stage(data_dir: str, game_partition, *, artifacts_root: str = DEFAULT_AR
               warmup_epochs: int = 2,
               report: bool = True, run_name: str | None = None,
               done: list[str] | None = None, on_trained=None,
-              subset_keys=None, subset_train_games=None) -> list[str]:
+              subset_keys=None, subset_train_games=None,
+              rebuild_vocabs: bool = False) -> list[str]:
     """Train every model on ``game_partition`` (one stage / one full train) and return the keys
     trained this call.
 
@@ -186,9 +187,16 @@ def run_stage(data_dir: str, game_partition, *, artifacts_root: str = DEFAULT_AR
     )
 
     def _pp(key: str) -> dict:
-        """Preprocess kwargs for one head: the subset partition for the small heads, else full."""
+        """Preprocess kwargs for one head: the subset partition for the small heads, else full.
+
+        Vocabs are rebuilt+frozen only by the vocab-owning head (event_time), and only when the
+        caller asks (``rebuild_vocabs=True``, e.g. a full train after a re-clean). Every other head
+        loads the frozen vocab, so the shared token space stays consistent across heads.
+        """
         part = subset_partition if (key in subset_keys and subset_partition is not None) else game_partition
-        return dict(rebuild_vocabs=False, game_partition=part, refit_norm_stats=refit_norm_stats)
+        owns_vocab = key == EventTimeModel.KEY
+        return dict(rebuild_vocabs=(rebuild_vocabs and owns_vocab),
+                    game_partition=part, refit_norm_stats=refit_norm_stats)
 
     def _train(model, key: str) -> None:
         if key in done:

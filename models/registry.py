@@ -33,3 +33,13 @@ MODEL_REGISTRY: dict[str, type] = {
     # Stint-length head: regresses how long an entering player stays on the floor.
     StintLengthModel.KEY: StintLengthModel,
 }
+
+# Canonical dependency-ordered training sequence (matches models.pipeline.run_stage). Lives here —
+# the neutral registry — rather than in any one training driver, so both the full-train path and
+# per-model retrains share one list. (Order: event/time -> player -> conditional-time -> the
+# conditional type/result heads -> substitution -> stint_length.)
+STAGE_MODEL_KEYS: list[str] = [
+    EventTimeModel.KEY, PlayerModel.KEY, ConditionalTimeModel.KEY,
+    *[cls.KEY for cls in CONDITIONAL_MODEL_CLASSES],
+    SubstitutionModel.KEY, StintLengthModel.KEY,
+]

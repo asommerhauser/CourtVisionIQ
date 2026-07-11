@@ -17,10 +17,51 @@ New models reuse this verbatim by declaring a `KEY` and going through ModelArtif
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_ARTIFACTS_ROOT = "./artifacts"
+
+# Parent directory that holds one subdirectory per model VERSION: ``<VERSIONS_ROOT>/v<MAJOR.MINOR>/``
+# (e.g. ``./artifacts/v1.0/``). A full train writes a new version dir; a single-model retrain
+# overwrites just one head inside an existing version. Keeping each version in its own dir preserves
+# history for comparison across trains.
+VERSIONS_ROOT = "./artifacts"
+
+
+def version_root(version: str, versions_root: str = VERSIONS_ROOT) -> str:
+    """Resolve a version label (e.g. ``"1.0"`` or ``"v1.0"``) to its artifacts root string.
+
+    Returned as a plain ``./``-prefixed string (not a ``Path``) so it compares equal to the
+    hard-coded defaults recorded in run state / config.
+    """
+    v = str(version).strip()
+    v = v if v.startswith("v") else f"v{v}"
+    return f"{versions_root.rstrip('/')}/{v}"
+
+
+def latest_version(versions_root: str = VERSIONS_ROOT) -> str | None:
+    """Newest ``v<MAJOR.MINOR>`` under ``versions_root`` by numeric (major, minor) order.
+
+    Returns the bare label (``"1.0"``, no ``v`` prefix) or ``None`` when no version dir exists.
+    Used as the default target for a single-model retrain (``train.py --model <name>``).
+    """
+    root = Path(versions_root)
+    if not root.is_dir():
+        return None
+    best: tuple[int, int] | None = None
+    best_label: str | None = None
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        m = re.fullmatch(r"v(\d+)\.(\d+)", child.name)
+        if not m:
+            continue
+        key = (int(m.group(1)), int(m.group(2)))
+        if best is None or key > best:
+            best, best_label = key, f"{m.group(1)}.{m.group(2)}"
+    return best_label
 
 
 @dataclass(frozen=True)
