@@ -8,8 +8,9 @@ with predicted/actual/variance box scores, and the generated play-by-plays under
   python evaluate.py --version 1.0
       Evaluate v1.0's holdout (auto-named eval-NNN), STAGE_SIMS sims/game, default concurrency.
 
-  python evaluate.py --version 1.0 --name pace-097 --monte-carlo 21 --concurrency 8
-      Named run; 21 sims/game; 8 holdout games simulated in parallel (their sims pooled per pass).
+  python evaluate.py --version 1.0 --name pace-097 --monte-carlo 21 --concurrency 48
+      Named run; 21 sims/game; up to 48 game-sims per GPU forward pass (the VRAM knob). Lower
+      --concurrency if you OOM; it is independent of --monte-carlo.
 
   python evaluate.py --version 1.0 --name pace-097 --games 10
       Predict only the next 10 unfinished holdout games into that run, then stop (batched).
@@ -38,7 +39,8 @@ def main() -> None:
     ap.add_argument("--monte-carlo", type=int, default=None, dest="monte_carlo",
                     help="Sims per game to aggregate (Monte-Carlo count; default: STAGE_SIMS).")
     ap.add_argument("--concurrency", type=int, default=None,
-                    help="Holdout games simulated in parallel (their sims pooled into one GPU pass).")
+                    help="Concurrent game-sims per GPU forward pass (VRAM knob; default 48). Lower it "
+                         "if you hit OOM, raise it to use more of the card. Independent of --monte-carlo.")
     ap.add_argument("--games", type=int, default=None,
                     help="Cap NEW games simulated this call (batched / interrupt-friendly). Default: all.")
     ap.add_argument("--report-only", action="store_true",

@@ -162,8 +162,8 @@ results run under `results/v<version>/<eval-name>/`.
 # Evaluate v1.0's holdout (auto-named eval-NNN), default sims + concurrency:
 python evaluate.py --version 1.0
 
-# Named run; 21 sims/game; 8 holdout games simulated in parallel (their sims pooled per GPU pass):
-python evaluate.py --version 1.0 --name pace-097 --monte-carlo 21 --concurrency 8
+# Named run; 21 sims/game; up to 48 game-sims per GPU forward pass (VRAM knob):
+python evaluate.py --version 1.0 --name pace-097 --monte-carlo 21 --concurrency 48
 
 # Predict only the next 10 unfinished games into that run, then stop (batched / resumable):
 python evaluate.py --version 1.0 --name pace-097 --games 10
@@ -174,8 +174,10 @@ python evaluate.py --version 1.0 --name pace-097 --report-only
 
 - **`--monte-carlo`** — sims per game to average (default `STAGE_SIMS`; more sims tighten the
   box-score means and win-prob resolution).
-- **`--concurrency`** — holdout games simulated in parallel; their sims are pooled into one batched
-  GPU forward pass per head (throughput only — results are seed-determined, unchanged).
+- **`--concurrency`** — concurrent game-sims per batched GPU forward pass (default 48). This is the
+  VRAM knob: attention memory grows with batch × seq², so **lower it if you OOM**, raise it to use
+  more of the card. Independent of `--monte-carlo`; throughput only — results are seed-determined,
+  unchanged.
 
 **A results run** (`results/v<version>/<eval-name>/`) contains:
 ```

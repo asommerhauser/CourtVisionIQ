@@ -162,10 +162,12 @@ class FullRun:
 
         ``version`` defaults to the trained run's version. ``name`` names the eval folder (default:
         auto-increment ``eval-NNN``, resuming the latest incomplete one). ``n_sims`` = Monte-Carlo
-        sims per game (--monte-carlo); ``concurrency`` = holdout games simulated in parallel, whose
-        sims are pooled into one batched GPU pass (--concurrency). ``max_new`` caps NEW games this
-        call (batched / interrupt-friendly); ``None`` runs the whole holdout, flushing an intermediate
-        report every ``report_every`` games.
+        sims per game (--monte-carlo). ``concurrency`` = concurrent game-sims per batched GPU forward
+        pass — the **VRAM knob**: attention memory grows with batch × seq², so lower it if you OOM,
+        raise it to use more of the card. It is decoupled from n_sims: the holdout's pooled sims run
+        in cohorts of this width, so memory is bounded by ``concurrency`` no matter how many games/sims
+        are pooled. ``max_new`` caps NEW games this call (batched / interrupt-friendly); ``None`` runs
+        the whole holdout, flushing an intermediate report every ``report_every`` games.
         """
         from reporting.eval_report import resolve_results_run_dir
         from simulation.stage_eval import evaluate_stage
@@ -178,10 +180,11 @@ class FullRun:
 
         version = version or self.state.get("version", DEFAULT_VERSION)
         n_sims = n_sims or STAGE_SIMS
-        games_per_batch = concurrency or EVAL_GAMES_PER_BATCH
-        # Cohort wide enough to run every pooled sim (concurrency games × n_sims) at once, so the
-        # pool isn't split across cohorts; GameSimulator batches them into one forward pass per head.
-        batch_size = max(ROLLOUT_BATCH_SIZE, games_per_batch * n_sims)
+        # concurrency = concurrent game-sims per GPU forward pass (VRAM-bound). games_per_batch just
+        # pools enough games that cohorts stay full as sims desync; the actual GPU batch is capped at
+        # `batch_size`, so VRAM is bounded by concurrency regardless of the total pooled.
+        batch_size = concurrency or ROLLOUT_BATCH_SIZE
+        games_per_batch = EVAL_GAMES_PER_BATCH
         holdout = self.state["holdout_game_ids"]
         run_dir = resolve_results_run_dir(version, name=name, holdout_total=len(holdout))
         self.state["last_eval_name"] = run_dir.name
