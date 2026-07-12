@@ -36,6 +36,8 @@ source of truth if the two ever need to change together.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from config import (
@@ -76,6 +78,47 @@ HOME, AWAY = "home", "away"
 # The simulator builds rows in memory and never goes through pandas, so we reproduce that one
 # coercion here to keep generated rows on the model's training distribution.
 _NULL_STRINGS = {"null"}
+
+# --- Compiled inference (GPU-utilization speedup) ---------------------------------------------
+# The rollout makes millions of tiny (batch small, seq short) forward passes. Called eagerly
+# (`model(x, training=False)`), each pays Python-side op-dispatch overhead that dominates when the
+# batched rollout keeps the actual matmuls small — the GPU sits mostly idle waiting on Python.
+# Wrapping each head in a cached ``tf.function`` traces it once per input signature and thereafter
+# dispatches a single compiled graph, cutting that overhead.
+#
+# OPT-IN (default OFF): set CVIQ_TF_INFER=1 to enable. It is off by default because the payoff is
+# GPU-specific and needs on-hardware measurement — if ``reduce_retracing`` fails to collapse the
+# varying sequence-length dim, it can retrace per event and run *slower*. Enable it on the GPU box,
+# confirm the rollout speeds up (and results hold), then leave it on. A permanent per-signature
+# eager fallback means any graph-incompatibility degrades to exactly the prior (eager) behavior.
+_TF_INFER_ENABLED = os.environ.get("CVIQ_TF_INFER", "0") == "1"
+_EAGER = object()  # sentinel cache value: this (model_key, signature) must run eagerly
+
+
+def _compiled_forward(cache: dict, model, model_key: str, inputs: dict):
+    """Run ``model(inputs, training=False)`` via a per-signature cached ``tf.function``.
+
+    ``cache`` is owned by the caller (one per GameSimulator). The signature is the head key plus the
+    sorted input names, so each distinct call shape compiles once; ``reduce_retracing`` absorbs the
+    varying batch/sequence dims. Any exception (or the kill-switch) pins that signature to eager.
+    """
+    if not _TF_INFER_ENABLED:
+        return model(inputs, training=False)
+
+    import tensorflow as tf
+
+    sig = (model_key, tuple(sorted(inputs.keys())))
+    fn = cache.get(sig)
+    if fn is _EAGER:
+        return model(inputs, training=False)
+    if fn is None:
+        fn = tf.function(lambda x, _m=model: _m(x, training=False), reduce_retracing=True)
+        cache[sig] = fn
+    try:
+        return fn({k: tf.convert_to_tensor(v) for k, v in inputs.items()})
+    except Exception:  # graph-incompat / tracing error -> fall back to eager for this signature
+        cache[sig] = _EAGER
+        return model(inputs, training=False)
 
 
 def _norm_cat(value):
@@ -425,7 +468,8 @@ class GameSimulator:
             raise RuntimeError(
                 f"'{model_key}' head not loaded; train it and load via GameSimulator.load()."
             )
-        out = model(inputs, training=False)
+        cache = self.__dict__.setdefault("_tf_infer_cache", {})
+        out = _compiled_forward(cache, model, model_key, inputs)
         return {k: np.asarray(v) for k, v in out.items()}
 
     def _head_logits(self, key: str, output_name: str, inputs: dict) -> np.ndarray:
