@@ -41,13 +41,17 @@ EVENT_TEMPERATURE = 1.0    # next-event head (shot / foul / turnover / … mix)
 # Multiplicative calibration on the predicted inter-event Δt before it advances the game clock
 # (GameController._advance_clock). 1.0 = raw model. Pace ≈ possessions/48 ≈ FGA-driven, and the
 # clock filling 48 min sets how many possessions fit: >1 slows the clock (fewer possessions →
-# lower pace), <1 speeds it up. Leave at 1.0 until measured, then set to real_Δt_mean/sim_Δt_mean
-# from `python -m simulation.diagnostics` (it does not require a retrain).
-# Set to 1.06 off the 100-game full-train holdout: pace ran 107.8 vs 101.3 real poss/48 (+6.4%),
-# so the conditional-time head's mean gap is ~6% short. 101.3/107.8 ~= 0.94 -> slow the clock by
-# x1.06 to land pace ~= real and deflate the across-the-board counting-stat over-prediction
-# (DREB/AST/STL all inflated ~proportionally with pace). Re-confirm with diagnostics after a retrain.
-DELTA_TIME_SCALE = 1.06
+# lower pace), <1 speeds it up. Ideal value = real_Δt_mean/sim_Δt_mean from
+# `python -m simulation.diagnostics` (no retrain needed).
+#
+# HISTORY: 1.06 was fit to Train 1, whose smaller time head ran pace HIGH (107.8 vs 101.3 real,
+# +6.4%), so the clock was slowed x1.06. Train 2's larger conditional-time head no longer
+# under-predicts the gap, but the +6% slowdown stayed on top of it and pace COLLAPSED the other way
+# — v1.0's full holdout ran 92.1 vs 100.7 real poss/48 (bias -8.6), the mirror image of Train 1.
+# Pace scales ~inversely with seconds/event, so 1.06 x (92.1/100.7) ≈ 0.97 targets real pace as a
+# first cut without a retrain. Re-confirm against sim vs real Δt with `simulation.diagnostics` and
+# set precisely = real_Δt_mean/sim_Δt_mean. (Secondary pace lever if this still lags: MAX_DELTA.)
+DELTA_TIME_SCALE = 0.97
 SUB_TEMPERATURE = 1.0      # outgoing substitution pick (legacy path) / generic sub sampling
 # Incoming-sub pick temperature. The substitution head emits over the *player* vocab, so — like
 # the actor head — its small, real preferences (which bench player actually checks in) should
@@ -121,9 +125,12 @@ STINT_MAX_SECONDS = 900.0
 # fouls count toward this; technicals do not.
 FOUL_OUT_LIMIT = 6
 
-# Clamp on a single predicted Δt before it advances the game clock (after DELTA_TIME_SCALE), so one
-# bad gap can't blow up the clock. Raised from 40 to 60 — real end-of-quarter / dead-ball gaps
-# exceed 40s and truncating them bleeds game time (nudging pace up). The controller imports this.
+# Clamp on a single predicted inter-EVENT Δt before it advances the game clock (after
+# DELTA_TIME_SCALE), so one bad gap can't blow up the clock. NOT the 24s shot clock — this is the
+# gap between two consecutive events, which is usually well under 24s but can legitimately exceed it
+# (a dead-ball / timeout stretch, or the gap spanning a quarter/half break; free throws are logged
+# at Δt=0). Lowering it trims that long tail and nudges pace UP, so it's the secondary pace lever
+# after DELTA_TIME_SCALE (leave at 60 while tuning the scale; try ~45 only if pace still lags).
 MAX_DELTA = 60.0
 # Probability a missed shot yields no individual rebound (an out-of-bounds / dropped team rebound):
 # the ball just changes hands with no row. The off/def split of real rebounds is the rebound-type
