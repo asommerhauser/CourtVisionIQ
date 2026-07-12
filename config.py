@@ -175,10 +175,11 @@ HOLDOUT_FRAC = 0.1
 # Filename of the holdout game-id manifest, written under each model's processed_dir.
 HOLDOUT_MANIFEST_NAME = "holdout_games.json"
 
-# --- Curriculum training (training/curriculum.py + training/chronology.py) ---
-# The full corpus is trained in contiguous, cumulative stages. After each stage we predict the
-# next block of real games as a sequential holdout (no random split) and score the simulator.
-# Number of sequential games held out for evaluation after each stage's training boundary.
+# --- Chronological schedule helpers (training/chronology.py) ---
+# Utilities for contiguous, cumulative training slices + sequential (next-N) holdouts. Retained as
+# building blocks (build_schedule / sequential_partition); the single full train (full_run) is the
+# active path — see FINAL_HOLDOUT_GAMES below.
+# Default number of sequential games held out after a training boundary (schedule helper default).
 HOLDOUT_GAMES = 10
 # Predictions run per holdout game when scoring a stage (the simulator is stochastic; we average).
 # Bumped 11 -> 21: the eval averages the per-game sims before scoring, so more sims tighten the
