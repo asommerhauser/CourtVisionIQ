@@ -64,21 +64,35 @@ SUB_INCOMING_TEMPERATURE = 0.45
 TYPE_TEMPERATURE = 1.0     # shot_type / assist_type / turnover_type / foul_type / rebound_type
 RESULT_TEMPERATURE = 1.0   # shot_result (made / missed / blocked)
 # Per-outcome logit offset applied to the live-shot result sample (made / missed / blocked) via the
-# existing `bias` arg of GameSimulator._masked_sample. Default {} = raw model. Blocks were
-# over-produced (+53% in the stage eval), which drags eFG/FG% down; if eFG stays low after the
-# pace fix, push "blocked" negative (and/or "made" positive) here to pull make/block rates to real.
-SHOT_RESULT_BIAS: dict[str, float] = {}
+# existing `bias` arg of GameSimulator._masked_sample. Default {} = raw model. Fit to v1.0 trial1
+# (100-game holdout): the unassisted make rate ran 21.8% vs 27.1% real (2P% .510 vs .548, 3P% .322
+# vs .374 — ~-7.8 pts/team) and blocks were over-produced (+27%). Values are the log-odds-ratio
+# corrections from the pooled live-shot table (per-type ideal: made +0.22 on 2pt / +0.35 on 3pt;
+# global weighted below). FTs do NOT route through this bias (FT% was already accurate).
+# RE-MEASURE after any retrain of shot_result — a modern-heavier train should need less of this.
+SHOT_RESULT_BIAS: dict[str, float] = {"made": 0.27, "blocked": -0.15}
 # Per-event-token logit offset applied to the next-event pick (GameController._sample_event), the
-# event-head sibling of SHOT_RESULT_BIAS. Default {} = raw model. Tune post-train from the eval
-# report's team-bias table: e.g. the Train-1 holdout under-produced fouls (PF -3.6 / FTA -3.9 per
-# game — the model can't see bonus/clutch contexts) and over-produced assists (+3.9) / turnovers
-# (+2.25), which would suggest something like {"foul": +0.2, "assist": -0.15, "turnover": -0.1}.
-# Re-measure before touching: the game-state features change the whole event mix.
-EVENT_BIAS: dict[str, float] = {}
+# event-head sibling of SHOT_RESULT_BIAS. Default {} = raw model. Fit to v1.0 trial1: fouls ran
+# 36.1/game vs 40.5 real (-11%, the biggest driver of the FTA -4.7/team deficit) and turnovers
+# 44.9 vs 41.6 (+8%). Re-measure after any retrain — the event mix moves with the event head.
+EVENT_BIAS: dict[str, float] = {"foul": 0.15, "turnover": -0.08}
 # Per-head per-token logit offset on the conditional type heads (GameSimulator.predict_type),
 # keyed by head then token, e.g. {"turnover_type": {"steal": -0.2}} to pull steal-type turnovers
-# down without moving the overall turnover rate. Default {} = raw model.
-TYPE_BIAS: dict[str, dict[str, float]] = {}
+# down without moving the overall turnover rate. Default {} = raw model. Fit to v1.0 trial1:
+#   foul_type    — shooting-foul share ran 40.5% vs 52.8% real (the other half of the FTA deficit),
+#                  personal over-picked (16.5 vs 10.6/game), loose-ball fouls near-absent (0.06 vs
+#                  2.70/game — hence the outsized +2.5 on a near-zero-mass token; iterate on it),
+#                  technicals 0.12 vs 0.63. Offensive fouls were already over (4.62 vs 3.83).
+#   turnover_type — steal share slightly high (56.8% vs 54.8% of TOs).
+#   assist_type  — assisted-3 share 38.5% vs 41.0% (drives the residual TPM gap).
+#   rebound_type — offensive share of rebounds 23.4% vs 27.3%.
+TYPE_BIAS: dict[str, dict[str, float]] = {
+    "foul_type": {"shooting": 0.35, "personal": -0.45, "offensive": -0.30,
+                  "loose ball": 2.5, "technical": 1.5},
+    "turnover_type": {"steal": -0.12},
+    "assist_type": {"3pt": 0.10},
+    "rebound_type": {"offensive": 0.20},
+}
 # Home-court edge. The rollout is otherwise home/away symmetric (HOME just inbounds first), so the
 # sim can't separate winners and win-pick accuracy sits near a coin flip. This adds a logit nudge to
 # the live-shot "made" outcome: +HOME_COURT_SHOT_BIAS for the home offense, -HOME_COURT_SHOT_BIAS for
@@ -86,7 +100,9 @@ TYPE_BIAS: dict[str, dict[str, float]] = {}
 # without moving the pooled eFG/FG% the four-factors table already gets ~right. ~0.10 lifts home eFG
 # ~+1pt / drops away ~-1pt, roughly a ~2.5-pt home edge (real NBA ~2.5-3.0). 0 = off; tune against
 # the win-prediction calibration + spread bias in the eval report. Applied in GameController._do_shot.
-HOME_COURT_SHOT_BIAS = 0.10
+# Trimmed 0.10 -> 0.07: v1.0 trial1 predicted the home margin at +4.05 vs +2.58 actual (spread bias
+# +1.47), so the edge was ~55% too strong; scaled proportionally.
+HOME_COURT_SHOT_BIAS = 0.07
 # Logit bonus per second of a player's current on-court stint, added to the outgoing-sub pick so
 # a long-tenured player (a star included) is *nudged* — not forced — toward coming off. 0 = off.
 # Lowered from 0.15 so starters are pulled for tenure less aggressively (the stage eval under-played
@@ -94,7 +110,9 @@ HOME_COURT_SHOT_BIAS = 0.10
 SUB_FATIGUE_WEIGHT = 0.08
 # Max game-seconds a team may go without a substitution before the Controller forces one (the
 # event head never targets a team, so this safety net keeps a team from playing five men 48 min).
-SUB_MAX_GAP_SECONDS = 420.0
+# Raised 420 -> 600 alongside STINT_LENGTH_SCALE: real teams average one sub every ~2 min, so the
+# backstop should stay rare; at 420 it would re-create the churn the longer stints remove.
+SUB_MAX_GAP_SECONDS = 600.0
 
 # Number of independent game-sims the batched rollout runs concurrently, pooling their per-event
 # forward passes into one batched GPU call (simulation/batched_rollout.py). >1 enables batching; 1 is
@@ -118,9 +136,18 @@ EVAL_GAMES_PER_BATCH = 6
 # regresses log-stint, so we sample with multiplicative log-space noise for rotation variety.
 # STINT_SAMPLE_SIGMA is the std of that log-space noise (0 = deterministic / point estimate).
 STINT_SAMPLE_SIGMA = 0.25
+# Multiplicative calibration on the predicted stint length (applied in predict_stint_length before
+# the cap) — the rotation sibling of DELTA_TIME_SCALE. The head regresses LOG-stint, so its point
+# estimate is the geometric mean, which systematically under-predicts the arithmetic mean of a
+# right-skewed duration distribution. Measured on v1.0 trial1: sim stints averaged 366s vs 474s
+# real (ratio 1.30), producing 79 subs/game vs 46 real and over-playing the 9th-13th men by 2-3x
+# while starters ran ~5 min short. Tune to match subs/game (~46) in the eval report; 1.0 = raw.
+STINT_LENGTH_SCALE = 1.30
 # Numerical cap on a sampled stint (game-seconds). There is intentionally NO lower bound — a
 # short specialist stint (a one-possession 3pt shooter / rebounder) is legitimate basketball.
-STINT_MAX_SECONDS = 900.0
+# Raised 900 -> 2400: real stints run to ~2600s (p90 886s), so the old cap truncated the real
+# tail right where long starter stints live and clipped the sim's max stint to ~938s.
+STINT_MAX_SECONDS = 2400.0
 # Personal fouls that disqualify a player for the rest of the game (NBA standard: 6). Offensive
 # fouls count toward this; technicals do not.
 FOUL_OUT_LIMIT = 6
@@ -143,8 +170,8 @@ _TUNING_KEYS = (
     "DELTA_TIME_SCALE", "MAX_DELTA", "DEADBALL_REBOUND_PROB",
     "PLAYER_TEMPERATURE", "EVENT_TEMPERATURE", "TYPE_TEMPERATURE", "RESULT_TEMPERATURE",
     "SUB_TEMPERATURE", "SUB_INCOMING_TEMPERATURE", "SUB_FATIGUE_WEIGHT", "SUB_MAX_GAP_SECONDS",
-    "STINT_SAMPLE_SIGMA", "STINT_MAX_SECONDS", "FOUL_OUT_LIMIT", "SHOT_RESULT_BIAS",
-    "EVENT_BIAS", "TYPE_BIAS", "HOME_COURT_SHOT_BIAS",
+    "STINT_SAMPLE_SIGMA", "STINT_LENGTH_SCALE", "STINT_MAX_SECONDS", "FOUL_OUT_LIMIT",
+    "SHOT_RESULT_BIAS", "EVENT_BIAS", "TYPE_BIAS", "HOME_COURT_SHOT_BIAS",
 )
 
 
@@ -209,7 +236,11 @@ BOUNDARY_CYCLE = ("frac:0.25", "frac:0.50", "pre_playoffs")
 # gradient. Newest season = 1.0; weight halves every RECENCY_HALFLIFE_SEASONS seasons, floored at
 # RECENCY_FLOOR (so old-player embeddings keep getting a little gradient). See season_features.
 RECENCY_WEIGHTING = True
-RECENCY_HALFLIFE_SEASONS = 6.0
+# Halved 6 -> 3 for v1.1: v1.0's subset heads anchored near a corpus-era average — eFG ran .500 vs
+# .554 real (2P% -3.8pp, 3P% -5.2pp) and the per-shooter eFG gradient was compressed, the classic
+# signature of older, lower-efficiency eras diluting the modern game despite the season embedding.
+# A shorter halflife makes the modern era dominate the gradient harder.
+RECENCY_HALFLIFE_SEASONS = 3.0
 RECENCY_FLOOR = 0.05
 
 # --- Single full-train + batched holdout eval (full_train.py / training/full_run.py) ---
@@ -220,12 +251,13 @@ FINAL_SEASON_FRACTION = 0.5
 FINAL_HOLDOUT_GAMES = 100
 EVAL_BATCH = 10
 # Model versions live one-per-dir under ./artifacts/v<MAJOR.MINOR>/ (see models.artifacts.
-# version_root / latest_version). The current weights (formerly ./artifacts_full2, "train 2.5") are
-# christened v1.0. FULL_ARTIFACTS_ROOT is the default/latest root; a full train writes a new version
-# dir chosen on the CLI (train.py --full --version X.Y). Keep this string equal to
+# version_root / latest_version). v1.1 = the modern-heavy retrain (recency halflife 3, richer
+# subset rates) + the trial1-fit dial package; v1.0 weights stay in ./artifacts/v1.0.
+# FULL_ARTIFACTS_ROOT is the default/latest root; a full train writes a new version dir chosen on
+# the CLI (train.py --full --version X.Y). Keep this string equal to
 # version_root(DEFAULT_VERSION) — tests/test_full_run.py asserts it.
-DEFAULT_VERSION = "1.0"
-FULL_ARTIFACTS_ROOT = "./artifacts/v1.0"
+DEFAULT_VERSION = "1.1"
+FULL_ARTIFACTS_ROOT = "./artifacts/v1.1"
 
 # --- Representative subset for the small heads (training/subset.py) ---
 # The small categorical/regression heads (event/type/result/conditional-time) saturate long before
@@ -236,14 +268,18 @@ FULL_ARTIFACTS_ROOT = "./artifacts/v1.0"
 # game, so no embedding goes starved. The big player-vocab heads (player / substitution /
 # stint_length) keep the full corpus — they actually need the data.
 #
-# Per-season sample rate for the most recent seasons, NEWEST FIRST: the newest season gets 70% of
-# its games, the next 40%, the third 25%. The newest season is itself already truncated at
-# FINAL_SEASON_FRACTION (we cut partway through it), so 70% of that is a modest absolute count.
-SUBSET_RECENT_SEASON_RATES = (0.70, 0.40, 0.25)
-# Seasons older than the recent block decay from the last recent rate (0.25), halving every
-# this-many seasons — a gentle exponential tail. Coverage still guarantees every player a game, so
-# old-only players pull in the older games they need regardless of the rate.
-SUBSET_RECENCY_HALFLIFE_SEASONS = 8.0
+# Per-season sample rate for the most recent seasons, NEWEST FIRST. Raised for v1.1
+# ((0.70, 0.40, 0.25) -> (1.0, 0.70, 0.50)): the subset heads (shot_result especially) under-fit
+# the modern game's efficiency (see RECENCY_HALFLIFE_SEASONS note), and shot_result early-stopped
+# at epoch 7 on the old 3,239-game subset — it has headroom for more modern data. The newest
+# season is itself already truncated at FINAL_SEASON_FRACTION (we cut partway through it), so
+# 100% of that is a modest absolute count.
+SUBSET_RECENT_SEASON_RATES = (1.0, 0.70, 0.50)
+# Seasons older than the recent block decay from the last recent rate, halving every this-many
+# seasons — a gentle exponential tail (tightened 8 -> 5 for v1.1, same rationale). Coverage still
+# guarantees every player a game, so old-only players pull in the older games they need
+# regardless of the rate.
+SUBSET_RECENCY_HALFLIFE_SEASONS = 5.0
 SUBSET_SEED = 42                     # deterministic subset selection
 SUBSET_GAMES_PATH = "./training/subset_games.json"  # persisted subset manifest (one extract step)
 # Heads trained on the representative subset rather than the full corpus. All six conditional

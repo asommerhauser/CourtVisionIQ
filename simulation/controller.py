@@ -51,7 +51,8 @@ LIVE_SHOT_RESULTS = ["made", "missed", "blocked"]
 FT_RESULTS = ["made", "missed"]
 TURNOVER_TYPES = ["steal", "violation", "error"]
 FOUL_TYPES = ["personal", "shooting", "offensive", "loose ball",
-              "technical", "flagrant-1", "flagrant-2", "away from play"]
+              "technical", "flagrant-1", "flagrant-2", "away from play",
+              "personal take", "transition take"]
 # A foul drawn while a missed shot is in the air to be rebounded is a loose-ball / common foul,
 # never a shooting foul (the shot already happened and was logged) — masking shooting out here
 # keeps us from double-counting a real missed FGA *and* awarding shooting-foul free throws.
@@ -64,9 +65,13 @@ REBOUND_TYPES = ["offensive", "defensive"]
 
 # Common fouls that can trigger bonus free throws when the defense is in the penalty.
 COMMON_FOULS = {"personal", "loose ball", "away from play"}
+# Take fouls (in the vocab and cleaned data as "personal take" / "transition take"): a deliberate
+# common foul to stop the ball, awarded 1 FT + the fouled team retains (the cleaner maps both to
+# "free throw op"). Not in COMMON_FOULS — their outcome is fixed, not bonus-dependent.
+TAKE_FOULS = {"personal take", "transition take"}
 # Fouls that count toward a team's per-period foul total (the penalty count).
 TEAM_FOUL_TYPES = {"shooting", "personal", "loose ball", "away from play",
-                   "flagrant-1", "flagrant-2"}
+                   "flagrant-1", "flagrant-2", "personal take", "transition take"}
 
 class GameController:
     """Drive a full single-game rollout off a loaded :class:`GameSimulator`, enforcing rules."""
@@ -553,6 +558,13 @@ class GameController:
             return ("free throw", 1, True)
         if ftype == "offensive":
             return ("cop", 0, False)
+        if ftype in TAKE_FOULS:
+            # Take foul (personal take / transition take): 1 FT, fouled team keeps the ball —
+            # mirrors the cleaner's "free throw op" for both types. Only coherent from the
+            # defense; a sampled offensive-side take degrades to a no-FT common foul.
+            if on_defense:
+                return ("free throw op", 1, True)
+            return ("nothing", 0, False)
         if ftype == "flagrant-1":
             return ("free throw op", 2, True)
         if ftype == "flagrant-2":

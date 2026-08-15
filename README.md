@@ -216,6 +216,7 @@ no retrain. They are captured into every eval report for cross-run analysis. Key
 | `EVENT_BIAS` / `TYPE_BIAS` | Additive logit offsets on the event-mix / type heads (e.g. push fouls up). |
 | `SHOT_RESULT_BIAS` | Made/missed/blocked logit offsets → eFG / FG%. |
 | `PLAYER_TEMPERATURE` | Flattens the actor head → shot/rebound/assist concentration across players. |
+| `STINT_LENGTH_SCALE` | Multiplies predicted stint lengths → substitution rate / minutes concentration (the log-stint head's point estimate under-shoots the mean; tune to real ~46 subs/game). Re-fit **after every retrain**, like `DELTA_TIME_SCALE`. |
 
 ---
 

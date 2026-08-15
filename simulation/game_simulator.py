@@ -41,7 +41,7 @@ import os
 import numpy as np
 
 from config import (
-    MAX_SEQUENCE_LENGTH, RESULT_TEMPERATURE, ROSTER_SIZE, STINT_MAX_SECONDS,
+    MAX_SEQUENCE_LENGTH, RESULT_TEMPERATURE, ROSTER_SIZE, STINT_LENGTH_SCALE, STINT_MAX_SECONDS,
     STINT_SAMPLE_SIGMA, SUB_INCOMING_TEMPERATURE, SUB_TEMPERATURE, TYPE_BIAS, TYPE_TEMPERATURE,
 )
 from models.conditional_time_model import ConditionalTimeModel
@@ -540,8 +540,10 @@ class GameSimulator:
         for an opener) and ``next_secondary_player`` (incoming) — and regresses standardized
         log-stint. Denormalizes with the head's own ``stint_log_mean`` / ``stint_log_std``, then
         (unless ``greedy``) adds multiplicative log-space noise (``STINT_SAMPLE_SIGMA``) for
-        rotation variety. Capped at ``STINT_MAX_SECONDS``; there is **no** lower bound — a short
-        specialist stint is legitimate.
+        rotation variety, and scales by ``STINT_LENGTH_SCALE`` (the log-regression's point
+        estimate is the geometric mean, which under-shoots the arithmetic mean of a skewed
+        duration distribution). Capped at ``STINT_MAX_SECONDS``; there is **no** lower bound — a
+        short specialist stint is legitimate.
         """
         inputs = self._conditioned_inputs(
             next_event=SUB_EVENT, delta_seconds=delta_seconds,
@@ -558,7 +560,7 @@ class GameSimulator:
         if not greedy and s > 0:
             log_stint += float(self.rng.normal(0.0, s))
 
-        seconds = float(np.expm1(log_stint))
+        seconds = float(np.expm1(log_stint)) * STINT_LENGTH_SCALE
         return max(0.0, min(seconds, STINT_MAX_SECONDS))
 
     # ===================================================================== #
