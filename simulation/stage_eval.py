@@ -127,7 +127,8 @@ def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
                    predictions_root: str = DEFAULT_OUTPUT_ROOT, seed0: int = 0,
                    batch_size: int = ROLLOUT_BATCH_SIZE,
                    games_per_batch: int = EVAL_GAMES_PER_BATCH,
-                   results_run_dir: str | Path | None = None) -> dict:
+                   results_run_dir: str | Path | None = None,
+                   write_report: bool = True) -> dict:
     """Predict a stage's holdout games (``n_sims`` each), write per-game folders + a stage report.
 
     ``holdout_ids`` defaults to the manifest the stage's preprocess wrote (``holdout_games.json``).
@@ -138,6 +139,11 @@ def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
     an intermediate report every N newly-finished games so progress is visible during a straight run;
     a final report is always written at the end. Already-finished games still load into the report, so
     it covers everything done so far. Returns the report dict (with ``run_dir``, ``done``, ``total``).
+
+    ``write_report=False`` skips writing the report files (report.html / report.json / data
+    parquet) while still building and returning the aggregate — used by sharded evals, where
+    concurrent processes share one run dir and a partial-slice report write would race; the merge
+    is a later ``write_report=True`` call over the full holdout (evaluate.py --report-only).
     """
     from reporting.eval_report import build_report, write_eval_report
 
@@ -158,10 +164,13 @@ def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
     sim = None  # lazily loaded only if there's an unfinished game to simulate
 
     def _flush_report() -> dict:
-        """Build + write the eval report over everything finished so far; return the report dict."""
+        """Build (and, unless ``write_report=False``, write) the eval report over everything
+        finished so far; return the report dict."""
         aggregate = _aggregate(records)
         rep = build_report(records=records, aggregate=aggregate, n_sims=n_sims, run_name=stage_name)
-        if results_run_dir is not None:
+        if not write_report:
+            rd = results_run_dir if results_run_dir is not None else Path(reports_root)
+        elif results_run_dir is not None:
             rd = write_eval_report(rep, run_dir=results_run_dir)
         else:
             rd = write_eval_report(rep, reports_root=reports_root)

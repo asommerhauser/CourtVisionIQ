@@ -170,6 +170,10 @@ python evaluate.py --version 1.0 --name pace-097 --games 10
 
 # Rebuild the report over finished games, no new sims:
 python evaluate.py --version 1.0 --name pace-097 --report-only
+
+# Shard the holdout across N processes sharing one GPU (see "GPU utilization" below), then merge:
+python evaluate.py --version 1.0 --name trial1 --shard 1/4   # ... 2/4, 3/4, 4/4 in parallel
+python evaluate.py --version 1.0 --name trial1 --report-only # after ALL shards finish
 ```
 
 - **`--monte-carlo`** — sims per game to average (default `STAGE_SIMS`; more sims tighten the
@@ -201,6 +205,14 @@ per-call dispatch overhead further — enable and measure it on your GPU:
 `CVIQ_TF_INFER=1 python evaluate.py …` (off by default; it needs on-hardware validation because a
 bad retrace can run slower on some setups). It falls back to eager per-signature on any
 incompatibility, so results are unchanged.
+
+**CPU is the eval bottleneck, and `--shard` is the lever.** Within one process the per-game rule
+logic runs on Python threads, so the GIL caps it at ~2-3 cores no matter how many the machine has.
+To use a many-core box, launch N processes on **disjoint slices** of the holdout with
+`--shard 1/N .. N/N` (same `--name`; each needs ~3-4 GB VRAM, so 4-5 fit a 24 GB card — drop
+`--concurrency` to ~24 each). Per-game seeds don't depend on position, so the merged run
+(`--report-only` after all shards finish) is bit-identical to an unsharded one. Prefer a pod with
+more/faster CPU cores over a bigger GPU — the models are small and the GPU is rarely the limit.
 
 ---
 

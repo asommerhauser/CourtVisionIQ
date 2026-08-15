@@ -157,7 +157,8 @@ class FullRun:
     # --------------------------------------------------------------- eval
     def eval(self, *, version: str | None = None, name: str | None = None,
              n_sims: int | None = None, concurrency: int | None = None,
-             max_new: int | None = None, report_every: int | None = None) -> None:
+             max_new: int | None = None, report_every: int | None = None,
+             shard: tuple[int, int] | None = None) -> None:
         """Predict the holdout into a results run at results/v<version>/<eval-name>/.
 
         ``version`` defaults to the trained run's version. ``name`` names the eval folder (default:
@@ -168,6 +169,14 @@ class FullRun:
         in cohorts of this width, so memory is bounded by ``concurrency`` no matter how many games/sims
         are pooled. ``max_new`` caps NEW games this call (batched / interrupt-friendly); ``None`` runs
         the whole holdout, flushing an intermediate report every ``report_every`` games.
+
+        ``shard`` = (i, n), 1-based: simulate only ``holdout[i-1::n]`` so n concurrent processes can
+        split the holdout across CPU cores while sharing one GPU (the rollout's worker threads are
+        GIL-bound, so a single process can't use them). The slices are disjoint, per-game seeds do
+        not depend on position, and each game's results land in its own folder — so a sharded run's
+        games are bit-identical to an unsharded run's. Sharded calls do NOT write the aggregate
+        report (concurrent partial writes would race); merge with :meth:`report` (--report-only)
+        once every shard finishes. They also leave the run state untouched.
         """
         from reporting.eval_report import resolve_results_run_dir
         from simulation.stage_eval import evaluate_stage
@@ -187,18 +196,34 @@ class FullRun:
         games_per_batch = EVAL_GAMES_PER_BATCH
         holdout = self.state["holdout_game_ids"]
         run_dir = resolve_results_run_dir(version, name=name, holdout_total=len(holdout))
-        self.state["last_eval_name"] = run_dir.name
-        self._save()
+        if shard is None:
+            self.state["last_eval_name"] = run_dir.name
+            self._save()
+        else:
+            i, n = shard
+            holdout = holdout[i - 1::n]
+            print(f"[eval] shard {i}/{n}: {len(holdout)} of "
+                  f"{len(self.state['holdout_game_ids'])} holdout games -> {run_dir}")
 
         report = evaluate_stage(
             f"v{version}", holdout_ids=holdout, n_sims=n_sims, max_new=max_new,
             report_every=report_every, data_dir=self.state["data_dir"],
             processed_dir=self.state["processed_dir"], artifacts_root=version_root(version),
             results_run_dir=run_dir, batch_size=batch_size, games_per_batch=games_per_batch,
+            write_report=shard is None,
         )
         done, total = report["done"], report["total"]
         print("\n" + "=" * 70)
-        if done >= total:
+        if shard is not None:
+            i, n = shard
+            if done >= total:
+                print(f"SHARD {i}/{n} DONE — all {total} of its games predicted. Once EVERY shard "
+                      f"is done, merge the report:")
+                print(f"  python evaluate.py --version {version} --name {run_dir.name} --report-only")
+            else:
+                print(f"SHARD {i}/{n} STOP — {done}/{total} of its games done. Re-run to continue:")
+                print(f"  python evaluate.py --version {version} --name {run_dir.name} --shard {i}/{n}")
+        elif done >= total:
             print(f"DONE — all {total} holdout games predicted. Report:")
         else:
             print(f"STOP — {done}/{total} holdout games done. Re-run to continue:")
