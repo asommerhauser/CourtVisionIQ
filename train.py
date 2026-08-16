@@ -15,6 +15,12 @@ user-launched; nothing auto-advances.
   python train.py --model shot_result [--version 1.1]
       Retrain ONE head in place, keeping the rest. Targets the current run's version.
 
+  python train.py --adopt --version 1.0
+      Trains NOTHING. Rebuilds the local run state for weights that already exist in
+      artifacts/v1.0/ (e.g. unpacked from a tarball on a fresh GPU pod) so evaluate.py can run.
+      The run state is machine-local and never committed, so this is the missing first step
+      whenever you move a trained version to a new machine.
+
   python train.py --status
       Show full-run progress.
 
@@ -41,6 +47,10 @@ def main() -> None:
                       help="Retrain ONE head in place (keeps the others).")
     mode.add_argument("--continue", dest="cont", action="store_true",
                       help="Resume an interrupted full train at the next unfinished head.")
+    mode.add_argument("--adopt", action="store_true",
+                      help="Trains nothing: rebuild the local run state for weights already in "
+                           "artifacts/v<version>/ so evaluate.py can run them (use on a fresh "
+                           "machine/pod after unpacking a weights tarball).")
     mode.add_argument("--status", action="store_true", help="Show full-run progress.")
 
     ap.add_argument("--version", help="Model version label, e.g. 1.1 (required with --full).")
@@ -77,6 +87,10 @@ def main() -> None:
             ap.error(f"--model targets the current run version '{run.state.get('version')}', "
                      f"not '{args.version}'. Run a --full train for that version first.")
         run.retrain_model(args.model)
+    elif args.adopt:
+        if not args.version:
+            ap.error("--adopt requires --version (which weights dir to adopt, e.g. --version 1.0).")
+        run.adopt(version=args.version, data_dir=args.data_dir, processed_dir=args.processed_dir)
     elif args.cont:
         run.train()
     elif args.status:

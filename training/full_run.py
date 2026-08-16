@@ -28,13 +28,17 @@ from config import (
     DEFAULT_VERSION, EVAL_BATCH, EVAL_GAMES_PER_BATCH, FINAL_HOLDOUT_GAMES, FINAL_SEASON_FRACTION,
     ROLLOUT_BATCH_SIZE, SEED, STAGE_SIMS, SUBSET_MODEL_KEYS, TEST_FRAC,
 )
-from models.artifacts import version_root
+from models.artifacts import ModelArtifacts, version_root
+from models.event_time_model import EventTimeModel
 from models.registry import STAGE_MODEL_KEYS
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
 from training.chronology import game_index, sequential_partition
 from training.subset import load_subset_games
 
 DEFAULT_STATE_PATH = "./training/full_run_state.json"
+
+# The game-skeleton head: without it there is no simulator, so it is the one head `adopt` requires.
+EVENT_TIME_KEY = EventTimeModel.KEY
 
 
 class FullRun:
@@ -51,19 +55,25 @@ class FullRun:
 
     def _require(self) -> None:
         if not self.state:
-            raise SystemExit("No full-run state. Run:  python train.py --full --version X.Y --batch-size N")
+            raise SystemExit(
+                f"No full-run state at {self.state_path} (it is machine-local and never committed, "
+                f"so a fresh checkout never has one).\n"
+                f"  Weights already on disk (e.g. unpacked into ./artifacts/v1.0/)?\n"
+                f"      python train.py --adopt --version 1.0        # builds the state, trains nothing\n"
+                f"  Otherwise train from scratch:\n"
+                f"      python train.py --full --version X.Y --batch-size N"
+            )
 
-    # --------------------------------------------------------------- setup
-    def setup(self, *, version: str | None = None, data_dir: str = "./data",
-              processed_dir: str = "./data/processed", epochs: int = 50, batch_size: int = 64) -> None:
-        """Compute the train/holdout cut from the already-cleaned data (no re-clean / re-warmup).
+    # --------------------------------------------------------------- cut / holdout
+    @staticmethod
+    def _cut(data_dir: str):
+        """Compute the train/holdout cut from the cleaned data in ``data_dir``.
 
-        ``version`` (e.g. ``"1.0"``) names the weights dir (``artifacts/v<version>/``) and the report
-        label (``v<version>``). Defaults to ``DEFAULT_VERSION`` so existing callers/tests keep working.
+        Returns ``(idx, boundary, holdout_ids)``. Pure function of the cleaned season CSVs plus
+        the frozen config constants (``FINAL_SEASON_FRACTION`` / ``FINAL_HOLDOUT_GAMES``),
+        so it reproduces the same cut on any machine with the same data — which is what lets
+        :meth:`adopt` rebuild an eval-ready state for weights trained somewhere else.
         """
-        version = version or DEFAULT_VERSION
-        artifacts_root = version_root(version)
-        run_name = f"v{version}"
         idx = game_index(data_dir)
         last_season = int(idx["season"].max())
         reg = idx[(idx["season"] == last_season) & idx["is_regular"]]
@@ -76,10 +86,24 @@ class FullRun:
                 f"not enough games after the cut for a {FINAL_HOLDOUT_GAMES}-game holdout "
                 f"(boundary {boundary}, corpus {len(idx)})."
             )
-        _, _, holdout = sequential_partition(idx, boundary, n_holdout=FINAL_HOLDOUT_GAMES,
-                                             val_frac=TEST_FRAC, seed=SEED)
+        # The holdout is the ordered block right after the cut. (train/val only matter to a train,
+        # which builds them itself via sequential_partition on this same boundary.)
         ordered = idx["game_id"].to_numpy()
         holdout_ids = [int(g) for g in ordered[boundary:boundary + FINAL_HOLDOUT_GAMES]]
+        return idx, boundary, holdout_ids
+
+    # --------------------------------------------------------------- setup
+    def setup(self, *, version: str | None = None, data_dir: str = "./data",
+              processed_dir: str = "./data/processed", epochs: int = 50, batch_size: int = 64) -> None:
+        """Compute the train/holdout cut from the already-cleaned data (no re-clean / re-warmup).
+
+        ``version`` (e.g. ``"1.0"``) names the weights dir (``artifacts/v<version>/``) and the report
+        label (``v<version>``). Defaults to ``DEFAULT_VERSION`` so existing callers/tests keep working.
+        """
+        version = version or DEFAULT_VERSION
+        artifacts_root = version_root(version)
+        run_name = f"v{version}"
+        idx, boundary, holdout_ids = self._cut(data_dir)
 
         self.state = {
             "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -95,12 +119,80 @@ class FullRun:
         by_id = idx.set_index("game_id")
         first, last = by_id.loc[holdout_ids[0]], by_id.loc[holdout_ids[-1]]
         print(f"[setup] version {version}: cut at {int(FINAL_SEASON_FRACTION * 100)}% "
-              f"of season {last_season}'s regular schedule -> {boundary} train games.")
+              f"of season {int(idx['season'].max())}'s regular schedule -> {boundary} train games.")
         print(f"[setup] holdout = {len(holdout_ids)} games (g{holdout_ids[0]} .. g{holdout_ids[-1]}, "
               f"{first['game_date']} .. {last['game_date']}), predicted {EVAL_BATCH} at a time.")
         print(f"[setup] full-train weights -> {artifacts_root}")
         print(f"State -> {self.state_path}\nNext:  python train.py --full --version {version} "
               f"--batch-size {batch_size}")
+
+    # --------------------------------------------------------------- adopt
+    def adopt(self, *, version: str | None = None, data_dir: str = "./data",
+              processed_dir: str = "./data/processed") -> None:
+        """Build an eval-ready run state for weights that were trained on ANOTHER machine.
+
+        The run state (``full_run_state.json``) is machine-local and never committed — it is written
+        by :meth:`setup`, which only runs as part of a full train. So a fresh checkout that has the
+        weights (``artifacts/v<version>/``) but not the state cannot evaluate: ``evaluate.py`` sees no
+        state and tells you to retrain. That is the gap this closes — the exact case of shipping a
+        trained version to a rented GPU pod to run (or re-run, after an inference-dial change) the
+        holdout eval.
+
+        Nothing is trained and no weights are touched. The cut + holdout come from :meth:`_cut`,
+        which is deterministic given the cleaned data and the frozen config constants, so the holdout
+        is identical to the one the original train wrote. The state is marked ``trained`` with the
+        heads actually present on disk.
+
+        Refuses to overwrite an interrupted train's state (``status == "training"``), whose
+        ``trained_models`` list is the only record of how far that train got.
+        """
+        version = version or self.state.get("version") or DEFAULT_VERSION
+        artifacts_root = version_root(version)
+
+        if self.state.get("status") == "training":
+            raise SystemExit(
+                f"{self.state_path} holds an INTERRUPTED train (version "
+                f"{self.state.get('version', '?')}, {len(self.state.get('trained_models', []))}/"
+                f"{len(STAGE_MODEL_KEYS)} heads done). Adopting would discard it. Finish it with "
+                f"`python train.py --continue`, or move that file aside first."
+            )
+
+        found = [k for k in STAGE_MODEL_KEYS
+                 if ModelArtifacts.for_key(k, artifacts_root).exists()]
+        if not found:
+            raise SystemExit(
+                f"No model weights under {Path(artifacts_root).resolve()} - nothing to adopt. "
+                f"Expected <key>/<key>.weights.h5 per head (e.g. event_time/event_time.weights.h5). "
+                f"Unpack the version's weights tarball into ./artifacts/ first."
+            )
+        if EVENT_TIME_KEY not in found:
+            raise SystemExit(
+                f"'{EVENT_TIME_KEY}' weights missing under {Path(artifacts_root).resolve()} — it is "
+                f"the game skeleton, so the simulator cannot load without it. Found: {found}."
+            )
+
+        idx, boundary, holdout_ids = self._cut(data_dir)
+        self.state = {
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "version": version, "data_dir": data_dir, "processed_dir": processed_dir,
+            "artifacts_root": artifacts_root, "reports_root": DEFAULT_REPORTS_ROOT,
+            "epochs": 0, "batch_size": 0, "run_name": f"v{version}",
+            "n_games": int(len(idx)), "boundary_idx": boundary,
+            "holdout_game_ids": holdout_ids, "eval_batch": EVAL_BATCH,
+            "status": "trained", "trained_models": found, "adopted": True,
+        }
+        self._save()
+
+        missing = [k for k in STAGE_MODEL_KEYS if k not in found]
+        by_id = idx.set_index("game_id")
+        first, last = by_id.loc[holdout_ids[0]], by_id.loc[holdout_ids[-1]]
+        print(f"[adopt] version {version}: {len(found)}/{len(STAGE_MODEL_KEYS)} heads found in "
+              f"{artifacts_root}")
+        if missing:
+            print(f"[adopt] NOT on disk (the simulator will fall back for these): {missing}")
+        print(f"[adopt] holdout = {len(holdout_ids)} games (g{holdout_ids[0]} .. g{holdout_ids[-1]}, "
+              f"{first['game_date']} .. {last['game_date']}), cut at game {boundary} of {len(idx)}.")
+        print(f"State -> {self.state_path}\nNext:  python evaluate.py --version {version}")
 
     # --------------------------------------------------------------- train
     def train(self, *, rebuild_vocabs: bool = False) -> None:
@@ -183,8 +275,14 @@ class FullRun:
 
         self._require()
         if self.state["status"] != "trained":
-            print("[eval] not trained yet — run:  python train.py --full --version "
-                  f"{self.state.get('version', DEFAULT_VERSION)} --batch-size {self.state['batch_size']}")
+            v = self.state.get("version", DEFAULT_VERSION)
+            print(f"[eval] run state says status={self.state['status']!r}, not 'trained'.")
+            if ModelArtifacts.for_key(EVENT_TIME_KEY, version_root(version or v)).exists():
+                print(f"[eval] but v{version or v} weights ARE on disk — adopt them (no training):")
+                print(f"         python train.py --adopt --version {version or v}")
+            else:
+                print(f"[eval] finish the train:  python train.py --full --version {v} "
+                      f"--batch-size {self.state['batch_size']}")
             return
 
         version = version or self.state.get("version", DEFAULT_VERSION)

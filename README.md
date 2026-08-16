@@ -107,6 +107,46 @@ a few dollars.
 4. Run the commands below. When done, pull `results/` + `reports/` (and `artifacts/` if you want
    the weights) back, then **terminate the pod** so billing stops.
 
+#### Evaluating weights you already trained (no retrain)
+
+The common case: v1.0 is trained, you changed only *inference dials* (`config.py`), and you want a
+fresh holdout eval on a rented GPU. Two things a clone does **not** bring, because both are
+gitignored — the **weights** and the **run state**:
+
+| What | Where | Committed? | How it gets to the pod |
+| --- | --- | --- | --- |
+| Code + frozen vocabs (`encoder/vocabs/*.json`) | repo | **yes** | `git clone` / `git pull` |
+| Inference dials (`config.py`) | repo | **yes** | `git clone` / `git pull` |
+| Cleaned seasons (`data/season*.csv`) | `/data` | no | `seasons.tgz` (step 2) |
+| Trained weights (`artifacts/v1.0/**`) | `/artifacts` | no | weights tarball, below |
+| Run state (`training/full_run_state.json`) | `/training` | no | **`train.py --adopt`**, below |
+
+The run state holds the holdout game IDs and the train/holdout cut. It is written by `train.py`
+during a full train and is machine-local, so a fresh pod has none — and without it `evaluate.py`
+stops with *"No full-run state"*. `--adopt` rebuilds it from the data + the weights on disk, and
+trains nothing. (The cut is a pure function of the cleaned CSVs and the frozen constants in
+`config.py`, so the reconstructed holdout is identical to the one the original train used.)
+
+```bash
+# on your machine — weights only; skip the .keras files, the reload path uses .weights.h5
+tar -czf v1.0-weights.tgz artifacts/v1.0/*/*.weights.h5 artifacts/v1.0/*/norm_stats.json
+tar -tzf v1.0-weights.tgz | head        # SANITY-CHECK IT — a 45-byte tgz is an empty archive
+```
+```bash
+# on the pod, from the repo root, after steps 1-3
+tar -xzf v1.0-weights.tgz               # -> artifacts/v1.0/<head>/<head>.weights.h5
+python train.py --adopt --version 1.0   # rebuilds run state; trains nothing
+python train.py --status                # version=1.0, status=trained, 11/11 heads, holdout 100
+python evaluate.py --version 1.0 --name trial2 --monte-carlo 21 --concurrency 24
+```
+
+`--adopt` refuses (rather than writing a state that fails later) when the weights are missing, when
+`event_time` — the game skeleton — is absent, or when it would discard an interrupted train's
+progress. Re-running it is safe and idempotent.
+
+Changed only a dial and want a second eval? Just `git pull` and run `evaluate.py` again under a new
+`--name` — the state and weights on the pod stay valid.
+
 ---
 
 ## Data cleaning
@@ -139,6 +179,9 @@ python train.py --model shot_result
 
 # Progress:
 python train.py --status
+
+# Adopt weights trained on another machine (trains nothing — see the cloud-GPU section):
+python train.py --adopt --version 1.0
 ```
 
 A full train re-preprocesses each head from `data/`, writes weights to `artifacts/v<version>/`, and
@@ -157,6 +200,10 @@ equal to `--batch-size` on a roomy card, lower it only if a player-vocab head OO
 
 Simulates the holdout (from the training run's frozen holdout set) against reality and writes a
 results run under `results/v<version>/<eval-name>/`.
+
+> Needs `training/full_run_state.json`, which is machine-local and never committed. On a machine
+> that has the weights but never ran the train (a fresh pod), create it first with
+> `python train.py --adopt --version 1.0`.
 
 ```bash
 # Evaluate v1.0's holdout (auto-named eval-NNN), default sims + concurrency:

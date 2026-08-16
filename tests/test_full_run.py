@@ -2,6 +2,7 @@
 import json
 
 import pandas as pd
+import pytest
 
 from config import FINAL_HOLDOUT_GAMES, FULL_ARTIFACTS_ROOT
 from training.full_run import FullRun
@@ -48,6 +49,102 @@ def test_setup_cuts_mid_last_season(tmp_path):
     idx = game_index(str(data_dir)).set_index("game_id")
     for g in st["holdout_game_ids"]:
         assert int(idx.loc[g, "season"]) == 2005 and int(idx.loc[g, "playoff"]) == 1
+
+
+def _fake_weights(root, keys):
+    """Lay down the minimum on-disk shape ModelArtifacts.exists() looks for."""
+    for key in keys:
+        d = root / key
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{key}.weights.h5").write_bytes(b"")
+    return root
+
+
+def _corpus(tmp_path):
+    data_dir = tmp_path / "data"; data_dir.mkdir()
+    _season_csv(data_dir / "season2003.csv", 2003, 20, 4)
+    _season_csv(data_dir / "season2004.csv", 2004, 20, 4)
+    _season_csv(data_dir / "season2005.csv", 2005, 220, 10)
+    return data_dir
+
+
+def test_adopt_reproduces_setups_holdout_without_training(tmp_path, monkeypatch):
+    """Weights trained elsewhere + this repo's data must yield the SAME cut setup would have."""
+    from models.registry import STAGE_MODEL_KEYS
+    import training.full_run as full_run
+
+    data_dir = _corpus(tmp_path)
+    arts = _fake_weights(tmp_path / "artifacts" / "v1.0", STAGE_MODEL_KEYS)
+    monkeypatch.setattr(full_run, "version_root", lambda v, **k: str(arts))
+
+    expected = FullRun(state_path=str(tmp_path / "setup.json"))
+    expected.setup(version="1.0", data_dir=str(data_dir), processed_dir=str(tmp_path / "proc"))
+
+    run = FullRun(state_path=str(tmp_path / "adopted.json"))
+    run.adopt(version="1.0", data_dir=str(data_dir), processed_dir=str(tmp_path / "proc"))
+
+    assert run.state["boundary_idx"] == expected.state["boundary_idx"]
+    assert run.state["holdout_game_ids"] == expected.state["holdout_game_ids"]
+    # ...but unlike setup, it is immediately evaluable.
+    assert run.state["status"] == "trained"
+    assert run.state["trained_models"] == list(STAGE_MODEL_KEYS)
+    assert run.state["adopted"] is True
+
+
+def test_adopt_records_only_the_heads_on_disk(tmp_path, monkeypatch):
+    from models.registry import STAGE_MODEL_KEYS
+    import training.full_run as full_run
+
+    data_dir = _corpus(tmp_path)
+    present = [full_run.EVENT_TIME_KEY, STAGE_MODEL_KEYS[1]]
+    arts = _fake_weights(tmp_path / "artifacts" / "v1.0", present)
+    monkeypatch.setattr(full_run, "version_root", lambda v, **k: str(arts))
+
+    run = FullRun(state_path=str(tmp_path / "state.json"))
+    run.adopt(version="1.0", data_dir=str(data_dir))
+    assert run.state["trained_models"] == present
+
+
+def test_adopt_refuses_without_the_event_time_head(tmp_path, monkeypatch):
+    """The event/time head is the game skeleton — adopting without it would fail later, in the sim."""
+    from models.registry import STAGE_MODEL_KEYS
+    import training.full_run as full_run
+
+    data_dir = _corpus(tmp_path)
+    others = [k for k in STAGE_MODEL_KEYS if k != full_run.EVENT_TIME_KEY]
+    arts = _fake_weights(tmp_path / "artifacts" / "v1.0", others)
+    monkeypatch.setattr(full_run, "version_root", lambda v, **k: str(arts))
+
+    run = FullRun(state_path=str(tmp_path / "state.json"))
+    with pytest.raises(SystemExit, match=full_run.EVENT_TIME_KEY):
+        run.adopt(version="1.0", data_dir=str(data_dir))
+
+
+def test_adopt_refuses_with_no_weights_at_all(tmp_path, monkeypatch):
+    import training.full_run as full_run
+
+    data_dir = _corpus(tmp_path)
+    empty = tmp_path / "artifacts" / "v1.0"; empty.mkdir(parents=True)
+    monkeypatch.setattr(full_run, "version_root", lambda v, **k: str(empty))
+
+    run = FullRun(state_path=str(tmp_path / "state.json"))
+    with pytest.raises(SystemExit, match="nothing to adopt"):
+        run.adopt(version="1.0", data_dir=str(data_dir))
+
+
+def test_adopt_refuses_to_discard_an_interrupted_train(tmp_path, monkeypatch):
+    from models.registry import STAGE_MODEL_KEYS
+    import training.full_run as full_run
+
+    data_dir = _corpus(tmp_path)
+    arts = _fake_weights(tmp_path / "artifacts" / "v1.0", STAGE_MODEL_KEYS)
+    monkeypatch.setattr(full_run, "version_root", lambda v, **k: str(arts))
+
+    state_path = _state(tmp_path, status="training")
+    run = FullRun(state_path=state_path)
+    run.state["trained_models"] = ["event_time", "player"]
+    with pytest.raises(SystemExit, match="INTERRUPTED"):
+        run.adopt(version="1.0", data_dir=str(data_dir))
 
 
 def _state(tmp_path, status):
