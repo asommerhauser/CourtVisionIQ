@@ -101,7 +101,13 @@ class _BatchCoordinator:
                  progress: "_Progress | None" = None):
         self.infer_fn = infer_fn
         self.live = n_workers
-        self.cond = threading.Condition()
+        # Two conditions over ONE lock (so there is no lost-wakeup window between them). A submit
+        # only ever needs to wake the coordinator, but a single shared Condition made it wake all
+        # B-1 sleeping workers too — B notifies x B sleepers x ~2500 rounds is millions of
+        # pointless GIL handoffs per run, on the exact thread pool the rollout is bottlenecked on.
+        self.lock = threading.Lock()
+        self.submit_cond = threading.Condition(self.lock)   # only the coordinator waits here
+        self.result_cond = threading.Condition(self.lock)   # workers wait here
         self.pending: dict[int, tuple[str, dict]] = {}   # worker_id -> (model_key, inputs)
         self.results: dict[int, dict] = {}               # worker_id -> output dict
         self.progress = progress
@@ -109,38 +115,41 @@ class _BatchCoordinator:
     # --- worker-facing API (called from worker threads) ---
     def request(self, worker_id: int, model_key: str, inputs: dict) -> dict:
         """Submit one forward pass and block until the batched result for this worker is ready."""
-        with self.cond:
+        with self.result_cond:                  # same lock as submit_cond
             self.pending[worker_id] = (model_key, inputs)
-            self.cond.notify_all()
+            self.submit_cond.notify()           # wake ONLY the coordinator
             while worker_id not in self.results:
-                self.cond.wait()
+                self.result_cond.wait()
             return self.results.pop(worker_id)
 
-    def worker_done(self, n_events: int = 0) -> None:
-        """A worker finished its game; drop it from the live set so the barrier can re-evaluate."""
-        with self.cond:
+    def worker_done(self) -> None:
+        """This slot will submit no more requests; drop it so the barrier can re-evaluate.
+
+        Called once per *slot*, at slot exit — not once per game. A slot runs many games
+        back-to-back (see :func:`run_jobs_batched`), and ``live`` must mean "slots that can still
+        submit", which is what the barrier predicate ``len(pending) < live`` tests.
+        """
+        with self.lock:
             self.live -= 1
-            self.cond.notify_all()
-        if self.progress is not None:
-            self.progress.complete_one(n_events)
+            self.submit_cond.notify()
 
     # --- coordinator loop (run on the main/driver thread) ---
     def run(self) -> None:
         """Batch-and-dispatch until every worker has finished."""
         while True:
-            with self.cond:
+            with self.submit_cond:
                 # Wait until all still-running workers are blocked on a request (or all are done).
                 while self.live > 0 and len(self.pending) < self.live:
-                    self.cond.wait()
+                    self.submit_cond.wait()
                 if self.live == 0 and not self.pending:
                     break
                 batch = self.pending
                 self.pending = {}
             # Heavy work outside the lock — every batched worker is parked in request().
             outs = self._run_batch(batch)
-            with self.cond:
+            with self.result_cond:
                 self.results.update(outs)
-                self.cond.notify_all()
+                self.result_cond.notify_all()   # every parked worker does have a result now
             if self.progress is not None:
                 self.progress.tick(passes=len(self._last_groups), rows=len(batch))
 
@@ -240,41 +249,68 @@ class _Progress:
 def run_jobs_batched(master: GameSimulator, jobs: list[GameJob], *, batch_size: int,
                      greedy: bool = False, show_progress: bool = True,
                      progress: _Progress | None = None) -> list[list[dict]]:
-    """Run ``jobs`` in cohorts of ``batch_size`` concurrent games; return histories in job order.
+    """Run ``jobs`` on a pool of ``batch_size`` concurrent slots; return histories in job order.
 
-    Each cohort spins up one worker thread per game (each a real ``GameController`` over a
-    ``_WorkerSim``) plus the coordinator on this thread; all share the master's weights. The result
-    list is aligned to ``jobs``.
+    ``batch_size`` is the number of games in flight at once (the VRAM knob), **not** a cohort
+    size. Each slot is a thread that pulls the next unclaimed job, plays it with a real
+    ``GameController`` over a ``_WorkerSim``, and immediately pulls another — so a slot that draws
+    a short game backfills instead of idling. The previous strict-cohort loop drained and restarted
+    the whole pool every ``batch_size`` jobs, and since real games run ~400-1200 events, the last
+    fifth of every cohort ran at an effective batch of 1-5. Slots share the master's weights and
+    the one coordinator; the result list is aligned to ``jobs``.
+
+    Scheduling only: ``histories`` is index-addressed and ``GameJob.seed`` does not depend on
+    position, so which games happen to be concurrent cannot change any game's result.
     """
     histories: list[list[dict]] = [None] * len(jobs)  # type: ignore[list-item]
     if progress is None:
         progress = _Progress(total=len(jobs), enabled=show_progress)
+    if not jobs:
+        if show_progress:
+            progress.finish()
+        return histories
 
-    for start in range(0, len(jobs), batch_size):
-        cohort = list(range(start, min(start + batch_size, len(jobs))))
-        coord = _BatchCoordinator(master._infer, n_workers=len(cohort), progress=progress)
+    n_slots = max(1, min(batch_size, len(jobs)))
+    coord = _BatchCoordinator(master._infer, n_workers=n_slots, progress=progress)
 
-        def _worker(slot: int, job_idx: int) -> None:
-            job = jobs[job_idx]
-            wsim = _WorkerSim(master, coord, worker_id=slot)
-            ctrl = GameController(wsim, seed=job.seed, greedy=greedy)
-            ctrl.start(job.home_roster, job.away_roster, possession=job.possession,
-                       season=str(job.season), home_starters=job.home_starters,
-                       away_starters=job.away_starters, season_context=job.season_context)
-            history = None
-            try:
-                history = ctrl.run()
-                histories[job_idx] = history
-            finally:
-                coord.worker_done(len(history) if history else 0)
+    claim_lock = threading.Lock()
+    cursor = 0
 
-        threads = [threading.Thread(target=_worker, args=(slot, job_idx), daemon=True)
-                   for slot, job_idx in enumerate(cohort)]
-        for t in threads:
-            t.start()
-        coord.run()
-        for t in threads:
-            t.join()
+    def _claim() -> int | None:
+        """Hand out the next unclaimed job index, or None once the list is drained."""
+        nonlocal cursor
+        with claim_lock:
+            if cursor >= len(jobs):
+                return None
+            cursor += 1
+            return cursor - 1
+
+    def _slot(slot: int) -> None:
+        try:
+            while (job_idx := _claim()) is not None:
+                job = jobs[job_idx]
+                wsim = _WorkerSim(master, coord, worker_id=slot)
+                ctrl = GameController(wsim, seed=job.seed, greedy=greedy)
+                ctrl.start(job.home_roster, job.away_roster, possession=job.possession,
+                           season=str(job.season), home_starters=job.home_starters,
+                           away_starters=job.away_starters, season_context=job.season_context)
+                history = None
+                try:
+                    history = ctrl.run()
+                    histories[job_idx] = history
+                finally:
+                    progress.complete_one(len(history) if history else 0)
+        finally:
+            # Once per slot, at slot exit — the barrier counts slots, not games.
+            coord.worker_done()
+
+    threads = [threading.Thread(target=_slot, args=(slot,), daemon=True)
+               for slot in range(n_slots)]
+    for t in threads:
+        t.start()
+    coord.run()
+    for t in threads:
+        t.join()
 
     if show_progress:
         progress.finish()

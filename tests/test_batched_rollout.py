@@ -24,7 +24,7 @@ def _run(n_workers, routine, infer_fn, timeout=10.0):
         try:
             routine(wid, coord, results)
         finally:
-            coord.worker_done(0)
+            coord.worker_done()
 
     workers = [threading.Thread(target=worker, args=(i,)) for i in range(n_workers)]
     cthread = threading.Thread(target=coord.run)
@@ -99,3 +99,105 @@ def test_groups_requests_by_head_within_a_round():
     # One barrier round, two head groups of two -> exactly two batched calls.
     assert ("a", 2) in seen and ("b", 2) in seen
     assert len(seen) == 2
+
+
+# ===================================================================== #
+# --- Slot pool: backfill instead of strict cohorts                    --
+# ===================================================================== #
+
+class _StubMaster:
+    """Enough of a GameSimulator for run_jobs_batched: an _infer and the attrs _WorkerSim copies."""
+
+    def __init__(self):
+        self.model = object()
+        self.instance = None
+        self.heads = {}
+        self.stint_norm_stats = {}
+        self.condtime_norm_stats = {}
+        self.batch_widths: list[int] = []
+
+    def _infer(self, model_key, stacked):
+        self.batch_widths.append(stacked["x"].shape[0])
+        return {"y": stacked["x"]}
+
+
+def _patch_pool(monkeypatch, lengths):
+    """Replace _WorkerSim/GameController so a "game" is just N coordinator requests.
+
+    ``lengths[i]`` is how many requests job i makes — the knob that creates the ragged tails a
+    strict-cohort loop cannot backfill.
+    """
+    import simulation.batched_rollout as br
+
+    class FakeWorkerSim:
+        def __init__(self, master, coordinator, worker_id):
+            self.coord, self.wid = coordinator, worker_id
+
+    class FakeController:
+        def __init__(self, sim, seed=0, greedy=False):
+            self.sim, self.seed = sim, seed
+
+        def start(self, *a, **kw):
+            pass
+
+        def run(self):
+            for _ in range(lengths[self.seed]):
+                self.sim.coord.request(self.sim.wid, "m", {"x": np.array([[float(self.seed)]])})
+            return [{"event": "e"}] * lengths[self.seed]
+
+    monkeypatch.setattr(br, "_WorkerSim", FakeWorkerSim)
+    monkeypatch.setattr(br, "GameController", FakeController)
+
+
+def test_slots_backfill_and_every_job_runs(monkeypatch):
+    """More jobs than slots: results stay aligned to `jobs`, and no job is skipped or doubled."""
+    import simulation.batched_rollout as br
+
+    lengths = [3, 12, 4, 1, 9, 2, 7, 5, 6, 11]      # deliberately ragged
+    _patch_pool(monkeypatch, lengths)
+    master = _StubMaster()
+    jobs = [br.GameJob(home_roster=[], away_roster=[], seed=i) for i in range(len(lengths))]
+
+    histories = br.run_jobs_batched(master, jobs, batch_size=3, show_progress=False)
+
+    assert [len(h) for h in histories] == lengths, "results must stay aligned to job order"
+
+
+def test_backfill_keeps_the_batch_full_past_the_first_cohort(monkeypatch):
+    """The point of the pool: a finished short game is replaced, not left as a hole in the batch.
+
+    With 3 slots and one very long job, the strict-cohort loop would drain to width 1 three times
+    (once per cohort of 3). The pool holds width 3 until the job list is genuinely exhausted.
+    """
+    import simulation.batched_rollout as br
+
+    lengths = [1, 1, 1, 1, 1, 1, 1, 1, 40]
+    _patch_pool(monkeypatch, lengths)
+    master = _StubMaster()
+    jobs = [br.GameJob(home_roster=[], away_roster=[], seed=i) for i in range(len(lengths))]
+
+    br.run_jobs_batched(master, jobs, batch_size=3, show_progress=False)
+
+    widths = master.batch_widths
+    assert sum(widths) == sum(lengths), "every request must be served exactly once"
+    # The long job's tail is unavoidably width 1, but the short jobs must not have been.
+    assert max(widths) == 3
+    assert widths.count(1) <= 40 + 2, "short jobs should have been pooled, not run one at a time"
+
+
+def test_pool_handles_more_slots_than_jobs(monkeypatch):
+    import simulation.batched_rollout as br
+
+    lengths = [2, 3]
+    _patch_pool(monkeypatch, lengths)
+    master = _StubMaster()
+    jobs = [br.GameJob(home_roster=[], away_roster=[], seed=i) for i in range(2)]
+
+    histories = br.run_jobs_batched(master, jobs, batch_size=32, show_progress=False)
+    assert [len(h) for h in histories] == lengths
+
+
+def test_pool_with_no_jobs_is_a_noop():
+    import simulation.batched_rollout as br
+
+    assert br.run_jobs_batched(_StubMaster(), [], batch_size=8, show_progress=False) == []
