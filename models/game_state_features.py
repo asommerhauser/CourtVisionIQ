@@ -98,29 +98,31 @@ def _norm(value) -> str:
 # --- Derivation    ---
 # =====================
 
-def derive_game_state(rows) -> dict[str, np.ndarray]:
-    """Per-row running game state for one game's ordered event ``rows`` (inclusive of each row).
+class GameStateScan:
+    """Incremental form of :func:`derive_game_state`: feed rows in order, get each row's raw state.
 
-    ``rows`` is an ordered iterable of dict-like events carrying at least ``event, player,
-    type, result, time`` and the per-row ``roster_home`` / ``roster_away`` snapshots — the
-    shape produced by both the cleaned data and ``GameSimulator`` history. Scoring follows the
-    box-score semantics (made shot → 2 / 3 / 1 by type; scoring team = the player's side by
-    roster membership). Returns raw (un-normalized) ``(N,)`` float arrays keyed by
-    ``GAME_STATE_KEYS``.
+    ``derive_game_state`` is a thin loop over this, so preprocessing (a whole game at once) and
+    the simulator (one row at a time, as the rollout appends) execute literally the same code —
+    the train/inference parity this module promises holds by construction rather than by
+    convention. State is inclusive of the row just fed.
     """
-    rows = list(rows)
-    n = len(rows)
-    out = {k: np.zeros((n,), dtype=np.float32) for k in GAME_STATE_KEYS}
 
-    home_pts = away_pts = 0
-    fouls_home = fouls_away = 0
-    cur_period = -1
-    for i, row in enumerate(rows):
+    __slots__ = ("home_pts", "away_pts", "fouls_home", "fouls_away", "cur_period")
+
+    def __init__(self) -> None:
+        self.home_pts = 0
+        self.away_pts = 0
+        self.fouls_home = 0
+        self.fouls_away = 0
+        self.cur_period = -1
+
+    def step(self, row) -> tuple:
+        """Fold one event row in; return its raw state values in ``GAME_STATE_KEYS`` order."""
         t = float(row.get("time") or 0.0)
         period = _period_index(t)
-        if period != cur_period:            # per-period team-foul reset (controller parity)
-            fouls_home = fouls_away = 0
-            cur_period = period
+        if period != self.cur_period:       # per-period team-foul reset (controller parity)
+            self.fouls_home = self.fouls_away = 0
+            self.cur_period = period
 
         event = _norm(row.get("event"))
         if event not in _SKIP_EVENTS:
@@ -134,21 +136,40 @@ def derive_game_state(rows) -> dict[str, np.ndarray]:
             if event == "shot" and result == "made":
                 pts = 3 if etype == "3pt" else 1 if etype == "free throw" else 2
                 if team == "home":
-                    home_pts += pts
+                    self.home_pts += pts
                 elif team == "away":
-                    away_pts += pts
+                    self.away_pts += pts
             elif event == "foul" and etype not in NON_TEAM_FOUL_TYPES:
                 if team == "home":
-                    fouls_home += 1
+                    self.fouls_home += 1
                 elif team == "away":
-                    fouls_away += 1
+                    self.fouls_away += 1
 
-        out["score_diff"][i] = home_pts - away_pts
-        out["score_total"][i] = home_pts + away_pts
-        out["period_idx"][i] = period
-        out["period_time_left"][i] = _period_end(t) - t
-        out["team_fouls_home"][i] = fouls_home
-        out["team_fouls_away"][i] = fouls_away
+        return (self.home_pts - self.away_pts,
+                self.home_pts + self.away_pts,
+                period,
+                _period_end(t) - t,
+                self.fouls_home,
+                self.fouls_away)
+
+
+def derive_game_state(rows) -> dict[str, np.ndarray]:
+    """Per-row running game state for one game's ordered event ``rows`` (inclusive of each row).
+
+    ``rows`` is an ordered iterable of dict-like events carrying at least ``event, player,
+    type, result, time`` and the per-row ``roster_home`` / ``roster_away`` snapshots — the
+    shape produced by both the cleaned data and ``GameSimulator`` history. Scoring follows the
+    box-score semantics (made shot -> 2 / 3 / 1 by type; scoring team = the player's side by
+    roster membership). Returns raw (un-normalized) ``(N,)`` float arrays keyed by
+    ``GAME_STATE_KEYS``. A thin driver over :class:`GameStateScan`.
+    """
+    rows = list(rows)
+    n = len(rows)
+    out = {k: np.zeros((n,), dtype=np.float32) for k in GAME_STATE_KEYS}
+    scan = GameStateScan()
+    for i, row in enumerate(rows):
+        for k, v in zip(GAME_STATE_KEYS, scan.step(row)):
+            out[k][i] = v
     return out
 
 
@@ -159,6 +180,19 @@ def normalize_game_state(raw: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         lo, hi, div = _NORM[k]
         out[k] = (np.clip(raw[k], lo, hi) / div).astype(np.float32)
     return out
+
+
+def normalize_game_state_row(raw_row) -> tuple:
+    """Normalize ONE row's raw values (``GameStateScan.step`` output) to ``GAME_STATE_KEYS`` order.
+
+    Deliberately routed through :func:`normalize_game_state` on length-1 arrays rather than
+    hand-rolled: the batch path stores raw values into a float32 array before clipping, so going
+    through the same float32 clip/divide is what makes the incremental simulator path bit-identical
+    to preprocessing. Six tiny numpy ops, paid once per appended event (not once per head call).
+    """
+    one = {k: np.array([v], dtype=np.float32) for k, v in zip(GAME_STATE_KEYS, raw_row)}
+    out = normalize_game_state(one)
+    return tuple(out[k][0] for k in GAME_STATE_KEYS)
 
 
 # =====================

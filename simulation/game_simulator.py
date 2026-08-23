@@ -37,6 +37,7 @@ source of truth if the two ever need to change together.
 from __future__ import annotations
 
 import os
+import warnings
 
 import numpy as np
 
@@ -60,6 +61,7 @@ from models.game_state_features import (
 )
 from models.stint_length_model import StintLengthModel
 from models.substitution_model import START_TOKEN, SUB_EVENT, SubstitutionModel
+from simulation.input_cache import HistoryEncoder
 
 # Neutral default for a hand-built matchup with no schedule given: treat both teams as
 # mid-season (real-game predictions read the actual value from the GameInput).
@@ -95,6 +97,13 @@ _NULL_STRINGS = {"null"}
 # eager fallback means any graph-incompatibility degrades to exactly the prior (eager) behavior.
 _TF_INFER_ENABLED = os.environ.get("CVIQ_TF_INFER", "0") == "1"
 _EAGER = object()  # sentinel cache value: this (model_key, signature) must run eagerly
+
+# Written the obvious way, build_model_inputs re-encodes the whole window on every model call --
+# five times per event, plus two full-history rescans each time. simulation/input_cache.py encodes
+# each row once as it is appended instead. ON by default (it is a pure refactor of the same
+# arithmetic, proven bit-identical in tests/test_input_cache.py); CVIQ_INPUT_CACHE=0 falls back to
+# _build_model_inputs_uncached, which stays in the tree verbatim as that test's oracle.
+_INPUT_CACHE_ENABLED = os.environ.get("CVIQ_INPUT_CACHE", "1") != "0"
 
 
 def _compiled_forward(cache: dict, model, model_key: str, inputs: dict):
@@ -176,6 +185,9 @@ class GameSimulator:
         # Growing sequence of event rows; each carries its own post-update roster
         # snapshot + absolute time. This list IS the model's input context.
         self.history: list[dict] = []
+        # Incremental encoder over `history` -- see simulation/input_cache.py. Built last: it
+        # reads encoder / sequence_length / _pad_id, which are set above.
+        self._cache = HistoryEncoder(self)
 
     # ===================================================================== #
     # --- Loading                                                          --
@@ -228,6 +240,7 @@ class GameSimulator:
         self.away_days_rest = DEFAULT_REST_DAYS
         self.home_rest, self.away_rest = {}, {}
         self.history = []
+        self._cache.reset()
 
     def _set_season_context(self, ctx: dict | None) -> None:
         """Apply a pre-game season-context dict (from GameInput.season_context()).
@@ -245,6 +258,9 @@ class GameSimulator:
         self.away_days_rest = float(ctx.get("away_days_rest", DEFAULT_REST_DAYS))
         self.home_rest = dict(ctx.get("home_rest", {}) or {})
         self.away_rest = dict(ctx.get("away_rest", {}) or {})
+        # Rest / team-scalar columns are derived from this context, so anything already encoded
+        # is stale. Free in practice (every start_* sets context before its first append).
+        self._cache.on_context_change()
 
     def start_game(self, home_roster: list[str], away_roster: list[str],
                    possession: str = HOME, season: str = "2003",
@@ -273,7 +289,7 @@ class GameSimulator:
             seed.update(seed_event)
         # Seed bypasses state-rule updates (it is the frame, not a play) and snapshots
         # the tip-off rosters directly.
-        self.history.append(self._make_row(time=float(tipoff_time), **seed))
+        self._append_row(self._make_row(time=float(tipoff_time), **seed))
         return self
 
     def append_event(self, event: str, player: str, type: str, result: str,
@@ -305,7 +321,17 @@ class GameSimulator:
 
         row = self._make_row(event=event, player=player, type=type, result=result,
                              secondary_player=secondary_player, time=float(time))
+        self._append_row(row)
+        return row
+
+    def _append_row(self, row: dict) -> dict:
+        """Append one row to ``history`` AND encode it into the incremental input cache.
+
+        The single append seam. Rows are immutable once here (``_make_row`` snapshots both
+        rosters), which is exactly what lets ``HistoryEncoder`` encode each row once.
+        """
         self.history.append(row)
+        self._cache.append(row)
         return row
 
     def _make_row(self, *, event, player, type, result, secondary_player, time) -> dict:
@@ -387,17 +413,31 @@ class GameSimulator:
         back to an all-ones mask (no masking), preserving the pre-mask behavior. The other
         heads ignore this key. PAD is always 0.
         """
+        # Keyed on roster CONTENT, not a version counter. The mask is *nearly* game-constant, but
+        # not quite -- GameController._disqualify removes a fouled-out player from `*_full` -- and a
+        # counter would need bumping in _apply_substitution, _disqualify, _place_starter,
+        # _place_known_starter and every start_*: five chances to miss one, and a miss is silently
+        # wrong results. A content key cannot go stale. The returned array is shared but never
+        # mutated (a changed key builds a new one).
+        key = (tuple(self.home_full), tuple(self.away_full),
+               tuple(self.home_roster), tuple(self.away_roster))
+        hit = self.__dict__.get("_avail_mask_cache")
+        if hit is not None and hit[0] == key:
+            return hit[1]
+
         enc = self.encoder
         V = enc.player_vocab.next_token
         players = {*self.home_full, *self.away_full, *self.home_roster, *self.away_roster}
         if not players:
-            return np.ones((1, V), dtype=np.float32)
-        mask = np.zeros((1, V), dtype=np.float32)
-        for p in players:
-            i = enc.encode_player(p)
-            if 0 <= i < V:
-                mask[0, i] = 1.0
-        mask[0, enc.encode_player("PAD")] = 0.0
+            mask = np.ones((1, V), dtype=np.float32)
+        else:
+            mask = np.zeros((1, V), dtype=np.float32)
+            for p in players:
+                i = enc.encode_player(p)
+                if 0 <= i < V:
+                    mask[0, i] = 1.0
+            mask[0, enc.encode_player("PAD")] = 0.0
+        self._avail_mask_cache = (key, mask)
         return mask
 
     def _conditioned_inputs(self, *, next_event: str, delta_seconds: float,
@@ -421,6 +461,12 @@ class GameSimulator:
         n = min(len(self.history), SEQ)
         enc = self.encoder
 
+        # These allocate and fill a (1, SEQ) array to carry ONE token, once per head call -- the
+        # largest remaining input cost now that `base` is cached. Deliberately left alone: reusing
+        # a persistent PAD-filled scratch (undoing the previous single write) would hand TF the
+        # same object on call j and mutate it before call j+1. That is safe only because
+        # batched_rollout._stack copies, and silently wrong on the unbatched path. Pool these only
+        # alongside a copy-on-handoff, not on its own.
         def _col(encode, value) -> np.ndarray:
             arr = np.full((1, SEQ), encode("PAD"), dtype=np.int32)
             arr[0, n - 1] = encode(_norm_cat(value))
@@ -672,7 +718,7 @@ class GameSimulator:
         self.possession = possession
         self.season = str(season)
         # Empty start frame — the lineup is not yet built (mirrors preprocessing).
-        self.history.append(self._make_row(
+        self._append_row(self._make_row(
             event="start", player="start", type="start", result="start",
             secondary_player="none", time=float(tipoff_time),
         ))
@@ -702,7 +748,7 @@ class GameSimulator:
         self.season = str(season)
         # Set before building the opening five — the substitution head now consumes rest.
         self._set_season_context(season_context)
-        self.history.append(self._make_row(
+        self._append_row(self._make_row(
             event="start", player="start", type="start", result="start",
             secondary_player="none", time=float(tipoff_time),
         ))
@@ -734,7 +780,7 @@ class GameSimulator:
         self.season = str(season)
         # Set before building the opening five — the substitution head now consumes rest.
         self._set_season_context(season_context)
-        self.history.append(self._make_row(
+        self._append_row(self._make_row(
             event="start", player="start", type="start", result="start",
             secondary_player="none", time=float(tipoff_time),
         ))
@@ -753,7 +799,7 @@ class GameSimulator:
         """
         roster = self.home_roster if team == HOME else self.away_roster
         roster.append(incoming)  # post-add snapshot, like the synthesized openers
-        self.history.append(self._make_row(
+        self._append_row(self._make_row(
             event=SUB_EVENT, player=START_TOKEN, type=SUB_EVENT, result=SUB_EVENT,
             secondary_player=incoming, time=float(tipoff_time),
         ))
@@ -770,7 +816,7 @@ class GameSimulator:
                                          delta_seconds=0.0, greedy=greedy)
         available.remove(incoming)
         roster.append(incoming)  # post-add snapshot, like the synthesized openers
-        self.history.append(self._make_row(
+        self._append_row(self._make_row(
             event=SUB_EVENT, player=START_TOKEN, type=SUB_EVENT, result=SUB_EVENT,
             secondary_player=incoming, time=float(tipoff_time),
         ))
@@ -789,6 +835,31 @@ class GameSimulator:
     # ===================================================================== #
 
     def build_model_inputs(self) -> dict[str, np.ndarray]:
+        """The model's batch-1 input dict for the current ``history``.
+
+        Served from the incremental :class:`~simulation.input_cache.HistoryEncoder`, which encodes
+        each row once as it is appended instead of rebuilding the whole window on every one of the
+        ~5 head calls per event. ``_build_model_inputs_uncached`` below is the behavioural spec and
+        the oracle the cache is tested against; ``CVIQ_INPUT_CACHE=0`` selects it directly.
+
+        The length compare is a self-heal, not an assertion: if anything ever appends to
+        ``history`` without going through :meth:`_append_row`, re-encode rather than serve stale
+        tensors. Raising instead would turn a benign new code path into a crash hours into an eval.
+        """
+        if not self.history:
+            raise RuntimeError("No history to encode; call start_game() first.")
+        if not _INPUT_CACHE_ENABLED:
+            return self._build_model_inputs_uncached()
+        if self._cache.n != len(self.history):
+            warnings.warn(
+                "input cache fell out of sync with history (something appended outside "
+                "_append_row); re-encoding. Results are unaffected, throughput is not.",
+                RuntimeWarning, stacklevel=2,
+            )
+            self._cache.rebuild_from(self.history)
+        return self._cache.base_inputs()
+
+    def _build_model_inputs_uncached(self) -> dict[str, np.ndarray]:
         """
         Shape the current ``history`` into the model's fixed input dict (batch = 1).
 
