@@ -43,6 +43,7 @@ from data_loading import resolve_partition
 from models.norm_stats_io import load_norm_stats, save_norm_stats
 from models.artifacts import DEFAULT_ARTIFACTS_ROOT, warm_start_weights
 from models.event_time_model import (
+    _norm_stats_path,
     AddPositionalEmbedding,
     KeyPaddingMask,
     EMBED_DIMS,
@@ -515,8 +516,9 @@ class StintLengthModel(SubstitutionModel):
         if not self.encoder.player_vocab.frozen:
             self.encoder.load_all()
             self.encoder.freeze_all()
-        if self.norm_stats is None and Path(NORM_STATS_PATH).exists():
-            self.norm_stats = json.loads(Path(NORM_STATS_PATH).read_text(encoding="utf-8"))
+        _p = _norm_stats_path(self.encoder)
+        if self.norm_stats is None and _p.exists():
+            self.norm_stats = json.loads(_p.read_text(encoding="utf-8"))
         # The seconds metric needs the log-stint scaling; load the per-model stats if the
         # currently-held norm_stats predate it (e.g. only the shared file was loaded above).
         if not self.norm_stats or "stint_log_mean" not in self.norm_stats:

@@ -33,9 +33,13 @@ from training.full_run import DEFAULT_STATE_PATH, FullRun
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Evaluate a CourtVisionIQ model version on the holdout.")
-    ap.add_argument("--version", help="Model version to evaluate (default: the run state's version).")
-    ap.add_argument("--name", default=None, help="Eval folder name (default: auto eval-NNN).")
+    ap = argparse.ArgumentParser(
+        description="Evaluate a CourtVisionIQ model on the holdout. For an interactive session "
+                    "that keeps the model resident across many runs, use: python cviq.py")
+    ap.add_argument("--model", "--version", dest="model", default=None,
+                    help="Model to evaluate, e.g. v1.0 (default: the run state's model).")
+    ap.add_argument("--run", "--name", dest="run", default=None,
+                    help="Run folder name -> results/<model>/<run>/ (default: auto eval-NNN).")
     ap.add_argument("--monte-carlo", type=int, default=None, dest="monte_carlo",
                     help="Sims per game to aggregate (Monte-Carlo count; default: STAGE_SIMS).")
     ap.add_argument("--concurrency", type=int, default=None,
@@ -50,9 +54,9 @@ def main() -> None:
 
     run = FullRun(state_path=args.state)
     if args.report_only:
-        run.report(version=args.version, name=args.name)
+        run.report(version=args.model, name=args.run)
     else:
-        run.eval(version=args.version, name=args.name, n_sims=args.monte_carlo,
+        run.eval(version=args.model, name=args.run, n_sims=args.monte_carlo,
                  concurrency=args.concurrency, max_new=args.games)
 
 

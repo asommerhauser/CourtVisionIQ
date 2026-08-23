@@ -5,7 +5,7 @@ full_run.py — one recency-weighted full train + a batched 100-game holdout (th
 Train every model **once** on the whole corpus (up to a cut partway through the most recent season),
 with older seasons down-weighted (see ``season_features`` recency weighting), then predict the next
 ``FINAL_HOLDOUT_GAMES`` real games a batch at a time. Weights go to a versioned root
-``artifacts/v<version>/`` (see ``models.artifacts.version_root``) so each train keeps its own dir.
+``artifacts/<name>/`` (see ``models.artifacts.model_root``) so each train keeps its own dir.
 
 State machine (``full_run_state.json``), each step user-launched:
 
@@ -21,20 +21,36 @@ State machine (``full_run_state.json``), each step user-launched:
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
 from config import (
-    DEFAULT_VERSION, EVAL_BATCH, EVAL_GAMES_PER_BATCH, FINAL_HOLDOUT_GAMES, FINAL_SEASON_FRACTION,
+    DEFAULT_MODEL, EVAL_BATCH, EVAL_GAMES_PER_BATCH, FINAL_HOLDOUT_GAMES, FINAL_SEASON_FRACTION,
     ROLLOUT_BATCH_SIZE, SEED, STAGE_SIMS, SUBSET_MODEL_KEYS, TEST_FRAC,
 )
-from models.artifacts import version_root
+from models.artifacts import list_models, model_root
+from models.manifest import (new_manifest, record_head, snapshot_vocabs, vocab_fingerprint,
+                             write_manifest)
 from models.registry import STAGE_MODEL_KEYS
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
 from training.chronology import game_index, sequential_partition
 from training.subset import load_subset_games
 
 DEFAULT_STATE_PATH = "./training/full_run_state.json"
+
+
+def model_name(value: str) -> str:
+    """Resolve a model name, tolerating the legacy bare version format.
+
+    State files written before models were named store ``"1.0"``; the dir has always been
+    ``artifacts/v1.0``. Map a bare ``<major>.<minor>`` onto its ``v``-prefixed dir when that is
+    what exists, and otherwise pass the name through untouched so free-form names work.
+    """
+    s = str(value).strip()
+    if re.fullmatch(r"\d+\.\d+", s) and s not in list_models():
+        return f"v{s}"
+    return s
 
 
 class FullRun:
@@ -51,19 +67,21 @@ class FullRun:
 
     def _require(self) -> None:
         if not self.state:
-            raise SystemExit("No full-run state. Run:  python train.py --full --version X.Y --batch-size N")
+            raise SystemExit("No full-run state. Run:  python train.py --full --name <name> --batch-size N")
 
     # --------------------------------------------------------------- setup
-    def setup(self, *, version: str | None = None, data_dir: str = "./data",
-              processed_dir: str = "./data/processed", epochs: int = 50, batch_size: int = 64) -> None:
+    def setup(self, *, name: str | None = None, version: str | None = None,
+              data_dir: str = "./data", processed_dir: str = "./data/processed",
+              epochs: int = 50, batch_size: int = 64) -> None:
         """Compute the train/holdout cut from the already-cleaned data (no re-clean / re-warmup).
 
-        ``version`` (e.g. ``"1.0"``) names the weights dir (``artifacts/v<version>/``) and the report
-        label (``v<version>``). Defaults to ``DEFAULT_VERSION`` so existing callers/tests keep working.
+        ``name`` is the model name: it is both the weights dir (``artifacts/<name>/``) and the
+        report label. Free-form -- ``"v1.0"``, ``"endgame-feats"``. ``version`` is a deprecated
+        alias accepting a bare ``"1.0"``. Defaults to ``DEFAULT_MODEL``.
         """
-        version = version or DEFAULT_VERSION
-        artifacts_root = version_root(version)
-        run_name = f"v{version}"
+        name = model_name(name or version or DEFAULT_MODEL)
+        artifacts_root = model_root(name)
+        run_name = name
         idx = game_index(data_dir)
         last_season = int(idx["season"].max())
         reg = idx[(idx["season"] == last_season) & idx["is_regular"]]
@@ -83,7 +101,7 @@ class FullRun:
 
         self.state = {
             "created_at": datetime.now().isoformat(timespec="seconds"),
-            "version": version, "data_dir": data_dir, "processed_dir": processed_dir,
+            "version": name, "data_dir": data_dir, "processed_dir": processed_dir,
             "artifacts_root": artifacts_root, "reports_root": DEFAULT_REPORTS_ROOT,
             "epochs": epochs, "batch_size": batch_size, "run_name": run_name,
             "n_games": int(len(idx)), "boundary_idx": boundary,
@@ -92,14 +110,21 @@ class FullRun:
         }
         self._save()
 
+        # Stub manifest up front so an interrupted train still leaves readable weights: it records
+        # the architecture the graph will be rebuilt from, the seed, and the holdout.
+        write_manifest(artifacts_root, **new_manifest(
+            name, epochs=epochs, batch_size=batch_size, seed=SEED, data_dir=data_dir,
+            processed_dir=processed_dir, n_games=int(len(idx)), boundary_idx=boundary,
+            holdout_game_ids=holdout_ids))
+
         by_id = idx.set_index("game_id")
         first, last = by_id.loc[holdout_ids[0]], by_id.loc[holdout_ids[-1]]
-        print(f"[setup] version {version}: cut at {int(FINAL_SEASON_FRACTION * 100)}% "
+        print(f"[setup] {name}: cut at {int(FINAL_SEASON_FRACTION * 100)}% "
               f"of season {last_season}'s regular schedule -> {boundary} train games.")
         print(f"[setup] holdout = {len(holdout_ids)} games (g{holdout_ids[0]} .. g{holdout_ids[-1]}, "
               f"{first['game_date']} .. {last['game_date']}), predicted {EVAL_BATCH} at a time.")
         print(f"[setup] full-train weights -> {artifacts_root}")
-        print(f"State -> {self.state_path}\nNext:  python train.py --full --version {version} "
+        print(f"State -> {self.state_path}\nNext:  python train.py --full --name {name} "
               f"--batch-size {batch_size}")
 
     # --------------------------------------------------------------- train
@@ -108,8 +133,8 @@ class FullRun:
 
         self._require()
         if self.state["status"] == "trained":
-            print("[train] already trained — run:  python evaluate.py --version "
-                  f"{self.state.get('version', DEFAULT_VERSION)}")
+            print("[train] already trained — run:  python evaluate.py --model "
+                  f"{self.state.get('version', DEFAULT_MODEL)}")
             return
         idx = game_index(self.state["data_dir"])
         partition = sequential_partition(idx, self.state["boundary_idx"],
@@ -132,10 +157,21 @@ class FullRun:
         self._save()
 
         sdict = self.state
+        root = self.state["artifacts_root"]
+
         def on_trained(key: str) -> None:
             if key not in sdict["trained_models"]:
                 sdict["trained_models"].append(key)
             self._save()
+            record_head(root, key)
+            # event_time owns the vocab build, so once it is done the vocabs are final. Copying
+            # them into the model dir pins the token ids these weights were trained against --
+            # save_artifacts() writes the SHARED encoder/vocabs/, which the next train rewrites.
+            if key == "event_time":
+                from encoder.encoder import Encoder
+                enc = Encoder()
+                snapshot_vocabs(enc, root)
+                write_manifest(root, vocabs=vocab_fingerprint(enc))
 
         run_stage(
             self.state["data_dir"], partition, artifacts_root=self.state["artifacts_root"],
@@ -146,12 +182,14 @@ class FullRun:
             rebuild_vocabs=rebuild_vocabs,
         )
 
+        write_manifest(self.state["artifacts_root"],
+                       finished_at=datetime.now().isoformat(timespec="seconds"))
         self.state["status"] = "trained"
         self._save()
-        version = self.state.get("version", DEFAULT_VERSION)
+        version = self.state.get("version", DEFAULT_MODEL)
         print("\n" + "=" * 70)
         print("STOP — full train done. Evaluate the holdout:")
-        print(f"  python evaluate.py --version {version}")
+        print(f"  python evaluate.py --model {version}")
         print("=" * 70)
 
     # --------------------------------------------------------------- eval
@@ -174,11 +212,11 @@ class FullRun:
 
         self._require()
         if self.state["status"] != "trained":
-            print("[eval] not trained yet — run:  python train.py --full --version "
-                  f"{self.state.get('version', DEFAULT_VERSION)} --batch-size {self.state['batch_size']}")
+            print("[eval] not trained yet — run:  python train.py --full --name "
+                  f"{self.state.get('version', DEFAULT_MODEL)} --batch-size {self.state['batch_size']}")
             return
 
-        version = version or self.state.get("version", DEFAULT_VERSION)
+        name_ = model_name(version or self.state.get("version", DEFAULT_MODEL))
         n_sims = n_sims or STAGE_SIMS
         # concurrency = concurrent game-sims per GPU forward pass (VRAM-bound). games_per_batch just
         # pools enough games that cohorts stay full as sims desync; the actual GPU batch is capped at
@@ -186,14 +224,14 @@ class FullRun:
         batch_size = concurrency or ROLLOUT_BATCH_SIZE
         games_per_batch = EVAL_GAMES_PER_BATCH
         holdout = self.state["holdout_game_ids"]
-        run_dir = resolve_results_run_dir(version, name=name, holdout_total=len(holdout))
+        run_dir = resolve_results_run_dir(name_, name=name, holdout_total=len(holdout))
         self.state["last_eval_name"] = run_dir.name
         self._save()
 
         report = evaluate_stage(
-            f"v{version}", holdout_ids=holdout, n_sims=n_sims, max_new=max_new,
+            name_, holdout_ids=holdout, n_sims=n_sims, max_new=max_new,
             report_every=report_every, data_dir=self.state["data_dir"],
-            processed_dir=self.state["processed_dir"], artifacts_root=version_root(version),
+            processed_dir=self.state["processed_dir"], artifacts_root=model_root(name_),
             results_run_dir=run_dir, batch_size=batch_size, games_per_batch=games_per_batch,
         )
         done, total = report["done"], report["total"]
@@ -202,7 +240,7 @@ class FullRun:
             print(f"DONE — all {total} holdout games predicted. Report:")
         else:
             print(f"STOP — {done}/{total} holdout games done. Re-run to continue:")
-            print(f"  python evaluate.py --version {version} --name {run_dir.name}")
+            print(f"  python evaluate.py --model {name_} --run {run_dir.name}")
         print(f"  {report['run_dir']}")
         print("=" * 70)
 
@@ -284,14 +322,14 @@ class FullRun:
         from simulation.stage_eval import evaluate_stage
 
         self._require()
-        version = version or self.state.get("version", DEFAULT_VERSION)
+        name_ = model_name(version or self.state.get("version", DEFAULT_MODEL))
         name = name or self.state.get("last_eval_name")
         holdout = self.state["holdout_game_ids"]
-        run_dir = resolve_results_run_dir(version, name=name, holdout_total=len(holdout))
+        run_dir = resolve_results_run_dir(name_, name=name, holdout_total=len(holdout))
         report = evaluate_stage(
-            f"v{version}", holdout_ids=holdout, n_sims=STAGE_SIMS, max_new=0,
+            name_, holdout_ids=holdout, n_sims=STAGE_SIMS, max_new=0,
             data_dir=self.state["data_dir"], processed_dir=self.state["processed_dir"],
-            artifacts_root=version_root(version), results_run_dir=run_dir,
+            artifacts_root=model_root(name_), results_run_dir=run_dir,
         )
         print(f"[report] {report['done']}/{report['total']} games -> {report['run_dir']}")
 

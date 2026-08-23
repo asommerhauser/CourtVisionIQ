@@ -53,6 +53,7 @@ from models.norm_stats_io import load_norm_stats, save_norm_stats
 from encoder.encoder import Encoder
 from models.artifacts import ModelArtifacts, DEFAULT_ARTIFACTS_ROOT, warm_start_weights
 from models.event_time_model import (
+    _norm_stats_path,
     AddPositionalEmbedding,
     KeyPaddingMask,
     EMBED_DIMS,
@@ -593,8 +594,9 @@ class ConditionalTypeModel:
         if not self.encoder.player_vocab.frozen:
             self.encoder.load_all()
             self.encoder.freeze_all()
-        if self.norm_stats is None and Path(NORM_STATS_PATH).exists():
-            self.norm_stats = json.loads(Path(NORM_STATS_PATH).read_text(encoding="utf-8"))
+        _p = _norm_stats_path(self.encoder)
+        if self.norm_stats is None and _p.exists():
+            self.norm_stats = json.loads(_p.read_text(encoding="utf-8"))
 
         train_split = self._load_processed(_PROCESSED["train"])
         test_split = self._load_processed(_PROCESSED["test"])

@@ -38,25 +38,33 @@ from simulation.stats import ADVANCED_LABELS, BOX_STATS
 from simulation.eval_metrics import score_win_view
 
 # Evaluation ("test run") outputs live under results/, split from the model-training reports/ tree.
-# One folder per eval run: results/v<version>/<eval-name>/ with report.html + report.json at the
+# One folder per eval run: results/<model>/<eval-name>/ with report.html + report.json at the
 # root and the queryable parquet under data/. (See resolve_results_run_dir / write_eval_report.)
 DEFAULT_RESULTS_ROOT = "./results"
 
 
-def resolve_results_run_dir(version: str, *, name: str | None = None,
+def _slug(value: str) -> str:
+    """Filesystem-safe folder name: anything outside [A-Za-z0-9_.-] collapses to a dash."""
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value)).strip("-") or "eval"
+
+
+def resolve_results_run_dir(model: str, *, name: str | None = None,
                             holdout_total: int | None = None,
                             results_root: str = DEFAULT_RESULTS_ROOT) -> Path:
-    """Pick (and create) the results run dir for an evaluation under results/v<version>/.
+    """Pick (and create) the results run dir for an evaluation under results/<model>/.
 
-    With ``name`` -> results/v<version>/<name> (stable; a re-run resumes it). Without a name -> the
+    ``model`` is the model name, already carrying any ``v`` prefix ("v1.0", "endgame-feats"), so
+    runs sit beside the weights they came from.
+
+    With ``name`` -> results/<model>/<name> (stable; a re-run resumes it). Without a name -> the
     latest ``eval-NNN`` if it is still incomplete (fewer per-game ``record.json`` than
     ``holdout_total``), so a batched eval keeps filling one folder; otherwise the next ``eval-NNN``.
     """
-    base = Path(results_root) / f"v{version}"
+    base = Path(results_root) / _slug(model)
     base.mkdir(parents=True, exist_ok=True)
 
     if name:
-        slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(name)).strip("-") or "eval"
+        slug = _slug(name)
         run = base / slug
         run.mkdir(parents=True, exist_ok=True)
         return run

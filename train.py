@@ -33,17 +33,19 @@ from training.full_run import DEFAULT_STATE_PATH, FullRun
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Train CourtVisionIQ model versions.")
+    ap = argparse.ArgumentParser(description="Train CourtVisionIQ models.")
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--full", action="store_true",
-                      help="Fresh full train of every head (requires --version and --batch-size).")
+                      help="Fresh full train of every head (requires --name and --batch-size).")
     mode.add_argument("--model", metavar="NAME",
                       help="Retrain ONE head in place (keeps the others).")
     mode.add_argument("--continue", dest="cont", action="store_true",
                       help="Resume an interrupted full train at the next unfinished head.")
     mode.add_argument("--status", action="store_true", help="Show full-run progress.")
 
-    ap.add_argument("--version", help="Model version label, e.g. 1.1 (required with --full).")
+    ap.add_argument("--name", help="Model name, e.g. v1.1 or endgame-feats (required with --full). "
+                                   "Free-form; a retrain takes a NEW name rather than overwriting.")
+    ap.add_argument("--version", help="Deprecated alias for --name (accepts a bare '1.1').")
     ap.add_argument("--batch-size", type=int, help="Train batch size (required with --full).")
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--clean", action="store_true",
@@ -57,25 +59,27 @@ def main() -> None:
 
     run = FullRun(state_path=args.state)
 
+    name = args.name or args.version
+
     if args.full:
-        if not args.version or args.batch_size is None:
-            ap.error("--full requires --version and --batch-size.")
+        if not name or args.batch_size is None:
+            ap.error("--full requires --name and --batch-size.")
         if args.clean:
             from data_cleaner import DataCleaner
             from season_context import enrich
             print("[train] --clean: re-cleaning raw play-by-play into ./data ...")
             DataCleaner().run()
             enrich(args.data_dir)
-        run.setup(version=args.version, data_dir=args.data_dir, processed_dir=args.processed_dir,
+        run.setup(name=name, data_dir=args.data_dir, processed_dir=args.processed_dir,
                   epochs=args.epochs, batch_size=args.batch_size)
         run.train(rebuild_vocabs=args.rebuild_vocabs)
     elif args.model:
-        # Retrain one head against the CURRENT run state (which holds the version + train cut). A
-        # --version, if given, must match that state — retraining an arbitrary older version would
+        # Retrain one head against the CURRENT run state (which holds the model name + train cut).
+        # A --name, if given, must match that state — retraining an arbitrary older model would
         # need its own state and is out of scope.
-        if args.version and run.state.get("version") not in (None, args.version):
-            ap.error(f"--model targets the current run version '{run.state.get('version')}', "
-                     f"not '{args.version}'. Run a --full train for that version first.")
+        if name and run.state.get("version") not in (None, name):
+            ap.error(f"--model targets the currently trained model '{run.state.get('version')}', "
+                     f"not '{name}'. Run a --full train for that name first.")
         run.retrain_model(args.model)
     elif args.cont:
         run.train()

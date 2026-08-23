@@ -22,14 +22,16 @@ models/  layers/          model heads + transformer building blocks
 simulation/               rollout engine, box scores, evaluation harness, diagnostics
 reporting/                training reports + evaluation/results reports (HTML + Parquet)
 training/                 full-train orchestration + chronological slicing / subset selection
-artifacts/v<MAJOR.MINOR>/ trained model weights, one dir per version (e.g. artifacts/v1.0/); not in git
-reports/<model>/<run>/    per-model TRAINING reports (loss curves, epoch metrics)
-results/v<version>/<eval>/ EVALUATION ("test run") outputs — see below; not in git
+artifacts/<name>/         one trained model per dir (weights + manifest.json + vocabs/); not in git
+reports/<head>/<run>/     per-head TRAINING reports (loss curves, epoch metrics)
+results/<model>/<run>/    EVALUATION ("test run") outputs — see below; not in git
+cviq.py  shell/           the interactive TRAIN / LOAD / RUN shell
 ```
 
-**Versioning.** Model weights live one directory per version under `artifacts/v<MAJOR.MINOR>/`.
-The current model is **v1.0**. A full train writes a new version dir; a single-head retrain
-overwrites just that head inside a version.
+**Model names.** Weights live one directory per model under `artifacts/<name>/`, where the name is
+free-form (`v1.0`, `endgame-feats`). The name **is** the train identity: a retrain takes a new name
+rather than overwriting, so weights and the runs evaluated against them never drift apart. The
+current model is **v1.0**. A single-head retrain still overwrites just that head in place.
 
 **reports/ vs results/.** `reports/` holds model **training** reports (one folder per head per
 run). `results/` holds **evaluation** runs (simulated-vs-real holdout scoring) — kept separate so
@@ -123,13 +125,87 @@ after a re-clean so a cloud clone matches the freshly cleaned data.
 
 ---
 
-## Training — `train.py`
-
-Weights go to `artifacts/v<version>/`. Batch size is required for a full train.
+## The `cviq` shell — TRAIN / LOAD / RUN
 
 ```bash
-# Fresh full train of every head as a new version (optionally re-clean + refreeze vocab first):
-python train.py --full --version 1.1 --batch-size 64 [--epochs 50] [--clean] [--rebuild-vocabs]
+python cviq.py
+```
+
+Three distinct processes over **one resident model**:
+
+| | |
+|---|---|
+| **TRAIN** | produce a new named set of weights (launched, never run in-process) |
+| **LOAD** | bring an existing model into memory, unloading the previous one |
+| **RUN** | evaluate whatever is loaded, into `results/<model>/<run>/` |
+
+Separate `python x.py` invocations cannot share a loaded model, so a script-per-command design
+pays a full eleven-head rebuild every time a dial moves. Here the heads stay resident: changing a
+dial and re-predicting costs a rollout, not a reload.
+
+```
+cviq> load v1.0
+  loaded 11 heads from artifacts/v1.0 (vocabs: artifacts/v1.0/vocabs)
+  holdout: 100 games  (from v1.0/manifest.json)
+cviq> run tune-a --games 4 --sims 3
+  -> results/v1.0/tune-a/
+cviq> set DELTA_TIME_SCALE 0.99
+cviq> run tune-b --games 4 --sims 3        # no reload; the new dial is recorded in the report
+cviq> dials --changed
+cviq> load endgame-feats                   # unloads v1.0, keeps the dial overrides
+```
+
+The prompt appears in well under a second: TensorFlow is not imported until the first command
+that actually needs a model, so `models`, `status`, `dials` and `runs` stay instant.
+
+### Commands
+
+| Command | |
+|---|---|
+| `load <name> [--dials FILE] [--force]` | swap the resident model; `--force` overrides an arch/vocab mismatch |
+| `unload` | release it (frees host RAM; VRAM stays in TF's pool for the next load) |
+| `models` / `runs [<model>]` | what is on disk |
+| `run [<name>] [--games N] [--sims N] [--concurrency N] [--seed N] [--report-only]` | evaluate |
+| `set <DIAL> <value>` / `unset <DIAL>` / `reset` | tune; dict dials take JSON |
+| `dials [--changed] [--save FILE] [--recommended]` / `dialfile <FILE>` | inspect / export a dial package |
+| `train <name> [--batch-size N] [--go]` / `train --status / --follow / --list` | launch + monitor |
+| `adopt <name>` | back-fill a manifest + vocab snapshot for existing weights (no retrain) |
+| `status` | model, manifest, holdout source, changed dials, last run, RSS |
+
+Dial overrides deliberately **survive a load**, so the same tuning can be compared across two
+models. `run` resumes: a named run that already has per-game `record.json` files tops up rather
+than re-simulating.
+
+### Model names
+
+A model **name** is the train identity. Names are free-form slugs -- `v1.0`, `endgame-feats` --
+and a retrain always takes a **new** name rather than overwriting, so a set of weights and the
+runs evaluated against it never drift apart. Weights live in `artifacts/<name>/`, results in
+`results/<name>/<run>/`.
+
+Each model also carries:
+
+- **`manifest.json`** — the arch it was trained at, seed, epochs, git commit, data cut and holdout.
+  The graph is rebuilt from `config.py` at load time, so a changed capacity dim would otherwise
+  surface as an opaque Keras shape error; `load` turns that into a named refusal.
+- **`vocabs/`** — a snapshot of the token vocabularies these weights were built against. Every
+  head's `save_artifacts()` writes the *shared* `encoder/vocabs/`, so training a new model would
+  otherwise invalidate an older model's embedding tables.
+
+`adopt <name>` back-fills both for weights trained before either existed, with no retrain.
+
+The single-command scripts below still work and remain the right tool for a non-interactive run
+(cron, `nohup`, one-shot SSH).
+
+---
+
+## Training — `train.py`
+
+Weights go to `artifacts/<name>/`. Batch size is required for a full train.
+
+```bash
+# Fresh full train of every head under a NEW name (optionally re-clean + refreeze vocab first):
+python train.py --full --name v1.1 --batch-size 64 [--epochs 50] [--clean] [--rebuild-vocabs]
 
 # Resume an interrupted full train at the next unfinished head:
 python train.py --continue
@@ -141,7 +217,7 @@ python train.py --model shot_result
 python train.py --status
 ```
 
-A full train re-preprocesses each head from `data/`, writes weights to `artifacts/v<version>/`, and
+A full train re-preprocesses each head from `data/`, writes weights to `artifacts/<name>/`, and
 a per-head training report under `reports/<head>/`. If it dies mid-run, `--continue` picks up at
 the next unfinished head. `--model <name>` retrains a single head (`event_time`, `player`,
 `event_time_cond`, `shot_type`, `shot_result`, `assist_type`, `turnover_type`, `foul_type`,
@@ -156,20 +232,21 @@ equal to `--batch-size` on a roomy card, lower it only if a player-vocab head OO
 ## Evaluation — `evaluate.py`
 
 Simulates the holdout (from the training run's frozen holdout set) against reality and writes a
-results run under `results/v<version>/<eval-name>/`.
+results run under `results/<model>/<run>/`. For repeated runs against one model, prefer the
+`cviq` shell above -- this reloads the model on every invocation.
 
 ```bash
 # Evaluate v1.0's holdout (auto-named eval-NNN), default sims + concurrency:
-python evaluate.py --version 1.0
+python evaluate.py --model v1.0
 
 # Named run; 21 sims/game; up to 48 game-sims per GPU forward pass (VRAM knob):
-python evaluate.py --version 1.0 --name pace-097 --monte-carlo 21 --concurrency 48
+python evaluate.py --model v1.0 --run pace-097 --monte-carlo 21 --concurrency 48
 
 # Predict only the next 10 unfinished games into that run, then stop (batched / resumable):
-python evaluate.py --version 1.0 --name pace-097 --games 10
+python evaluate.py --model v1.0 --run pace-097 --games 10
 
 # Rebuild the report over finished games, no new sims:
-python evaluate.py --version 1.0 --name pace-097 --report-only
+python evaluate.py --model v1.0 --run pace-097 --report-only
 ```
 
 - **`--monte-carlo`** — sims per game to average (default `STAGE_SIMS`; more sims tighten the
@@ -206,8 +283,10 @@ incompatibility, so results are unchanged.
 
 ## Inference dials (tuning without retraining)
 
-Rollout behavior is shaped by dials in `config.py`, read live at run time — edit and re-evaluate,
-no retrain. They are captured into every eval report for cross-run analysis. Key ones:
+Rollout behavior is shaped by dials in `config.py`, read at call time — no retrain. Change them
+with `set` in the shell (no reload), or edit `config.py` for a new default. Every eval report
+records the dials that produced it, and `progression` segments a run by where they changed. Key
+ones:
 
 | Dial | Effect |
 |---|---|

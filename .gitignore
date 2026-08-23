@@ -33,5 +33,8 @@ htmlcov/
 *.tar
 *.zip
 
+# Per-train state + logs written by `cviq> train --go` / train.py --state
+/training/runs/
+
 # Evaluation / test-run outputs (results/v<version>/<eval-name>/); regenerated, not tracked
 /results/

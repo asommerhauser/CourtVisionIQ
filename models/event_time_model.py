@@ -268,6 +268,19 @@ def target_on_court(target: np.ndarray, home_buf: np.ndarray, away_buf: np.ndarr
     return (target[:, None] == oncourt).any(axis=1).astype(np.float32)
 
 
+
+def _norm_stats_path(encoder):
+    """Where pipeline-level norm stats live: beside the encoder's own vocabs.
+
+    Keyed off ``encoder.vocab_dir`` rather than the module-level ``config.NORM_STATS_PATH`` so a
+    caller with its own vocab dir (a test fixture, or a per-model vocab snapshot) reads and writes
+    its own copy. Writing the shared path unconditionally is what let the test fixtures overwrite
+    the committed ``encoder/vocabs/norm_stats.json`` with 3-game values.
+    """
+    from pathlib import Path as _P
+    d = getattr(encoder, "vocab_dir", None)
+    return _P(d) / "norm_stats.json" if d else _P(NORM_STATS_PATH)
+
 class EventTimeModel:
     """
     Core Event/Time Transformer.
@@ -426,8 +439,9 @@ class EventTimeModel:
         # Only (re)write the normalization stats when refitting; staged runs reuse warmup stats.
         if refit_norm_stats:
             save_norm_stats(self.processed_dir, self.KEY, self.norm_stats)
-            Path(NORM_STATS_PATH).parent.mkdir(parents=True, exist_ok=True)
-            Path(NORM_STATS_PATH).write_text(json.dumps(self.norm_stats, indent=2), encoding="utf-8")
+            _p = _norm_stats_path(self.encoder)
+            _p.parent.mkdir(parents=True, exist_ok=True)
+            _p.write_text(json.dumps(self.norm_stats, indent=2), encoding="utf-8")
 
         print(f"Preprocessed {len(train_games)} train / {len(test_games)} test / "
               f"{len(holdout_games)} holdout games -> {self.processed_dir} "
@@ -730,8 +744,9 @@ class EventTimeModel:
         if not self.encoder.player_vocab.frozen:
             self.encoder.load_all()
             self.encoder.freeze_all()
-        if self.norm_stats is None and Path(NORM_STATS_PATH).exists():
-            self.norm_stats = json.loads(Path(NORM_STATS_PATH).read_text(encoding="utf-8"))
+        _p = _norm_stats_path(self.encoder)
+        if self.norm_stats is None and _p.exists():
+            self.norm_stats = json.loads(_p.read_text(encoding="utf-8"))
 
         train_split = self._load_processed("train.npz")
         test_split = self._load_processed("test.npz")

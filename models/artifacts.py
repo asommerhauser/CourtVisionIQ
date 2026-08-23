@@ -14,6 +14,9 @@ The weights-only file is the robust reload path: rebuild the architecture in Pyt
 deserialization. The .keras file is the convenient single-file path.
 
 New models reuse this verbatim by declaring a `KEY` and going through ModelArtifacts.
+
+One level up, `<MODELS_ROOT>/<name>/` holds one such artifacts root per trained model; see
+`model_root` / `list_models` / `active_model`.
 """
 from __future__ import annotations
 
@@ -23,45 +26,92 @@ from pathlib import Path
 
 DEFAULT_ARTIFACTS_ROOT = "./artifacts"
 
-# Parent directory that holds one subdirectory per model VERSION: ``<VERSIONS_ROOT>/v<MAJOR.MINOR>/``
-# (e.g. ``./artifacts/v1.0/``). A full train writes a new version dir; a single-model retrain
-# overwrites just one head inside an existing version. Keeping each version in its own dir preserves
-# history for comparison across trains.
-VERSIONS_ROOT = "./artifacts"
+# Parent directory holding one subdirectory per MODEL: ``<MODELS_ROOT>/<name>/`` (e.g.
+# ``./artifacts/v1.0/``). A full train writes a new model dir; a single-head retrain overwrites just
+# one head inside an existing one. Each model keeps its own dir so trains stay comparable.
+MODELS_ROOT = "./artifacts"
+VERSIONS_ROOT = MODELS_ROOT  # deprecated alias, kept for existing callers
+
+# Records which model is currently loaded, inside the gitignored artifacts tree (per-machine).
+ACTIVE_MARKER = "ACTIVE"
+
+# Model names are free-form slugs. Anchored so a name can never contain a path separator or be
+# ".."/"." -- model_root() interpolates it straight into a path.
+_VALID_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 def version_root(version: str, versions_root: str = VERSIONS_ROOT) -> str:
-    """Resolve a version label (e.g. ``"1.0"`` or ``"v1.0"``) to its artifacts root string.
+    """Deprecated: resolve a ``v<MAJOR>.<MINOR>`` label to its artifacts root.
+
+    Superseded by :func:`model_root`, which takes a free-form name. Kept because it also normalizes
+    a bare ``"1.0"`` to ``"v1.0"``, which existing callers (training.full_run, evaluate.py) rely on.
+    """
+    v = str(version).strip()
+    v = v if v.startswith("v") else f"v{v}"
+    return model_root(v, versions_root)
+
+
+def model_root(name: str, models_root: str = MODELS_ROOT) -> str:
+    """Resolve a model NAME to its artifacts root string.
+
+    Names are free-form slugs -- ``"v1.0"``, ``"endgame-feats"``, ``"relative-encoding"``. A model
+    name is the train identity: retraining always produces a NEW name rather than overwriting an
+    existing one, so a set of weights and the runs evaluated against it never drift apart.
 
     Returned as a plain ``./``-prefixed string (not a ``Path``) so it compares equal to the
     hard-coded defaults recorded in run state / config.
     """
-    v = str(version).strip()
-    v = v if v.startswith("v") else f"v{v}"
-    return f"{versions_root.rstrip('/')}/{v}"
+    slug = str(name).strip()
+    if not _VALID_NAME.fullmatch(slug):
+        raise ValueError(
+            f"invalid model name {name!r}: expected letters/digits then any of "
+            f"[A-Za-z0-9._-] (e.g. 'v1.0', 'endgame-feats'). Path separators and '..' are "
+            f"rejected so a name can never escape the artifacts root."
+        )
+    return f"{models_root.rstrip('/')}/{slug}"
 
 
-def latest_version(versions_root: str = VERSIONS_ROOT) -> str | None:
-    """Newest ``v<MAJOR.MINOR>`` under ``versions_root`` by numeric (major, minor) order.
+def list_models(models_root: str = MODELS_ROOT) -> list[str]:
+    """Every loadable model name under ``models_root``, sorted.
 
-    Returns the bare label (``"1.0"``, no ``v`` prefix) or ``None`` when no version dir exists.
-    Used as the default target for a single-model retrain (``train.py --model <name>``).
+    A directory counts only when it holds ``event_time`` weights -- the head
+    :class:`~simulation.game_simulator.GameSimulator` requires. That check also keeps stray
+    per-head dirs out of the listing: the legacy ``main.py`` path writes an unversioned
+    ``./artifacts/<head>/``, which would otherwise look like a model named e.g. "player".
     """
-    root = Path(versions_root)
+    root = Path(models_root)
     if not root.is_dir():
+        return []
+    names = []
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or not _VALID_NAME.fullmatch(child.name):
+            continue
+        if ModelArtifacts.for_key("event_time", child).exists():
+            names.append(child.name)
+    return names
+
+
+def active_model(models_root: str = MODELS_ROOT) -> str | None:
+    """The model name recorded by :func:`set_active_model`, or None.
+
+    Stored in ``<models_root>/ACTIVE`` -- inside the gitignored artifacts tree, so "which model is
+    loaded" stays per-machine rather than travelling in the repo. Returns None when the file is
+    absent or names a model that no longer exists.
+    """
+    marker = Path(models_root) / ACTIVE_MARKER
+    if not marker.is_file():
         return None
-    best: tuple[int, int] | None = None
-    best_label: str | None = None
-    for child in root.iterdir():
-        if not child.is_dir():
-            continue
-        m = re.fullmatch(r"v(\d+)\.(\d+)", child.name)
-        if not m:
-            continue
-        key = (int(m.group(1)), int(m.group(2)))
-        if best is None or key > best:
-            best, best_label = key, f"{m.group(1)}.{m.group(2)}"
-    return best_label
+    name = marker.read_text(encoding="utf-8").strip()
+    return name if name and name in list_models(models_root) else None
+
+
+def set_active_model(name: str, models_root: str = MODELS_ROOT) -> str:
+    """Record ``name`` as the active model. Returns the name."""
+    model_root(name, models_root)  # validate before writing
+    root = Path(models_root)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / ACTIVE_MARKER).write_text(name.strip() + "\n", encoding="utf-8")
+    return name
 
 
 @dataclass(frozen=True)

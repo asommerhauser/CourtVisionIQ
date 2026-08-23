@@ -118,7 +118,8 @@ def _write_game_folder(out_dir: Path, game, spec, boxes, histories, record,
     (out_dir / "record.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
 
 
-def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
+def evaluate_stage(stage_name: str, *, sim=None, df=None, run_label: str | None = None,
+                   holdout_ids: list[int] | None = None,
                    n_sims: int = STAGE_SIMS, max_new: int | None = None,
                    report_every: int | None = None,
                    data_dir: str = "./data", processed_dir: str = "./data/processed",
@@ -134,7 +135,15 @@ def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
     Finished games (those with a cached ``record.json``) are reloaded rather than re-simulated, so a
     killed eval resumes. ``max_new`` caps how many *new* games are simulated this call (the rest are
     left for a later call) — used to predict the holdout a batch at a time; pass ``None`` to run the
-    whole holdout straight through in one process (a paid-GPU run). ``report_every`` (when set) writes
+    whole holdout straight through in one process (a paid-GPU run).
+
+    ``sim`` accepts an already-loaded :class:`~simulation.game_simulator.GameSimulator` instead of
+    loading one from ``artifacts_root`` -- how the resident ``cviq`` shell runs many evals against
+    one set of weights without paying the ~11-head rebuild each time. ``df`` likewise accepts an
+    already-parsed cleaned frame, skipping a full re-read of every season CSV. ``run_label`` is the
+    run's own name for the report (defaults to ``stage_name``, which is the *model* name).
+
+    ``report_every`` (when set) writes
     an intermediate report every N newly-finished games so progress is visible during a straight run;
     a final report is always written at the end. Already-finished games still load into the report, so
     it covers everything done so far. Returns the report dict (with ``run_dir``, ``done``, ``total``).
@@ -149,18 +158,21 @@ def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
     if not holdout_ids:
         raise ValueError(f"stage '{stage_name}' has an empty holdout — nothing to evaluate.")
 
-    df = load_all_cleaned(data_dir, parse_rosters=True)
+    if df is None:
+        df = load_all_cleaned(data_dir, parse_rosters=True)
     # Results layout (new): per-game folders under <results_run_dir>/games/, report at the run root.
     # Legacy layout: per-game folders under artifacts/predictions/<stage_name>/, report in reports/.
     results_run_dir = Path(results_run_dir) if results_run_dir is not None else None
     stage_dir = (results_run_dir / "games") if results_run_dir is not None \
         else (Path(predictions_root) / stage_name)
-    sim = None  # lazily loaded only if there's an unfinished game to simulate
+    # None -> lazily loaded below only if there's an unfinished game to simulate. A caller-supplied
+    # sim is used as-is (and never unloaded here; the shell owns its lifetime).
 
     def _flush_report() -> dict:
         """Build + write the eval report over everything finished so far; return the report dict."""
         aggregate = _aggregate(records)
-        rep = build_report(records=records, aggregate=aggregate, n_sims=n_sims, run_name=stage_name)
+        rep = build_report(records=records, aggregate=aggregate, n_sims=n_sims,
+                           run_name=run_label or stage_name)
         if results_run_dir is not None:
             rd = write_eval_report(rep, run_dir=results_run_dir)
         else:
@@ -201,7 +213,8 @@ def evaluate_stage(stage_name: str, *, holdout_ids: list[int] | None = None,
     # fills the GPU (one game alone leaves it ~10% utilized). Resolve each game's matchup + real
     # starters once, then pool their sims into a single run.
     if pending:
-        sim = GameSimulator.load(artifacts_root=artifacts_root)
+        if sim is None:
+            sim = GameSimulator.load(artifacts_root=artifacts_root)
         for p in pending:
             p["spec"] = extract_game_input(p["game"])
             try:
