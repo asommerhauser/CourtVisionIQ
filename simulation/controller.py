@@ -22,11 +22,10 @@ from __future__ import annotations
 
 import numpy as np
 
-from config import (
-    DEADBALL_REBOUND_PROB, DELTA_TIME_SCALE, EVENT_BIAS, EVENT_TEMPERATURE, FOUL_OUT_LIMIT,
-    HOME_COURT_SHOT_BIAS, MAX_DELTA, PLAYER_TEMPERATURE, SHOT_RESULT_BIAS,
-    SUB_FATIGUE_WEIGHT, SUB_MAX_GAP_SECONDS,
-)
+# Rollout dials are read as ``config.<DIAL>`` at call time, never bound at import: the shell
+# (and config.dials()) rebind them on the module between runs, and a ``from config import X``
+# alias here would silently freeze the value from startup. See config._TUNING_KEYS.
+import config
 from models.conditional_time_model import ConditionalTimeModel
 from models.stint_length_model import StintLengthModel
 from models.substitution_model import START_TOKEN
@@ -86,13 +85,13 @@ class GameController:
         # Sampling/rotation dials (config defaults, overridable per run/test). The rebounder is
         # sampled with the same actor temperature as every other player pick — the off/def split
         # is owned by the rebound-type head, so there is no separate rebound dial.
-        self.player_temp = PLAYER_TEMPERATURE if player_temp is None else player_temp
-        self.sub_fatigue_weight = (SUB_FATIGUE_WEIGHT if sub_fatigue_weight is None
+        self.player_temp = config.PLAYER_TEMPERATURE if player_temp is None else player_temp
+        self.sub_fatigue_weight = (config.SUB_FATIGUE_WEIGHT if sub_fatigue_weight is None
                                    else sub_fatigue_weight)
-        self.sub_max_gap = SUB_MAX_GAP_SECONDS if sub_max_gap is None else sub_max_gap
+        self.sub_max_gap = config.SUB_MAX_GAP_SECONDS if sub_max_gap is None else sub_max_gap
         # Logit nudge to the home offense's made-shot outcome (away gets the negation): the rollout's
         # one source of home/away asymmetry, so win prediction isn't a coin flip. See config.
-        self.home_court_bias = (HOME_COURT_SHOT_BIAS if home_court_bias is None
+        self.home_court_bias = (config.HOME_COURT_SHOT_BIAS if home_court_bias is None
                                 else home_court_bias)
         if seed is not None:
             self.sim.rng = np.random.default_rng(seed)
@@ -236,7 +235,7 @@ class GameController:
         # SHOT_RESULT_BIAS, for pulling the event mix (fouls/assists/turnovers) to real rates.
         event = self.sim._masked_sample(pred["event_logits"], allowed,
                                         self.sim.encoder.encode_event, greedy=self.greedy,
-                                        temperature=EVENT_TEMPERATURE, bias=EVENT_BIAS)
+                                        temperature=config.EVENT_TEMPERATURE, bias=config.EVENT_BIAS)
         return event, pred["delta_seconds"]
 
     def _advance_for(self, event: str, actor: str | None, marginal: float) -> float:
@@ -297,7 +296,7 @@ class GameController:
         (symmetric, so the pooled make rate is preserved while the home/away split is tilted). Returns
         ``None`` when nothing applies so ``predict_result`` takes its raw path.
         """
-        bias = dict(SHOT_RESULT_BIAS)
+        bias = dict(config.SHOT_RESULT_BIAS)
         if self.home_court_bias:
             nudge = self.home_court_bias if offense == HOME else -self.home_court_bias
             bias["made"] = bias.get("made", 0.0) + nudge
@@ -356,7 +355,7 @@ class GameController:
         team rebound / out-of-bounds — and the ball simply changes hands with no row.
         """
         offense = self.possession  # team that just missed
-        if self.rng.random() < DEADBALL_REBOUND_PROB:
+        if self.rng.random() < config.DEADBALL_REBOUND_PROB:
             self._advance_clock(delta)                 # no rebounder to time on → marginal gap
             self.possession = self._other(offense)     # out of bounds → other team
             return
@@ -606,7 +605,7 @@ class GameController:
     def _advance_clock(self, delta: float) -> None:
         # DELTA_TIME_SCALE calibrates pace (>1 slows the clock → fewer possessions); MAX_DELTA clamps
         # the rare blown gap. Scale first, then clamp.
-        inc = max(0.0, min(float(delta) * DELTA_TIME_SCALE, MAX_DELTA))
+        inc = max(0.0, min(float(delta) * config.DELTA_TIME_SCALE, config.MAX_DELTA))
         # Credit the lineup on the floor over this interval (mirrors box_score minutes accounting:
         # the pre-resolution rosters are who played the elapsed seconds). Subs this step happen
         # afterwards at the advanced clock, so their stints start clean.
@@ -688,7 +687,7 @@ class GameController:
         self.player_fouls[fouler] = self.player_fouls.get(fouler, 0) + 1
         if ftype == "flagrant-2":
             return   # ejected separately by _do_foul
-        if self.player_fouls[fouler] >= FOUL_OUT_LIMIT and fouler not in self._gone():
+        if self.player_fouls[fouler] >= config.FOUL_OUT_LIMIT and fouler not in self._gone():
             self._foul_out(fouler)
 
     def _gone(self) -> set[str]:

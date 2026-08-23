@@ -192,6 +192,70 @@ def tuning_snapshot() -> dict:
     return snap
 
 
+def get_dials() -> dict:
+    """Live values of every rollout dial, in native Python types.
+
+    Unlike ``tuning_snapshot`` (which JSON-encodes dict dials for Parquet), this returns the
+    dicts as dicts, so the result round-trips back through ``apply_dials``. Deep-copied so a
+    caller holding the result cannot mutate module state by editing a nested dict.
+    """
+    import copy as _copy
+    g = globals()
+    return {k: _copy.deepcopy(g[k]) for k in _TUNING_KEYS}
+
+
+def set_dial(name: str, value):
+    """Set one rollout dial, coercing ``value`` to the type the dial already holds.
+
+    Validating against ``_TUNING_KEYS`` means a typo raises instead of silently minting a new
+    module global that nothing reads. Strings are coerced from the shell: ``json.loads`` for the
+    dict-valued dials, otherwise ``int``/``float``/``bool`` to match the current value. Returns
+    the coerced value that was stored.
+    """
+    import json as _json
+    if name not in _TUNING_KEYS:
+        raise KeyError(f"unknown dial '{name}'; expected one of: {', '.join(_TUNING_KEYS)}")
+    current = globals()[name]
+    if isinstance(current, dict):
+        if isinstance(value, str):
+            value = _json.loads(value)
+        if not isinstance(value, dict):
+            raise TypeError(f"{name} is a dict dial; got {type(value).__name__}")
+        value = dict(value)
+    elif isinstance(current, bool):
+        value = value.strip().lower() in ("1", "true", "yes", "on") if isinstance(value, str) else bool(value)
+    elif isinstance(current, int):
+        value = int(float(value))
+    elif isinstance(current, float):
+        value = float(value)
+    globals()[name] = value
+    return value
+
+
+def apply_dials(values: dict) -> dict:
+    """Set many dials at once (a "dial package"). Returns the coerced values actually stored."""
+    return {k: set_dial(k, v) for k, v in values.items()}
+
+
+from contextlib import contextmanager as _contextmanager
+
+
+@_contextmanager
+def dials(**overrides):
+    """Temporarily apply dial overrides, restoring the previous values on exit.
+
+    Convenience for tests. This works only because every consumer reads ``config.<DIAL>`` at call
+    time rather than binding the name at import; see the note on ``_TUNING_KEYS`` above.
+    """
+    import copy as _copy
+    g = globals()
+    saved = {k: _copy.deepcopy(g[k]) for k in overrides}
+    try:
+        apply_dials(overrides)
+        yield
+    finally:
+        g.update(saved)
+
 # Where the shared vocab "language" files live
 VOCAB_DIR = ROOT_DIR / "encoder" / "vocabs"
 

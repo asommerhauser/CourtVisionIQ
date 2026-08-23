@@ -40,10 +40,12 @@ import os
 
 import numpy as np
 
-from config import (
-    MAX_SEQUENCE_LENGTH, RESULT_TEMPERATURE, ROSTER_SIZE, STINT_LENGTH_SCALE, STINT_MAX_SECONDS,
-    STINT_SAMPLE_SIGMA, SUB_INCOMING_TEMPERATURE, SUB_TEMPERATURE, TYPE_BIAS, TYPE_TEMPERATURE,
-)
+# Rollout dials are read as ``config.<DIAL>`` at call time, never bound at import (and never as
+# a default-arg expression, which evaluates once at def time): the shell rebinds them on the
+# module between runs. ROSTER_SIZE is a fixed architectural constant, not a dial, so it is safe
+# to bind. See config._TUNING_KEYS and tests/test_dials.py.
+import config
+from config import ROSTER_SIZE
 from models.conditional_time_model import ConditionalTimeModel
 from encoder.encoder import Encoder
 from models.artifacts import DEFAULT_ARTIFACTS_ROOT
@@ -479,7 +481,7 @@ class GameSimulator:
         return out[output_name][0, n - 1]
 
     def predict_outgoing(self, candidates: list[str], *, delta_seconds: float = 0.0,
-                         greedy: bool = False, temperature: float = SUB_TEMPERATURE,
+                         greedy: bool = False, temperature: float | None = None,
                          outgoing_bias: dict[str, float] | None = None) -> str:
         """Sample the outgoing player from ``candidates`` (the active roster) via PlayerModel.
 
@@ -487,6 +489,7 @@ class GameSimulator:
         long-stint player is more likely to be the one who comes off) on top of the model's
         learned "who usually gets subbed" distribution.
         """
+        temperature = config.SUB_TEMPERATURE if temperature is None else temperature
         inputs = self._next_step_inputs(outgoing=None, delta_seconds=delta_seconds)
         logits = self._head_logits(PlayerModel.KEY, "player_output", inputs)
         return self._constrained_sample(logits, candidates, greedy=greedy,
@@ -494,13 +497,15 @@ class GameSimulator:
 
     def predict_incoming(self, outgoing: str, candidates: list[str], *,
                          delta_seconds: float = 0.0, greedy: bool = False,
-                         temperature: float = SUB_INCOMING_TEMPERATURE) -> str:
+                         temperature: float | None = None) -> str:
         """Sample the incoming player from ``candidates`` (the bench) via SubstitutionModel,
         conditioned on the decided ``outgoing`` player.
 
         Defaults to the sharpened ``SUB_INCOMING_TEMPERATURE`` (like the actor head) so the bench
         pick follows the model's real preference instead of spreading near-uniformly across the
         bench — the deep bench should check in rarely, not as often as a rotation regular."""
+        if temperature is None:
+            temperature = config.SUB_INCOMING_TEMPERATURE
         inputs = self._next_step_inputs(outgoing=outgoing, delta_seconds=delta_seconds)
         logits = self._head_logits(SubstitutionModel.KEY, "secondary_player_output", inputs)
         return self._constrained_sample(logits, candidates, greedy=greedy, temperature=temperature)
@@ -556,12 +561,12 @@ class GameSimulator:
         std = float(self.stint_norm_stats.get("stint_log_std", 1.0)) or 1.0
         log_stint = log_norm * std + mean
 
-        s = STINT_SAMPLE_SIGMA if sigma is None else sigma
+        s = config.STINT_SAMPLE_SIGMA if sigma is None else sigma
         if not greedy and s > 0:
             log_stint += float(self.rng.normal(0.0, s))
 
-        seconds = float(np.expm1(log_stint)) * STINT_LENGTH_SCALE
-        return max(0.0, min(seconds, STINT_MAX_SECONDS))
+        seconds = float(np.expm1(log_stint)) * config.STINT_LENGTH_SCALE
+        return max(0.0, min(seconds, config.STINT_MAX_SECONDS))
 
     # ===================================================================== #
     # --- Conditional heads (player / type / result) for the rollout       --
@@ -582,7 +587,7 @@ class GameSimulator:
 
     def predict_type(self, key: str, next_event: str, next_player: str, allowed: list[str], *,
                      delta_seconds: float = 0.0, greedy: bool = False,
-                     temperature: float = TYPE_TEMPERATURE,
+                     temperature: float | None = None,
                      bias: dict[str, float] | None = None) -> str:
         """Sample an event's ``type`` from ``allowed`` via a conditional type head.
 
@@ -594,16 +599,17 @@ class GameSimulator:
         entry (config.py, keyed by ``key``) — e.g. ``{"turnover_type": {"steal": -0.2}}`` pulls
         steal-type turnovers down without moving the overall turnover rate.
         """
+        temperature = config.TYPE_TEMPERATURE if temperature is None else temperature
         inputs = self._conditioned_inputs(next_event=next_event, delta_seconds=delta_seconds,
                                           next_player=next_player)
         logits = self._head_logits(key, "type_output", inputs)
-        eff_bias = {**TYPE_BIAS.get(key, {}), **(bias or {})} or None
+        eff_bias = {**config.TYPE_BIAS.get(key, {}), **(bias or {})} or None
         return self._masked_sample(logits, allowed, self.encoder.encode_type, greedy=greedy,
                                    temperature=temperature, bias=eff_bias)
 
     def predict_result(self, next_player: str, next_type: str, allowed: list[str], *,
                        delta_seconds: float = 0.0, greedy: bool = False,
-                       temperature: float = RESULT_TEMPERATURE,
+                       temperature: float | None = None,
                        bias: dict[str, float] | None = None) -> str:
         """Sample a shot's ``result`` from ``allowed`` via the ``shot_result`` head.
 
@@ -612,6 +618,7 @@ class GameSimulator:
         made/missed for a free throw. ``bias`` (e.g. the ``SHOT_RESULT_BIAS`` calibration on a live
         shot) adds a per-outcome logit offset before sampling — see :meth:`_masked_sample`.
         """
+        temperature = config.RESULT_TEMPERATURE if temperature is None else temperature
         inputs = self._conditioned_inputs(next_event="shot", delta_seconds=delta_seconds,
                                           next_player=next_player, next_type=next_type)
         logits = self._head_logits("shot_result", "result_output", inputs)

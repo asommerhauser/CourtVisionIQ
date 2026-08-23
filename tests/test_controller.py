@@ -12,9 +12,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from config import DELTA_TIME_SCALE, FOUL_OUT_LIMIT, PLAYER_TEMPERATURE, ROSTER_SIZE
+# Dials are read as ``config.<DIAL>`` at assert time, matching how the Controller reads them.
+# Binding them here would make these tests pass vacuously once a dial is overridden at runtime.
+import config
+from config import ROSTER_SIZE
 from simulation.controller import (
-    GameController, OPEN_PLAY_EVENTS, REGULATION, OT_LENGTH, PERIOD_LENGTH, MAX_DELTA,
+    GameController, OPEN_PLAY_EVENTS, REGULATION, OT_LENGTH, PERIOD_LENGTH,
 )
 from simulation.game_simulator import HOME, AWAY
 
@@ -408,7 +411,7 @@ def test_sixth_personal_foul_disqualifies_and_replaces():
     ctrl = make_controller(HOME)
     ctrl.sim.away_full = AWAY_FIVE + ["K"]          # a bench player to replace the DQ'd one
     ctrl.sim.script(incoming=["K"])
-    for _ in range(FOUL_OUT_LIMIT):
+    for _ in range(config.FOUL_OUT_LIMIT):
         ctrl._charge_foul("F", "personal")
     assert "F" in ctrl.fouled_out
     assert "F" not in ctrl.sim.away_full            # removed for good — no sub can bring him back
@@ -417,16 +420,16 @@ def test_sixth_personal_foul_disqualifies_and_replaces():
 
 def test_fifth_personal_foul_does_not_disqualify():
     ctrl = make_controller(HOME)
-    for _ in range(FOUL_OUT_LIMIT - 1):
+    for _ in range(config.FOUL_OUT_LIMIT - 1):
         ctrl._charge_foul("F", "personal")
     assert "F" not in ctrl.fouled_out
     assert "F" in ctrl.sim.away_roster
-    assert ctrl.player_fouls["F"] == FOUL_OUT_LIMIT - 1
+    assert ctrl.player_fouls["F"] == config.FOUL_OUT_LIMIT - 1
 
 
 def test_technical_fouls_never_count_toward_foul_out():
     ctrl = make_controller(HOME)
-    for _ in range(FOUL_OUT_LIMIT + 4):
+    for _ in range(config.FOUL_OUT_LIMIT + 4):
         ctrl._charge_foul("F", "technical")
     assert ctrl.player_fouls.get("F", 0) == 0       # technicals are not personal fouls
     assert "F" not in ctrl.fouled_out
@@ -448,8 +451,8 @@ def test_default_player_temperature_matches_config():
     # over-concentrated head, so PLAYER_TEMPERATURE=2.0 spreads usage back to a realistic shot share
     # (see config.py). The controller must adopt the config default.
     ctrl = GameController(FakeSim(), seed=0)
-    assert ctrl.player_temp == PLAYER_TEMPERATURE
-    assert PLAYER_TEMPERATURE > 1.0                 # flatten over-concentration, not sharpen
+    assert ctrl.player_temp == config.PLAYER_TEMPERATURE
+    assert config.PLAYER_TEMPERATURE > 1.0                 # flatten over-concentration, not sharpen
 
 
 def test_rebounder_uses_player_temperature():
@@ -472,7 +475,7 @@ def test_conditional_time_head_drives_clock_when_loaded():
     assert ctrl.use_condtime
     sim.script(player=["A"], type=["2pt"], result=["missed"], delta=[18.0])
     ctrl._do_shot(delta=5.0)                 # marginal 5.0 conditions the actor pick; clock uses 18.0
-    assert ctrl.player_seconds["A"] == pytest.approx(18.0 * DELTA_TIME_SCALE)
+    assert ctrl.player_seconds["A"] == pytest.approx(18.0 * config.DELTA_TIME_SCALE)
     assert ("delta", "shot", "A") in sim.calls
 
 
@@ -482,7 +485,7 @@ def test_marginal_delta_drives_clock_without_conditional_head():
     assert not ctrl.use_condtime
     ctrl.sim.script(player=["A"], type=["2pt"], result=["missed"])
     ctrl._do_shot(delta=7.0)
-    assert ctrl.player_seconds["A"] == pytest.approx(7.0 * DELTA_TIME_SCALE)
+    assert ctrl.player_seconds["A"] == pytest.approx(7.0 * config.DELTA_TIME_SCALE)
 
 
 def test_advance_clock_accrues_on_court_minutes():
@@ -490,10 +493,10 @@ def test_advance_clock_accrues_on_court_minutes():
     ctrl._advance_clock(30.0)
     # Both on-court fives get the elapsed seconds (scaled by DELTA_TIME_SCALE); the clamp keeps a
     # huge delta bounded.
-    tick = 30.0 * DELTA_TIME_SCALE
+    tick = 30.0 * config.DELTA_TIME_SCALE
     assert all(ctrl.player_seconds[p] == pytest.approx(tick) for p in (*HOME_FIVE, *AWAY_FIVE))
     ctrl._advance_clock(10_000.0)
-    assert ctrl.player_seconds["A"] == pytest.approx(tick + MAX_DELTA)  # second tick clamped to MAX_DELTA
+    assert ctrl.player_seconds["A"] == pytest.approx(tick + config.MAX_DELTA)  # second tick clamped to MAX_DELTA
 
 
 def test_fatigue_bias_weights_long_stints():

@@ -14,3 +14,24 @@ try:  # noqa: SIM105
     import tensorflow  # noqa: F401
 except Exception:
     pass
+
+
+import copy
+
+import pytest
+
+import config as _config
+
+
+@pytest.fixture(autouse=True)
+def _restore_dials():
+    """Snapshot and restore every rollout dial around each test.
+
+    The dials are module globals that the shell (and ``config.dials()``) rebind at runtime, so a
+    test that sets one would otherwise leak into every test that runs after it. Deep-copied
+    because three of them are dicts.
+    """
+    saved = {k: copy.deepcopy(getattr(_config, k)) for k in _config._TUNING_KEYS}
+    yield
+    for k, v in saved.items():
+        setattr(_config, k, v)
