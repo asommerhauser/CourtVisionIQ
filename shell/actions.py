@@ -159,20 +159,15 @@ def read_manifest(root) -> dict:
 
 
 def apply_dial_file(path) -> int:
-    """Apply a dial package (a JSON object of DIAL -> value). Returns how many were set."""
-    p = Path(path)
-    if not p.is_file():
-        raise ShellError(f"no dial file at {p}")
+    """Apply a dial package (a JSON object of DIAL -> value). Returns how many were set.
+
+    The parsing lives in ``config`` so the eval CLI can hand the same package to child processes
+    without importing the shell (which pulls TensorFlow); this is the shell-error wrapper.
+    """
     try:
-        values = json.loads(p.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
-        raise ShellError(f"{p} is not valid JSON: {e}") from None
-    if not isinstance(values, dict):
-        raise ShellError(f"{p} must contain a JSON object of DIAL -> value")
-    try:
-        return len(config.apply_dials(values))
-    except (KeyError, TypeError, ValueError) as e:
-        raise ShellError(f"{p}: {e}") from None
+        return len(config.apply_dial_file(path))
+    except ValueError as e:
+        raise ShellError(str(e)) from None
 
 
 # --------------------------------------------------------------------------- #
@@ -220,6 +215,100 @@ def run_eval(session, name, *, games=None, sims=None, concurrency=None, seed=0,
     )
     session.last_run_dir = Path(report["run_dir"])
     echo(f"  {report['done']}/{report['total']} games -> {report['run_dir']}")
+    return report
+
+
+def run_eval_pooled(session, name, *, procs, sims=None, concurrency=None, seed=0, echo=print):
+    """Evaluate across N child processes, then merge one report in this process.
+
+    The parent supervises only -- it does not take a slice. It has to stay responsive to render the
+    merged progress line and to handle Ctrl-C, and a parent blocked inside a rollout can do
+    neither; cleanly interrupting both its own rollout and N children is a lot of machinery to buy
+    one shard's throughput. The resident model does sit idle holding its VRAM, which is why that is
+    subtracted from the children's budget below (and said out loud, since it costs a child).
+
+    The run dir is resolved ONCE here and its concrete name is passed to every child, so the
+    auto-``eval-NNN`` race that bare ``--shard`` has to guard against cannot happen from the shell.
+    The merge runs in-process: TensorFlow is already loaded and the cached frame skips a full
+    re-read of every season CSV.
+    """
+    from eval_pool import (assert_one_tuning, autosize_procs, finished_games, run_waves,
+                           shard_commands)
+
+    if not session.loaded:
+        raise ShellError("no model loaded. Run 'load <name>' first; 'models' lists what is here.")
+    if not session.holdout_ids:
+        raise ShellError(f"no holdout games resolved for {session.model} "
+                         f"(source tried: {session.holdout_source or 'none'}).")
+
+    from reporting.eval_report import resolve_results_run_dir
+
+    # Each child is a fresh `evaluate.py`, which reads the holdout + data paths from the run
+    # state. The shell deliberately does NOT need that file (Session.resolve_holdout falls back to
+    # the holdout manifest and to previous runs), so a pooled run can be asked for on a machine
+    # that cannot serve it. Say so here rather than letting N children each die with a stack trace.
+    state_path = Path(config.FULL_RUN_STATE_PATH)
+    if not state_path.is_file():
+        raise ShellError(
+            f"--procs needs {state_path} (each child process is a fresh 'evaluate.py', which reads "
+            f"the holdout and data paths from it). This shell resolved its holdout from "
+            f"{session.holdout_source or 'another source'} instead. "
+            f"Run without --procs to evaluate in this process, or create the state on "
+            f"this machine first.")
+
+    total = len(session.holdout_ids)
+    run_dir = resolve_results_run_dir(session.model, name=name, holdout_total=total)
+
+    state_holdout = json.loads(state_path.read_text(encoding="utf-8")).get(
+        "holdout_game_ids") or []
+    if sorted(int(g) for g in state_holdout) != sorted(session.holdout_ids):
+        raise ShellError(
+            f"the holdout in {state_path} ({len(state_holdout)} games) is not the one this shell "
+            f"resolved ({total} games, from {session.holdout_source or 'unknown'}). The children "
+            f"would evaluate a different set of games than this report claims to cover. "
+            f"Run without --procs.")
+
+    # Every child re-reads config.py from disk, so a shell that tuned dials at runtime MUST hand
+    # them over or the run silently mixes two tunings into one report.
+    dials_path = run_dir / "dials.json"
+    config.write_dial_file(dials_path)
+
+    echo(f"  {session.model} -> {run_dir}")
+    if session.changed_dials:
+        echo("  dials: " + ", ".join(f"{k} {a}->{b}"
+                                     for k, (a, b) in sorted(session.changed_dials.items())))
+    echo(f"  dial package -> {dials_path}")
+    echo("  resident model holds its VRAM while the children run; 'unload' frees host RAM but "
+         "VRAM stays in TF's allocator pool, so it may not buy you a child.")
+
+    reserved = config.EVAL_PROC_VRAM_GB if session.loaded else 0.0
+
+    def build(wave, remaining):
+        n, why = autosize_procs(holdout_games=remaining, requested=procs,
+                                reserved_vram_gb=reserved)
+        if wave == 1:
+            echo(f"  {total} holdout games ({finished_games(run_dir)} already done), {why}")
+        if n <= 1 and wave == 1:
+            return []
+        return shard_commands(model=session.model, run=run_dir.name, n=n,
+                              dials_path=dials_path, state_path=state_path, run_dir=run_dir,
+                              sims=sims, concurrency=concurrency, seed=seed,
+                              tag="" if wave == 1 else f"-w{wave}")
+
+    shards = run_waves(build=build, run_dir=run_dir, total_games=total, echo=echo)
+    if not shards and finished_games(run_dir) < total:
+        echo("  pool of 1 -- running in this process instead.")
+        return run_eval(session, name, sims=sims, concurrency=concurrency, seed=seed, echo=echo)
+
+    assert_one_tuning(run_dir, echo=echo)
+
+    # Merge in-process: TF is loaded and the cached frame skips re-reading every season CSV.
+    echo("  merging the report over every finished game ...")
+    report = run_eval(session, run_dir.name, sims=sims, concurrency=concurrency, seed=seed,
+                      report_only=True, echo=echo)
+    if report["done"] < report["total"]:
+        echo(f"  NOTE: {report['done']}/{report['total']} games -- the report covers finished "
+             f"games only. Re-run to continue.")
     return report
 
 

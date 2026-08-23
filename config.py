@@ -129,6 +129,17 @@ ROLLOUT_BATCH_SIZE = 48
 # single process (no cross-process VRAM contention). Lower it if system RAM/thread pressure is high.
 EVAL_GAMES_PER_BATCH = 6
 
+# --- Eval process pool (`run --procs N` / `evaluate.py --procs N`) ---
+# Batching fills the GPU, but everything around the forward pass -- input building, sampling,
+# the rule engine -- is Python, so one process is capped by the GIL at roughly one core no
+# matter how many the box has. Separate processes on disjoint holdout slices are what turn the
+# rest of the cores into throughput. These size that pool; like ROLLOUT_BATCH_SIZE they are perf
+# knobs, NOT tuning dials -- they change how long a run takes, never what it predicts.
+# Re-measure them per machine with the scaling curve in README (--procs 1 / 2 / 4).
+EVAL_PROC_CORES = 2        # cores to budget per eval process (GIL-bound Python + TF intra-op)
+EVAL_PROC_VRAM_GB = 4.0    # VRAM a loaded eval process costs (~3-4 GB for the 11 heads)
+EVAL_PROC_MAX = 8          # ceiling, so a 128-core pod does not fork a pathological pool
+
 # --- Stint-length scheduler (StintLengthModel + GameController hybrid scheduler) ---
 # When the stint-length head is loaded, the Controller commits each entering player to a stint:
 # it samples a length (game-seconds on the floor) and schedules the player's exit at
@@ -237,6 +248,44 @@ def apply_dials(values: dict) -> dict:
     return {k: set_dial(k, v) for k, v in values.items()}
 
 
+def apply_dial_file(path) -> dict:
+    """Apply a dial package from a JSON file (an object of DIAL -> value); return what was stored.
+
+    Lives here rather than in the shell so the eval CLI can use it without importing anything that
+    pulls TensorFlow: a sharded or pooled eval hands each child process the parent's dial package
+    this way, which is the only thing keeping N processes from silently running different physics.
+    Raises ValueError for anything malformed; callers wanting their own error type wrap it.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    p = _Path(path)
+    if not p.is_file():
+        raise ValueError(f"no dial file at {p}")
+    try:
+        values = _json.loads(p.read_text(encoding="utf-8"))
+    except _json.JSONDecodeError as e:
+        raise ValueError(f"{p} is not valid JSON: {e}") from None
+    if not isinstance(values, dict):
+        raise ValueError(f"{p} must contain a JSON object of DIAL -> value")
+    try:
+        return apply_dials(values)
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError(f"{p}: {e}") from None
+
+
+def write_dial_file(path) -> dict:
+    """Write the live dial values to ``path`` as JSON and return them. Inverse of the above."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    p = _Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    values = get_dials()
+    p.write_text(_json.dumps(values, indent=2, sort_keys=True), encoding="utf-8")
+    return values
+
+
 from contextlib import contextmanager as _contextmanager
 
 
@@ -255,6 +304,11 @@ def dials(**overrides):
         yield
     finally:
         g.update(saved)
+
+# Full-run state (holdout ids + the train/holdout cut). Machine-local, never committed.
+# Defined here rather than in training.full_run so the eval CLI and the process-pool
+# supervisor can read it without importing anything that pulls TensorFlow.
+FULL_RUN_STATE_PATH = "./training/full_run_state.json"
 
 # Where the shared vocab "language" files live
 VOCAB_DIR = ROOT_DIR / "encoder" / "vocabs"

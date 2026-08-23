@@ -247,6 +247,9 @@ python evaluate.py --model v1.0 --run pace-097 --games 10
 
 # Rebuild the report over finished games, no new sims:
 python evaluate.py --model v1.0 --run pace-097 --report-only
+
+# Split the holdout across 4 processes, then merge one report (see "GPU utilization" below):
+python evaluate.py --model v1.0 --run trial1 --procs 4      # or --procs auto
 ```
 
 - **`--monte-carlo`** — sims per game to average (default `STAGE_SIMS`; more sims tighten the
@@ -255,6 +258,9 @@ python evaluate.py --model v1.0 --run pace-097 --report-only
   VRAM knob: attention memory grows with batch × seq², so **lower it if you OOM**, raise it to use
   more of the card. Independent of `--monte-carlo`; throughput only — results are seed-determined,
   unchanged.
+- **`--procs`** — how many eval **processes** run at once over disjoint slices of the holdout.
+  A third, separate knob: `--concurrency` fills the GPU inside one process, `--procs` uses the rest
+  of the machine. `auto` sizes it from usable cores and free VRAM. Throughput only.
 
 **A results run** (`results/v<version>/<eval-name>/`) contains:
 ```
@@ -273,11 +279,42 @@ stable, resumable run. Regenerate a report from `report.json` without sims:
 ### GPU utilization
 
 The rollout drives many game-sims concurrently, pooling their per-event forward passes into one
-batched GPU call (`--concurrency`). An **opt-in** compiled-inference path (`tf.function`) can cut
-per-call dispatch overhead further — enable and measure it on your GPU:
-`CVIQ_TF_INFER=1 python evaluate.py …` (off by default; it needs on-hardware validation because a
-bad retrace can run slower on some setups). It falls back to eager per-signature on any
-incompatibility, so results are unchanged.
+batched GPU call (`--concurrency`). Within a process, slots backfill: a slot that finishes a short
+game immediately pulls the next one, so the batch stays full instead of draining at every cohort
+boundary.
+
+**Everything around the forward pass is Python, so one process is GIL-bound to about one core.**
+That is the real ceiling on a many-core box, and `--procs N` is the lever:
+
+```bash
+python evaluate.py --model v1.0 --run trial1 --procs auto
+```
+
+It resolves the run dir once, launches N `--shard i/N` children on disjoint holdout slices, shows
+one merged progress line, and merges a single report when they finish. Each child needs ~3-4 GB of
+VRAM (drop `--concurrency` to ~24 each if you crowd the card), and `auto` sizes the pool from
+usable cores, free VRAM, and how many games are left — printing which of those bound it. `--procs 1`
+is byte-for-byte the single-process path. The same works in the shell: `run trial1 --procs 4`.
+
+Under the hood, `--shard I/N` is a first-class flag, so you can also drive the split by hand (across
+two machines, say): run `--shard 1/N .. N/N` with the same `--run`, then `--report-only` to merge.
+Shards write disjoint game folders and skip the aggregate report; per-game seeds don't depend on
+position. Every child is handed the parent's dial package (`<run>/dials.json`) so all N processes
+run identical physics, and the merge warns if the finished games disagree on any dial.
+
+Tune the pool per machine by timing `--procs 1`, `2`, `4` over a few games into **fresh run names**
+(a repeated name resumes and finishes instantly), then adjust `EVAL_PROC_CORES` / `EVAL_PROC_VRAM_GB`
+in `config.py`.
+
+An **opt-in** compiled-inference path (`tf.function`) can cut per-call dispatch overhead further —
+enable and measure it on your GPU: `CVIQ_TF_INFER=1 python evaluate.py …` (off by default; it needs
+on-hardware validation because a bad retrace can run slower on some setups). It falls back to eager
+per-signature on any incompatibility, so results are unchanged.
+
+`CVIQ_INPUT_CACHE=0` disables the incremental input encoder (`simulation/input_cache.py`) and falls
+back to rebuilding the model's input window from scratch on every head call. It exists as a kill
+switch and as the oracle the cache is tested against — the two produce bit-identical tensors, and
+the old path is orders of magnitude slower. There is no reason to set it outside debugging.
 
 ---
 

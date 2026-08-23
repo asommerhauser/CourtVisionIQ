@@ -19,7 +19,7 @@ from pathlib import Path
 import config
 from models.artifacts import list_models, model_root
 from shell.actions import (ShellError, apply_dial_file, launch_train, load_model, run_eval,
-                           train_status)
+                           run_eval_pooled, train_status)
 from shell.session import Session
 
 BANNER = r"""
@@ -85,6 +85,9 @@ P_RUN.add_argument("--report-only", action="store_true",
                    help="rebuild the report from finished games; simulate nothing")
 P_RUN.add_argument("--report-every", type=int, metavar="N",
                    help="write an intermediate report every N finished games")
+P_RUN.add_argument("--procs", metavar="N",
+                   help="split the holdout across N eval processes ('auto' sizes from cores + "
+                        "free VRAM); omit or 1 for the in-process path")
 
 P_DIALS = _parser("dials")
 P_DIALS.add_argument("--changed", action="store_true", help="only dials that moved")
@@ -187,15 +190,29 @@ class CviqShell(cmd.Cmd):
 
     # ------------------------------------------------------------ RUN
     def do_run(self, arg):
-        """run [<name>] [--games N] [--sims N] [--concurrency N] [--seed N] [--report-only]
+        """run [<name>] [--games N] [--sims N] [--concurrency N] [--procs N] [--seed N]
+               [--report-only]
 
         Evaluate the loaded model into results/<model>/<name>/. A named run is stable: running it
         again resumes it rather than starting over, since finished games are cached per game.
 
         --sims and --concurrency are independent on purpose: sims is how many Monte-Carlo
         rollouts each game gets, concurrency is how many run at once and is what bounds VRAM.
+
+        --procs is the third, separate knob: concurrency fills the GPU inside ONE process, but
+        that process is GIL-bound to about one core, so --procs is what uses the rest of the box.
+        The run dir is resolved once here and handed to every child, so an auto-named run is safe.
         """
         a = P_RUN.parse_args(_split(arg))
+        if a.procs and str(a.procs) != "1":
+            if a.report_only:
+                raise ArgError("--report-only simulates nothing; drop --procs.")
+            if a.games:
+                raise ArgError("--games is the single-process interrupt knob and does not combine "
+                               "with --procs. Drop one.")
+            run_eval_pooled(self.session, a.name, procs=a.procs, sims=a.sims,
+                            concurrency=a.concurrency, seed=a.seed)
+            return
         run_eval(self.session, a.name, games=a.games, sims=a.sims, concurrency=a.concurrency,
                  seed=a.seed, report_only=a.report_only, report_every=a.report_every)
 

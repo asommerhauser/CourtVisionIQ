@@ -27,7 +27,7 @@ from pathlib import Path
 
 from config import (
     DEFAULT_MODEL, EVAL_BATCH, EVAL_GAMES_PER_BATCH, FINAL_HOLDOUT_GAMES, FINAL_SEASON_FRACTION,
-    ROLLOUT_BATCH_SIZE, SEED, STAGE_SIMS, SUBSET_MODEL_KEYS, TEST_FRAC,
+    FULL_RUN_STATE_PATH, ROLLOUT_BATCH_SIZE, SEED, STAGE_SIMS, SUBSET_MODEL_KEYS, TEST_FRAC,
 )
 from models.artifacts import list_models, model_root
 from models.manifest import (new_manifest, record_head, snapshot_vocabs, vocab_fingerprint,
@@ -37,7 +37,7 @@ from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
 from training.chronology import game_index, sequential_partition
 from training.subset import load_subset_games
 
-DEFAULT_STATE_PATH = "./training/full_run_state.json"
+DEFAULT_STATE_PATH = FULL_RUN_STATE_PATH   # re-exported: train.py imports it from here
 
 
 def model_name(value: str) -> str:
@@ -195,7 +195,8 @@ class FullRun:
     # --------------------------------------------------------------- eval
     def eval(self, *, version: str | None = None, name: str | None = None,
              n_sims: int | None = None, concurrency: int | None = None,
-             max_new: int | None = None, report_every: int | None = None) -> None:
+             max_new: int | None = None, report_every: int | None = None,
+             shard: tuple[int, int] | None = None, seed: int = 0) -> None:
         """Predict the holdout into a results run at results/v<version>/<eval-name>/.
 
         ``version`` defaults to the trained run's version. ``name`` names the eval folder (default:
@@ -206,6 +207,15 @@ class FullRun:
         in cohorts of this width, so memory is bounded by ``concurrency`` no matter how many games/sims
         are pooled. ``max_new`` caps NEW games this call (batched / interrupt-friendly); ``None`` runs
         the whole holdout, flushing an intermediate report every ``report_every`` games.
+
+        ``shard`` = ``(i, n)``, 1-based: simulate only ``holdout[i-1::n]``, so n concurrent
+        processes can split the holdout across CPU cores while sharing one GPU. Within a process
+        the rollout's worker threads are GIL-bound, so processes are what turn spare cores into
+        throughput. The n slices are disjoint and cover the holdout exactly once, per-game seeds do
+        not depend on position, and each game writes its own folder -- so a sharded run's games are
+        identical to an unsharded run's. Sharded calls do NOT write the aggregate report (concurrent
+        partial writes would clobber each other); merge with :meth:`report` once every shard
+        finishes. They also leave the run state untouched, since concurrent writers would race it.
         """
         from reporting.eval_report import resolve_results_run_dir
         from simulation.stage_eval import evaluate_stage
@@ -225,18 +235,34 @@ class FullRun:
         games_per_batch = EVAL_GAMES_PER_BATCH
         holdout = self.state["holdout_game_ids"]
         run_dir = resolve_results_run_dir(name_, name=name, holdout_total=len(holdout))
-        self.state["last_eval_name"] = run_dir.name
-        self._save()
+        if shard is None:
+            self.state["last_eval_name"] = run_dir.name
+            self._save()
+        else:
+            i, n = shard
+            holdout = holdout[i - 1::n]
+            print(f"[eval] shard {i}/{n}: {len(holdout)} of "
+                  f"{len(self.state['holdout_game_ids'])} holdout games -> {run_dir}")
 
         report = evaluate_stage(
-            name_, holdout_ids=holdout, n_sims=n_sims, max_new=max_new,
+            name_, holdout_ids=holdout, n_sims=n_sims, max_new=max_new, seed0=seed,
             report_every=report_every, data_dir=self.state["data_dir"],
             processed_dir=self.state["processed_dir"], artifacts_root=model_root(name_),
             results_run_dir=run_dir, batch_size=batch_size, games_per_batch=games_per_batch,
+            write_report=shard is None,
         )
         done, total = report["done"], report["total"]
         print("\n" + "=" * 70)
-        if done >= total:
+        if shard is not None:
+            i, n = shard
+            if done >= total:
+                print(f"SHARD {i}/{n} DONE — all {total} of its games predicted. Once EVERY "
+                      f"shard is done, merge the report:")
+                print(f"  python evaluate.py --model {name_} --run {run_dir.name} --report-only")
+            else:
+                print(f"SHARD {i}/{n} STOP — {done}/{total} of its games done. Re-run it:")
+                print(f"  python evaluate.py --model {name_} --run {run_dir.name} --shard {i}/{n}")
+        elif done >= total:
             print(f"DONE — all {total} holdout games predicted. Report:")
         else:
             print(f"STOP — {done}/{total} holdout games done. Re-run to continue:")
