@@ -249,10 +249,16 @@ In the pod window, from `/workspace/CourtVisionIQ`:
 
 ```bash
 runpodctl receive 8338-quantum-galileo-forest
-tar -xzf seasons.tgz            # both tarballs carry their data/ and artifacts/ prefixes,
-tar -xf  v1.0-weights.tar       # so extract from the REPO ROOT, not from inside data/
-ls data/season*.csv | wc -l     # 21
+tar --no-same-owner -xzf seasons.tgz       # both tarballs carry their data/ and artifacts/
+tar --no-same-owner -xf  v1.0-weights.tar  # prefixes, so extract from the REPO ROOT
+ls data/season*.csv | wc -l                # 21
 ```
+
+**`--no-same-owner` is not optional on a pod.** Tarballs packed in WSL off `/mnt/c` carry the
+Windows uid (197609); `tar` as root tries to restore it, the container has no such uid, and every
+member fails its `chown` — *after* writing the file, so the extract is fine but tar exits 2. That
+status silently breaks an `a && b && c` chain of extracts at the first tarball. Extract one per
+line, or pass the flag.
 
 One file per code — repeat for each tarball. A big send is worth watching: if the relay stalls,
 Ctrl-C both ends and re-issue (the spent code is dead, you get a new one).
