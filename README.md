@@ -22,6 +22,7 @@ models/  layers/          model heads + transformer building blocks
 simulation/               rollout engine, box scores, evaluation harness, diagnostics
 reporting/                training reports + evaluation/results reports (HTML + Parquet)
 training/                 full-train orchestration + chronological slicing / subset selection
+  full_run_state.json     holdout ids + data paths, written by a full train; not in git
 artifacts/<name>/         one trained model per dir (weights + manifest.json + vocabs/); not in git
 reports/<head>/<run>/     per-head TRAINING reports (loss curves, epoch metrics)
 results/<model>/<run>/    EVALUATION ("test run") outputs — see below; not in git
@@ -80,34 +81,256 @@ source ~/cviq-venv/bin/activate
 cd /mnt/c/Projects/CourtVisionIQ            # repo, shared with Windows via the mount
 ```
 
-### Option B — Rented cloud GPU (RunPod / Vast.ai / Lambda)
+### Option B — Rented cloud GPU
 
 The model stack is small (dozens of heads, a few M params each, trained sequentially) and more
 I/O-/overhead-bound than compute-bound — a single **24 GB consumer card (e.g. RTX 4090)** is
 plenty and far cheaper than an A100/H100. A full train (~2–4 h) + full holdout eval (~1–3 h) runs
-a few dollars.
+a few dollars. We rent on **RunPod**; the whole procedure is the next section.
 
-1. **Clone the code** (vocabs are committed; data is not):
+---
+
+## Running on RunPod
+
+Two shells, doing different jobs — keep both open:
+
+| | |
+|---|---|
+| **Windows PowerShell** | `ssh` into the pod. This is where the pod session lives. |
+| **WSL (Ubuntu-22.04)** | `tar` + `runpodctl send`. The transfer tool is installed here only (`/usr/local/bin/runpodctl`), and the repo is on the mount at `/mnt/c/Projects/CourtVisionIQ`. |
+
+Nothing is copied over SSH. Files move with **`runpodctl send`**, which prints a one-time code; you
+paste the matching `runpodctl receive <code>` into the pod's shell and the file streams across
+(croc under the hood, so it works in both directions and needs no open port). Both ends must be
+live at the same time — it is a relay, not a drop box — and a code is good for exactly one transfer.
+
+### What the pod needs, per job
+
+The code is on GitHub and the vocabs are committed; **data and weights are not**. What you ship
+depends on what you came to do:
+
+| Job | Ship up | |
+|---|---|---|
+| Full train | `data/season*.csv` (~133 MB packed) | the train writes `training/full_run_state.json` on the pod, so `evaluate.py` works there afterwards |
+| Evaluate / tune existing weights | the CSVs **+** `artifacts/<name>/` (~2.6 GB) | drive it from `python cviq.py` — see the state-file note |
+| Evaluate with `--procs N` | the above **+ `training/full_run_state.json`** | every child is a fresh `evaluate.py`, which reads the holdout from that file |
+| Clean from raw play-by-play | `RawData/MasterFiles/` (3.7 GB) | don't — cleaning needs no GPU. Clean locally, ship the cleaned CSVs. |
+
+> **The state file.** `evaluate.py` reads the holdout ids and the data paths from
+> `training/full_run_state.json`, which a full train writes and git does not track. Without it,
+> every invocation — including `--report-only` and each `--procs` child — exits with
+> `No full-run state`. The `cviq` shell has no such dependency: `load` resolves the holdout from
+> `artifacts/<name>/manifest.json`, falling back to the processed holdout manifest and then to
+> previous run folders. **On a pod that only ever received someone else's weights, evaluate from
+> the shell.**
+
+### One-time, per machine
+
+1. **Public key on the RunPod account** — console *Settings → SSH Public Keys*, or:
    ```bash
-   cd /workspace                              # a persistent volume, so data uploads once
-   git clone https://github.com/asommerhauser/CourtVisionIQ.git && cd CourtVisionIQ
+   runpodctl ssh add-key --key-file ~/.ssh/id_ed25519.pub
    ```
-2. **Ship the cleaned CSVs** (not `RawData/` — that's only for the one-time clean). They gzip to
-   ~1 GB:
+   The key has to be on the account **before** the pod is created; a running pod does not pick up a
+   newly added key without a restart.
+2. **`runpodctl` in WSL** (already installed here — check with `runpodctl version`):
    ```bash
-   # on your machine, from the repo root
-   tar -czf seasons.tgz data/season*.csv
-   # move seasons.tgz to the pod (runpodctl / scp / JupyterLab drag-drop), then on the pod:
-   mkdir -p data && tar -xzf seasons.tgz
+   wget -qO runpodctl https://github.com/runpod/runpodctl/releases/latest/download/runpodctl-linux-amd64
+   chmod +x runpodctl && sudo mv runpodctl /usr/local/bin/
+   runpodctl doctor          # prompts for the API key, saves it to ~/.runpod/config.toml
    ```
-3. **Environment + GPU check:**
-   ```bash
-   python -m venv .venv && source .venv/bin/activate
-   pip install -r requirements-gpu.txt        # tensorflow[and-cuda] bundles CUDA
-   python -c "import tensorflow as tf; print('GPUs:', tf.config.list_physical_devices('GPU'))"
-   ```
-4. Run the commands below. When done, pull `results/` + `reports/` (and `artifacts/` if you want
-   the weights) back, then **terminate the pod** so billing stops.
+   Pods ship with `runpodctl` preinstalled and already authenticated — nothing to do on that side.
+
+### 1. Start the pod
+
+Console, or from WSL:
+
+```bash
+runpodctl gpu list                                    # exact --gpu-id strings
+runpodctl pod create --name cviq \
+  --gpu-id "NVIDIA GeForce RTX 4090" \
+  --image runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404 \
+  --ports '22/tcp' --container-disk-in-gb 20 --volume-in-gb 60
+runpodctl pod list                                    # id + status
+runpodctl ssh info <pod-id>                           # the ssh command, without opening the console
+```
+
+- **Any CUDA 12.x image works.** `tensorflow[and-cuda]==2.20.0` bundles its own CUDA + cuDNN, so
+  the image only has to supply a working driver stack — the PyTorch images are convenient because
+  they are cached on most hosts and boot fast.
+- **Disk.** Measured sizes: cleaned CSVs 4.3 GB, `data/processed` 0.8 GB (rebuilt by a train), one
+  model 5.3 GB, a results run a few hundred MB. 60 GB on the volume leaves room for two models; the
+  20 GB container disk only holds the image + venv.
+- **`--ports '22/tcp'`** is what gets you direct SSH (and with it `scp`); without it you are on the
+  proxy, which is terminal-only.
+- `--stop-after` / `--terminate-after` take an ISO datetime and are cheap insurance against leaving
+  a card running overnight.
+
+### 2. SSH in (PowerShell)
+
+```powershell
+ssh root@<pod-ip> -p <pod-port> -i $env:USERPROFILE\.ssh\id_ed25519
+```
+
+Fallback when the pod exposes no TCP port — the RunPod proxy. It gives a terminal and nothing else
+(no `scp`, no port forwarding), which costs nothing here because transfers go through `runpodctl`:
+
+```powershell
+ssh <pod-id>-<hash>@ssh.runpod.io -i $env:USERPROFILE\.ssh\id_ed25519
+```
+
+**Then, first thing, start a multiplexer:**
+
+```bash
+tmux new -s cviq          # tmux attach -t cviq to get back after a drop
+```
+
+A dropped SSH session takes its child processes with it. `cviq> train --go` detaches the train from
+the *shell*, but it stays in the SSH session's process group — it is not SIGHUP-proof on its own.
+Anything longer than a few minutes belongs inside `tmux`.
+
+### 3. Clone + environment (on the pod)
+
+```bash
+cd /workspace                                  # the volume; the container disk is wiped on stop
+git clone https://github.com/asommerhauser/CourtVisionIQ.git && cd CourtVisionIQ
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-gpu.txt
+python -c "import tensorflow as tf; print('GPUs:', tf.config.list_physical_devices('GPU'))"
+# -> GPUs: [PhysicalDevice(name='/physical_device:GPU:0', device_type='GPU')]
+nvidia-smi; nproc                              # card + cores (cores size --procs later)
+```
+
+Keep the venv under `/workspace` as well, or a stop/start throws it away with the container disk.
+
+### 4. Ship the data / weights up
+
+**Pre-flight, before packing anything.** `pytest` overwrites the shared vocab stats and can leave a
+model's manifest pointing at a pytest temp dir — pack that and you ship a wrong holdout to the pod:
+
+```bash
+git status --short encoder/vocabs               # expect no output
+git checkout -- encoder/vocabs                  # if it isn't clean
+python -c "import json; m=json.load(open('artifacts/v1.0/manifest.json')); print(m['data']['data_dir'], m['data']['n_games'], len(m['holdout_game_ids']))"
+```
+
+`data_dir` must be the real `./data` (not `…/pytest-…/…`) and `n_games` the real corpus. If it is
+polluted, rewrite the manifest with `cviq> adopt v1.0` — no retrain.
+
+**Pack (WSL window, from `/mnt/c/Projects/CourtVisionIQ`):**
+
+```bash
+# cleaned seasons — 4.3 GB of CSV compresses ~30x, so gzip earns its keep here
+tar -czf seasons.tgz data/season*.csv
+
+# weights — .h5 float data does not compress; skip -z rather than burn minutes for ~0%
+tar -cf v1.0-weights.tar \
+    artifacts/v1.0/manifest.json artifacts/v1.0/vocabs \
+    artifacts/v1.0/*/*.weights.h5 artifacts/v1.0/*/norm_stats.json
+
+# only if you intend to use --procs / evaluate.py on the pod
+tar -czf runstate.tgz training/full_run_state.json
+```
+
+The `.keras` files are deliberately left out: `from_artifacts` rebuilds each graph from `config.py`
+and restores the weights-only file, so the `.keras` copies double the bundle for nothing.
+`manifest.json` and `vocabs/` are **not** optional — without them `load` warns about a pre-manifest
+model, finds no holdout list, and `run` refuses.
+
+**Send (WSL) → receive (pod):**
+
+```bash
+runpodctl send seasons.tgz
+#  Sending 'seasons.tgz' (133 MB)
+#  Code is: 8338-quantum-galileo-forest
+#  On the other computer run: runpodctl receive 8338-quantum-galileo-forest
+```
+
+In the pod window, from `/workspace/CourtVisionIQ`:
+
+```bash
+runpodctl receive 8338-quantum-galileo-forest
+tar -xzf seasons.tgz            # both tarballs carry their data/ and artifacts/ prefixes,
+tar -xf  v1.0-weights.tar       # so extract from the REPO ROOT, not from inside data/
+ls data/season*.csv | wc -l     # 21
+```
+
+One file per code — repeat for each tarball. A big send is worth watching: if the relay stalls,
+Ctrl-C both ends and re-issue (the spent code is dead, you get a new one).
+
+### 5. Run the job
+
+Everything below runs on the pod, inside `tmux`, with the venv active. The flags are documented in
+full under [Training](#training--trainpy), [Evaluation](#evaluation--evaluatepy) and
+[Inference dials](#inference-dials-tuning-without-retraining); this is the order of operations.
+
+**Clean** — only if you shipped `RawData/`. CPU-only, normally done locally:
+```bash
+python main.py --clean --rebuild-vocabs --model event_time
+```
+
+**Train** a new named model:
+```bash
+python train.py --full --name v1.1 --batch-size 64      # add --clean --rebuild-vocabs after a re-clean
+python train.py --status                                # progress, from a second tmux pane
+python train.py --continue                              # resume at the next unfinished head
+```
+Weights land in `artifacts/v1.1/`, per-head training reports under `reports/`, and the run state in
+`training/full_run_state.json` — which is what makes `evaluate.py` usable on this pod afterwards.
+
+**Load + evaluate + tune** — the resident-model path, no reload between runs:
+```bash
+python cviq.py
+cviq> models                         # confirm what arrived intact
+cviq> load v1.0
+cviq> run trial1 --games 4 --sims 3  # a short run first: proves data + weights + holdout line up
+cviq> set DELTA_TIME_SCALE 0.99
+cviq> run trial2 --games 4 --sims 3
+cviq> dials --changed --save dials-trial2.json
+cviq> run full1                      # the whole holdout
+```
+
+**Saturate the box** once a short run works. `--concurrency` fills the GPU inside one process,
+`--procs` spends the remaining cores (one process is GIL-bound to roughly one core):
+```bash
+cviq> run full1 --procs 4                                    # needs training/full_run_state.json
+python evaluate.py --model v1.0 --run full1 --procs auto      # same thing, non-interactive
+```
+Lower `--concurrency` (48 default → ~24 per child) if you crowd VRAM; each child costs ~3–4 GB.
+`CVIQ_TF_INFER=1` is the opt-in compiled-inference path — measure it on the rented card before
+trusting it.
+
+### 6. Pull the results back down, then terminate
+
+Same tool, reversed. On the pod:
+
+```bash
+tar -czf results-full1.tgz results/v1.0/full1 reports
+runpodctl send results-full1.tgz
+```
+
+In WSL, from the repo root, paste the printed `runpodctl receive <code>` and unpack it.
+
+**After a train, three things have to come home** or the run dies with the pod:
+
+```bash
+tar -cf  v1.1-weights.tar artifacts/v1.1/manifest.json artifacts/v1.1/vocabs \
+                          artifacts/v1.1/*/*.weights.h5 artifacts/v1.1/*/norm_stats.json
+tar -czf v1.1-meta.tgz training/full_run_state.json reports
+runpodctl send v1.1-weights.tar        # then again for v1.1-meta.tgz
+```
+
+Then **terminate the pod** — console, or `runpodctl pod delete <pod-id>`. Stopping a pod ends the
+GPU billing but keeps charging for the volume, and the container disk (venv included) is gone on
+the next start anyway.
+
+### Later: a network volume
+
+A fresh pod per session means re-shipping the CSVs and rebuilding the venv every time. A **network
+volume** removes both: create it in the console, pass `--network-volume-id <id>` to
+`runpodctl pod create`, and it mounts at `/workspace`. Put the clone, the venv, `data/` and
+`artifacts/` on it once, and every later session is just steps **2** (SSH + tmux) and **5** (run the
+job), with nothing to transfer and results pulled down as above. The volume bills by the GB-month
+whether or not a pod is attached, and it pins you to its datacenter when picking a GPU.
 
 ---
 
@@ -235,6 +458,11 @@ Simulates the holdout (from the training run's frozen holdout set) against reali
 results run under `results/<model>/<run>/`. For repeated runs against one model, prefer the
 `cviq` shell above -- this reloads the model on every invocation.
 
+It reads the holdout ids and the data paths from `training/full_run_state.json` -- written by a
+full train, not tracked by git -- so on a machine that only ever *received* weights, every
+invocation exits with `No full-run state`. Evaluate from `python cviq.py` there: `load` resolves
+the holdout from `artifacts/<name>/manifest.json` instead.
+
 ```bash
 # Evaluate v1.0's holdout (auto-named eval-NNN), default sims + concurrency:
 python evaluate.py --model v1.0
@@ -295,6 +523,8 @@ one merged progress line, and merges a single report when they finish. Each chil
 VRAM (drop `--concurrency` to ~24 each if you crowd the card), and `auto` sizes the pool from
 usable cores, free VRAM, and how many games are left — printing which of those bound it. `--procs 1`
 is byte-for-byte the single-process path. The same works in the shell: `run trial1 --procs 4`.
+Both forms need `training/full_run_state.json` on the machine, since every child is a fresh
+`evaluate.py`; without it the shell refuses by name and tells you to run without `--procs`.
 
 Under the hood, `--shard I/N` is a first-class flag, so you can also drive the split by hand (across
 two machines, say): run `--shard 1/N .. N/N` with the same `--run`, then `--report-only` to merge.
