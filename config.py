@@ -79,7 +79,11 @@ SHOT_RESULT_BIAS: dict[str, float] = {"made": 0.40, "blocked": -0.15}
 # 44.9 vs 41.6 (+8%). Re-measure after any retrain — the event mix moves with the event head.
 # v1.0 full1 (this bias already applied): FTA over-produced +3.845 (16% high) instead of under --
 # the foul-volume push overshot. Roughly halved.
-EVENT_BIAS: dict[str, float] = {"foul": 0.08, "turnover": -0.08}
+# v1.0 full2 (this bias + the foul_type.shooting cut below, applied together): FTA improved to
+# +1.44 but total fouls overshot the other way -- PF flipped from +0.41 to -0.71 (team level).
+# Restoring some volume here; foul_type.shooting is cut further below to keep FTA falling without
+# re-inflating PF.
+EVENT_BIAS: dict[str, float] = {"foul": 0.11, "turnover": -0.08}
 # Per-head per-token logit offset on the conditional type heads (GameSimulator.predict_type),
 # keyed by head then token, e.g. {"turnover_type": {"steal": -0.2}} to pull steal-type turnovers
 # down without moving the overall turnover rate. Default {} = raw model. Fit to v1.0 trial1:
@@ -94,12 +98,17 @@ EVENT_BIAS: dict[str, float] = {"foul": 0.08, "turnover": -0.08}
 # ball" is named directly as a likely culprit (a very large offset on a near-zero-mass token);
 # roughly halved rather than zeroed, since the original trial1 gap it corrected was real. OREB% is
 # now over +2.48% (was under at trial1, hence the original +0.20) -- halved since it's overshooting.
+# v1.0 full2 (all values below already applied): FTA still over +1.44 (team level) even with PF now
+# under -0.71 -- cut shooting-foul share further so FTA keeps falling as EVENT_BIAS.foul is restored
+# above. OREB landed close (+0.46) while DREB is still over (+1.17); bumped the offensive split back
+# up a touch to protect OREB's share while DEADBALL_REBOUND_PROB (below) pulls more total volume,
+# mostly from DREB, on the next pass. "loose ball" left untouched to isolate its effect this round.
 TYPE_BIAS: dict[str, dict[str, float]] = {
-    "foul_type": {"shooting": 0.20, "personal": -0.45, "offensive": -0.30,
+    "foul_type": {"shooting": 0.15, "personal": -0.45, "offensive": -0.30,
                   "loose ball": 1.2, "technical": 1.5},
     "turnover_type": {"steal": -0.12},
     "assist_type": {"3pt": 0.10},
-    "rebound_type": {"offensive": 0.10},
+    "rebound_type": {"offensive": 0.13},
 }
 # Home-court edge. The rollout is otherwise home/away symmetric (HOME just inbounds first), so the
 # sim can't separate winners and win-pick accuracy sits near a coin flip. This adds a logit nudge to
@@ -112,7 +121,11 @@ TYPE_BIAS: dict[str, dict[str, float]] = {
 # +1.47), so the edge was ~55% too strong; scaled proportionally.
 # Trimmed further 0.07 -> 0.047: v1.0 full1 (100-game holdout) still predicted +3.87 vs +2.58
 # actual (spread bias +1.29) -- same proportional scaling: 0.07 * (2.58/3.87).
-HOME_COURT_SHOT_BIAS = 0.047
+# Raised 0.047 -> 0.055: v1.0 full2 overshot the other way, spread bias flipping from +1.35 (full1)
+# to -0.69 -- win-pick accuracy also dropped 66% -> 62%, though with only 21 sims x 100 games some
+# of that swing is noise. Split the difference via linear interpolation between the two known
+# (dial, bias) points, targeting bias ~0.
+HOME_COURT_SHOT_BIAS = 0.055
 # Logit bonus per second of a player's current on-court stint, added to the outgoing-sub pick so
 # a long-tenured player (a star included) is *nudged* — not forced — toward coming off. 0 = off.
 # Lowered from 0.15 so starters are pulled for tenure less aggressively (the stage eval under-played
@@ -187,7 +200,14 @@ MAX_DELTA = 60.0
 # +2.22 -- total individually-attributed rebound volume is inflated on both sides, not just the
 # off/def split (that's TYPE_BIAS.rebound_type's job, tuned separately above). More dead-ball
 # rebounds pulls both counts down together without touching the split.
-DEADBALL_REBOUND_PROB = 0.09
+# Raised further 0.09 -> 0.10: v1.0 full2 landed OREB close (+0.46) but DREB is still over (+1.17)
+# -- the rebound_type.offensive cut (also made in full2) pulled OREB down twice as hard as DREB.
+# Pulling a bit more total volume here, offset by bumping rebound_type.offensive back up above, so
+# the extra cut lands mostly on DREB. This should also trim the pace bias regression full2 saw
+# (+0.50 -> +0.95): pace ~= FGA - OREB + TOV + 0.44*FTA, so full2's OREB drop mechanically pushed
+# the pace estimate up; restoring some FTA (via EVENT_BIAS.foul above) and reeling in rebounds
+# further both pull pace back down as a side effect, not a direct target.
+DEADBALL_REBOUND_PROB = 0.10
 
 # Post-hoc linear calibration on predicted point margin, applied only when aggregating spread
 # metrics for the eval report (simulation/eval_metrics.py) -- never to the raw per-game record, so
