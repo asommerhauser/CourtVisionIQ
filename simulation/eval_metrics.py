@@ -21,6 +21,7 @@ import math
 
 import numpy as np
 
+from config import MARGIN_CALIBRATION_INTERCEPT, MARGIN_CALIBRATION_SLOPE
 from simulation.stats import ADVANCED_LABELS, score_win_prob
 
 # Stat keys used in the team/player box-accuracy tables.
@@ -84,6 +85,17 @@ def win_metrics(win_probs: list[float], outcomes: list[bool], picks_correct: lis
     }
 
 
+def calibrate_margin(mean: float) -> float:
+    """Post-hoc linear calibration for the SPREAD headline only (config.MARGIN_CALIBRATION_*).
+
+    Predicted margins run too extreme for their information content; this is a report-time
+    correction, not a rollout dial -- it must not feed ``score_win_view`` (the win-probability
+    methods), since a nonzero intercept can flip the sign of a near-zero margin and that block is
+    scored on pick accuracy, not just MAE.
+    """
+    return MARGIN_CALIBRATION_INTERCEPT + MARGIN_CALIBRATION_SLOPE * mean
+
+
 def score_win_view(record: dict) -> dict:
     """Average-score winner for one game record (derived from the stored margin scalars).
 
@@ -129,7 +141,7 @@ def _aggregate_core(records: list[dict]) -> dict:
     score_views = [score_win_view(r) for r in records]
     win_score = win_metrics([v["win_prob_home"] for v in score_views], outcomes,
                             [v["pick_correct"] for v in score_views])
-    spread = spread_metrics([r["pred_margin_mean"] for r in records],
+    spread = spread_metrics([calibrate_margin(r["pred_margin_mean"]) for r in records],
                             [r["actual_margin"] for r in records])
 
     # Team box accuracy + reliability, pooling both sides of every game.

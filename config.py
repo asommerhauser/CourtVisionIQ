@@ -70,12 +70,16 @@ RESULT_TEMPERATURE = 1.0   # shot_result (made / missed / blocked)
 # corrections from the pooled live-shot table (per-type ideal: made +0.22 on 2pt / +0.35 on 3pt;
 # global weighted below). FTs do NOT route through this bias (FT% was already accurate).
 # RE-MEASURE after any retrain of shot_result — a modern-heavier train should need less of this.
-SHOT_RESULT_BIAS: dict[str, float] = {"made": 0.27, "blocked": -0.15}
+# v1.0 full1 (100-game holdout, this bias already applied): eFG% still -2.17% / FGM -1.04 vs real
+# -- the +0.27 correction closed most but not all of the original make-rate gap. Bumped further.
+SHOT_RESULT_BIAS: dict[str, float] = {"made": 0.40, "blocked": -0.15}
 # Per-event-token logit offset applied to the next-event pick (GameController._sample_event), the
 # event-head sibling of SHOT_RESULT_BIAS. Default {} = raw model. Fit to v1.0 trial1: fouls ran
 # 36.1/game vs 40.5 real (-11%, the biggest driver of the FTA -4.7/team deficit) and turnovers
 # 44.9 vs 41.6 (+8%). Re-measure after any retrain — the event mix moves with the event head.
-EVENT_BIAS: dict[str, float] = {"foul": 0.15, "turnover": -0.08}
+# v1.0 full1 (this bias already applied): FTA over-produced +3.845 (16% high) instead of under --
+# the foul-volume push overshot. Roughly halved.
+EVENT_BIAS: dict[str, float] = {"foul": 0.08, "turnover": -0.08}
 # Per-head per-token logit offset on the conditional type heads (GameSimulator.predict_type),
 # keyed by head then token, e.g. {"turnover_type": {"steal": -0.2}} to pull steal-type turnovers
 # down without moving the overall turnover rate. Default {} = raw model. Fit to v1.0 trial1:
@@ -86,12 +90,16 @@ EVENT_BIAS: dict[str, float] = {"foul": 0.15, "turnover": -0.08}
 #   turnover_type — steal share slightly high (56.8% vs 54.8% of TOs).
 #   assist_type  — assisted-3 share 38.5% vs 41.0% (drives the residual TPM gap).
 #   rebound_type — offensive share of rebounds 23.4% vs 27.3%.
+# v1.0 full1 (all values below already applied): FTA over-produced +3.845 (16% high) -- "loose
+# ball" is named directly as a likely culprit (a very large offset on a near-zero-mass token);
+# roughly halved rather than zeroed, since the original trial1 gap it corrected was real. OREB% is
+# now over +2.48% (was under at trial1, hence the original +0.20) -- halved since it's overshooting.
 TYPE_BIAS: dict[str, dict[str, float]] = {
-    "foul_type": {"shooting": 0.35, "personal": -0.45, "offensive": -0.30,
-                  "loose ball": 2.5, "technical": 1.5},
+    "foul_type": {"shooting": 0.20, "personal": -0.45, "offensive": -0.30,
+                  "loose ball": 1.2, "technical": 1.5},
     "turnover_type": {"steal": -0.12},
     "assist_type": {"3pt": 0.10},
-    "rebound_type": {"offensive": 0.20},
+    "rebound_type": {"offensive": 0.10},
 }
 # Home-court edge. The rollout is otherwise home/away symmetric (HOME just inbounds first), so the
 # sim can't separate winners and win-pick accuracy sits near a coin flip. This adds a logit nudge to
@@ -102,7 +110,9 @@ TYPE_BIAS: dict[str, dict[str, float]] = {
 # the win-prediction calibration + spread bias in the eval report. Applied in GameController._do_shot.
 # Trimmed 0.10 -> 0.07: v1.0 trial1 predicted the home margin at +4.05 vs +2.58 actual (spread bias
 # +1.47), so the edge was ~55% too strong; scaled proportionally.
-HOME_COURT_SHOT_BIAS = 0.07
+# Trimmed further 0.07 -> 0.047: v1.0 full1 (100-game holdout) still predicted +3.87 vs +2.58
+# actual (spread bias +1.29) -- same proportional scaling: 0.07 * (2.58/3.87).
+HOME_COURT_SHOT_BIAS = 0.047
 # Logit bonus per second of a player's current on-court stint, added to the outgoing-sub pick so
 # a long-tenured player (a star included) is *nudged* — not forced — toward coming off. 0 = off.
 # Lowered from 0.15 so starters are pulled for tenure less aggressively (the stage eval under-played
@@ -173,7 +183,21 @@ MAX_DELTA = 60.0
 # Probability a missed shot yields no individual rebound (an out-of-bounds / dropped team rebound):
 # the ball just changes hands with no row. The off/def split of real rebounds is the rebound-type
 # head's job; this is only the rare no-rebounder case. The controller imports this.
-DEADBALL_REBOUND_PROB = 0.06
+# Raised 0.06 -> 0.09: v1.0 full1 (100-game holdout) had OREB *and* DREB both over by the same
+# +2.22 -- total individually-attributed rebound volume is inflated on both sides, not just the
+# off/def split (that's TYPE_BIAS.rebound_type's job, tuned separately above). More dead-ball
+# rebounds pulls both counts down together without touching the split.
+DEADBALL_REBOUND_PROB = 0.09
+
+# Post-hoc linear calibration on predicted point margin, applied only when aggregating spread
+# metrics for the eval report (simulation/eval_metrics.py) -- never to the raw per-game record, so
+# record.json / games.parquet / the margin scatter plot keep the literal model output and this can
+# be refit without touching sim data. NOT a rollout dial (nothing at sim time reads it, so it is
+# deliberately absent from _TUNING_KEYS below). Regressing actual margin on predicted margin across
+# v1.0's full1 holdout: actual = -0.31 + 0.745*predicted -- predicted margins run ~25% too extreme
+# for their information content. slope=1.0/intercept=0.0 = off.
+MARGIN_CALIBRATION_SLOPE = 0.745
+MARGIN_CALIBRATION_INTERCEPT = -0.31
 
 # Rollout dials captured into each evaluation report (reporting/eval_report.py) so tuning settings
 # are recorded alongside results for cross-run analysis. Order is the display order in the report.
