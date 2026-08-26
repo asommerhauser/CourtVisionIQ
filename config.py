@@ -151,6 +151,7 @@ ROLLOUT_BATCH_SIZE = 48
 # ROLLOUT_BATCH_SIZE. Pure scheduling — results are unchanged (each sim keeps its own seed). Runs in a
 # single process (no cross-process VRAM contention). Lower it if system RAM/thread pressure is high.
 EVAL_GAMES_PER_BATCH = 6
+# ...but only up to EVAL_POOL_JOBS concurrent sims -- see it, below STAGE_SIMS.
 
 # --- Eval process pool (`run --procs N` / `evaluate.py --procs N`) ---
 # Batching fills the GPU, but everything around the forward pass -- input building, sampling,
@@ -382,6 +383,13 @@ HOLDOUT_GAMES = 10
 # box-score means (cuts sampling-noise MAE) and halve the win-vote quantization (1/11 -> 1/21),
 # which flattered the Brier score. eval-all cost scales ~linearly (the batched rollout absorbs it).
 STAGE_SIMS = 21
+# The eval pool's real unit is CONCURRENT SIMS, not games: run_jobs_batched holds every
+# finished history in memory until the pool drains, so the peak is games x sims. At the
+# default 6 x 21 that is 126; a 100-sim run pooling 6 games would be 600 -- ~5x the host RAM
+# for no gain, since 100 sims of a SINGLE game already over-fill a ROLLOUT_BATCH_SIZE cohort
+# on their own. evaluate_stage pools ceil-down to this many jobs, which is exactly
+# EVAL_GAMES_PER_BATCH games at STAGE_SIMS (default shape unchanged) and 1 game at 100 sims.
+EVAL_POOL_JOBS = EVAL_GAMES_PER_BATCH * STAGE_SIMS
 # Seasons of training added between stops. A stop is placed every SEASONS_PER_STAGE seasons
 # (the first stop after the first SEASONS_PER_STAGE seasons), and the stop POINT cycles through
 # BOUNDARY_CYCLE across those stops. So with 3: train ~3 seasons -> stop 25% in -> +3 seasons ->

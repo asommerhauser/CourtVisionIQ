@@ -26,7 +26,8 @@ import json
 import re
 from pathlib import Path
 
-from config import EVAL_GAMES_PER_BATCH, HOLDOUT_MANIFEST_NAME, ROLLOUT_BATCH_SIZE, STAGE_SIMS
+from config import (EVAL_GAMES_PER_BATCH, EVAL_POOL_JOBS, HOLDOUT_MANIFEST_NAME,
+                    ROLLOUT_BATCH_SIZE, STAGE_SIMS)
 from data_loading import load_all_cleaned
 from models.artifacts import DEFAULT_ARTIFACTS_ROOT
 from reporting.game_report import render_game_html
@@ -102,9 +103,12 @@ def _write_game_folder(out_dir: Path, game, spec, boxes, histories, record,
     pbp_dir = out_dir / "playbyplay"
     pbp_dir.mkdir(parents=True, exist_ok=True)
     game.reindex(columns=CLEANED_COLUMNS).to_csv(pbp_dir / "actual_playbyplay.csv", index=False)
+    # Width from the real sim count: at 100 sims a fixed :02d stops sorting lexicographically
+    # (sim_9 after sim_100). Nothing reads these by name -- resume keys on record.json.
+    width = max(2, len(str(len(histories))))
     for i, history in enumerate(histories, start=1):
         frame = history_to_cleaned_frame(history, spec, game_id=int(record["game_id"]))
-        frame.to_csv(pbp_dir / f"sim_{i:02d}_playbyplay.csv", index=False)
+        frame.to_csv(pbp_dir / f"sim_{i:0{width}d}_playbyplay.csv", index=False)
 
     run_meta = {
         "game_id": record["game_id"],
@@ -238,6 +242,12 @@ def evaluate_stage(stage_name: str, *, sim=None, df=None, run_label: str | None 
     # Pass 2: simulate the pending games in pools of ``games_per_batch`` so each batched rollout
     # fills the GPU (one game alone leaves it ~10% utilized). Resolve each game's matchup + real
     # starters once, then pool their sims into a single run.
+    # Pool width is capped in *jobs*, not games: the batched rollout keeps every finished history
+    # until the pool drains, so 6 games x 100 sims would hold 600 of them. At STAGE_SIMS this is a
+    # no-op (126/21 = 6); at 100 sims it drops to one game per pool, which also lands each game's
+    # record.json as soon as it finishes.
+    games_per_batch = max(1, min(games_per_batch, EVAL_POOL_JOBS // max(1, n_sims)))
+
     if pending:
         if sim is None:
             sim = GameSimulator.load(artifacts_root=artifacts_root)
