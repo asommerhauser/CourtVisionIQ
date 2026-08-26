@@ -32,6 +32,7 @@ except Exception:
     pass
 
 import argparse
+import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
@@ -65,11 +66,47 @@ DEFAULT_SIMS = 11
 
 # --------------------------------------------------------------------------- rollout
 
+def sim_seed(base: int, game_id: int, s: int) -> int:
+    """A distinct RNG stream per ``(game_id, s)`` pair, from a run-wide ``base``.
+
+    The old derivation was ``base + s``, which never saw the game at all: every game in every run
+    replayed the same streams ``base..base+n_sims-1`` in the same order. That makes each game's
+    sampling error a draw from the *same* sequence as its neighbours' (so the cross-game aggregate's
+    error bars are optimistic), and it makes a longer run a superset of a shorter one rather than an
+    independent sample of it.
+
+    Two properties this has to keep:
+
+      * **Position-independent.** ``eval_pool`` shards the holdout as ``holdout[i-1::n]``, so a
+        game's index differs in every shard; seeding off the index would make a sharded run's games
+        differ from an unsharded run's. ``game_id`` is stable, an index is not.
+      * **Process-stable.** Every shard is a separate ``python evaluate.py``, and ``hash()`` is
+        salted per process (PYTHONHASHSEED), so it cannot be used here. blake2b is fixed.
+
+    Reproducible given ``base``, but deliberately NOT sim-for-sim comparable with runs recorded
+    before this change (``results/v1.0/full*``) — those stay valid as their own aggregates.
+    """
+    digest = hashlib.blake2b(f"{base}:{int(game_id)}:{int(s)}".encode(), digest_size=8).digest()
+    return int.from_bytes(digest, "big") % (2 ** 31 - 1)
+
+
+
+def _seed_for(base: int, game_id: int | None, s: int) -> int:
+    """``sim_seed`` when the caller knows which game this is, the legacy ``base + s`` when not."""
+    return base + s if game_id is None else sim_seed(base, game_id, s)
+
+
 def simulate_repeated(sim: GameSimulator, spec, home_starters, away_starters, *,
                       n_sims: int, seed0: int, home_team: str = "HOME",
                       away_team: str = "AWAY", return_histories: bool = False,
-                      batch_size: int = ROLLOUT_BATCH_SIZE, show_progress: bool = False):
-    """Play one matchup ``n_sims`` times (seeds ``seed0..seed0+n_sims-1``) -> list of box scores.
+                      batch_size: int = ROLLOUT_BATCH_SIZE, show_progress: bool = False,
+                      game_id: int | None = None):
+    """Play one matchup ``n_sims`` times -> list of box scores.
+
+    ``game_id`` (when given) seeds sim ``s`` with :func:`sim_seed`, so this game's streams are its
+    own rather than the shared ``seed0..seed0+n_sims-1`` every other game would also draw. ``None``
+    keeps the legacy ``seed0 + s``, which is what the standalone ``python -m simulation.evaluation``
+    harness and its tests pin.
 
     With ``return_histories`` also return the per-sim event histories (so the stage evaluator can
     persist each generated play-by-play): returns ``(boxes, histories)`` instead of just ``boxes``.
@@ -84,7 +121,7 @@ def simulate_repeated(sim: GameSimulator, spec, home_starters, away_starters, *,
         jobs = [GameJob(home_roster=spec.home_roster, away_roster=spec.away_roster,
                         season=str(spec.season), home_starters=home_starters,
                         away_starters=away_starters, season_context=spec.season_context(),
-                        seed=seed0 + s) for s in range(n_sims)]
+                        seed=_seed_for(seed0, game_id, s)) for s in range(n_sims)]
         histories = run_jobs_batched(sim, jobs, batch_size=batch_size, show_progress=show_progress)
         boxes = [generate_box_score(h, home_team=home_team, away_team=away_team) for h in histories]
         return (boxes, histories) if return_histories else boxes
@@ -92,7 +129,7 @@ def simulate_repeated(sim: GameSimulator, spec, home_starters, away_starters, *,
     boxes: list[BoxScore] = []
     histories: list[list[dict]] = []
     for s in range(n_sims):
-        ctrl = GameController(sim, seed=seed0 + s)
+        ctrl = GameController(sim, seed=_seed_for(seed0, game_id, s))
         ctrl.start(spec.home_roster, spec.away_roster, season=str(spec.season),
                    home_starters=home_starters, away_starters=away_starters,
                    season_context=spec.season_context())
@@ -103,7 +140,8 @@ def simulate_repeated(sim: GameSimulator, spec, home_starters, away_starters, *,
 
 
 def simulate_games(sim: GameSimulator, games: list, *, n_sims: int, seed0: int,
-                   batch_size: int = ROLLOUT_BATCH_SIZE, show_progress: bool = False):
+                   batch_size: int = ROLLOUT_BATCH_SIZE, show_progress: bool = False,
+                   game_ids: list[int] | None = None):
     """Pool ``n_sims`` sims for **several** games into ONE batched rollout, then split back per game.
 
     A single game only keeps ~2 sims on the same head at once (its sims desync across the event/
@@ -114,18 +152,25 @@ def simulate_games(sim: GameSimulator, games: list, *, n_sims: int, seed0: int,
 
     ``games`` is a list of ``(spec, home_starters, away_starters, home_team, away_team)``. Returns a
     list of ``(boxes, histories)`` aligned to ``games``.
+
+    ``game_ids`` (aligned to ``games``) switches seeding to :func:`sim_seed`, giving every
+    ``(game, sim)`` pair its own stream instead of replaying ``seed0..seed0+n_sims-1`` once per
+    game. Pass it whenever the caller knows the real game ids -- the holdout evaluator does.
     """
+    if game_ids is not None and len(game_ids) != len(games):
+        raise ValueError(f"game_ids has {len(game_ids)} entries for {len(games)} games")
     from simulation.batched_rollout import GameJob, run_jobs_batched
 
     jobs: list[GameJob] = []
     spans: list[tuple[int, int, str, str]] = []   # (start, end, home_team, away_team) per game
-    for spec, home_starters, away_starters, home_team, away_team in games:
+    for g, (spec, home_starters, away_starters, home_team, away_team) in enumerate(games):
+        gid = game_ids[g] if game_ids is not None else None
         start = len(jobs)
         for s in range(n_sims):
             jobs.append(GameJob(
                 home_roster=spec.home_roster, away_roster=spec.away_roster,
                 season=str(spec.season), home_starters=home_starters, away_starters=away_starters,
-                season_context=spec.season_context(), seed=seed0 + s))
+                season_context=spec.season_context(), seed=_seed_for(seed0, gid, s)))
         spans.append((start, len(jobs), home_team, away_team))
 
     histories = run_jobs_batched(sim, jobs, batch_size=batch_size, show_progress=show_progress)
@@ -216,19 +261,24 @@ def evaluate_game(sim: GameSimulator, game_df, *, n_sims: int, seed0: int,
     except ValueError:
         home_starters = away_starters = None
 
+    gid = int(game_df["game_id"].iloc[0])
     boxes = simulate_repeated(sim, spec, home_starters, away_starters, n_sims=n_sims,
                               seed0=seed0, home_team=home_team, away_team=away_team,
-                              batch_size=batch_size)
-    return build_game_record(game_df, boxes, n_sims=n_sims,
+                              batch_size=batch_size, game_id=gid)
+    return build_game_record(game_df, boxes, n_sims=n_sims, seed_base=seed0,
                              home_team=home_team, away_team=away_team)
 
 
 def build_game_record(game_df, boxes: list[BoxScore], *, n_sims: int,
-                      home_team: str = "HOME", away_team: str = "AWAY") -> dict:
+                      home_team: str = "HOME", away_team: str = "AWAY",
+                      seed_base: int | None = None) -> dict:
     """Assemble one game's evaluation record from its (already-simulated) box scores.
 
     Split out from ``evaluate_game`` so the stage evaluator can run the sims itself (keeping the
     per-sim histories to persist) and still produce the identical record for the aggregate report.
+
+    ``seed_base`` is recorded so a run says which RNG streams produced it (see :func:`sim_seed`);
+    records written before that existed simply carry ``None``.
     """
     actual_box = generate_box_score(game_df, home_team=home_team, away_team=away_team)
     margins = [b.home_score - b.away_score for b in boxes]
@@ -274,6 +324,7 @@ def build_game_record(game_df, boxes: list[BoxScore], *, n_sims: int,
     return {
         "game_id": int(game_df["game_id"].iloc[0]),
         "n_sims": n_sims,
+        "seed_base": seed_base,
         # Tuning provenance captured at sim time: which dials produced THIS game's sims, so the
         # report can segment the holdout by distinct tuning (games simmed across retunes keep their
         # own snapshot). evaluated_at orders the progression by when each game was actually run.

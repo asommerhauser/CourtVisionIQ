@@ -241,9 +241,10 @@ def evaluate_stage(stage_name: str, *, sim=None, df=None, run_label: str | None 
             game_specs = [(p["spec"], p["home_starters"], p["away_starters"],
                            p["home_team"], p["away_team"]) for p in chunk]
             results = simulate_games(sim, game_specs, n_sims=n_sims, seed0=seed0,
-                                     batch_size=batch_size, show_progress=True)
+                                     batch_size=batch_size, show_progress=True,
+                                     game_ids=[p["gid"] for p in chunk])
             for p, (boxes, histories) in zip(chunk, results):
-                record = build_game_record(p["game"], boxes, n_sims=n_sims,
+                record = build_game_record(p["game"], boxes, n_sims=n_sims, seed_base=seed0,
                                            home_team=p["home_team"], away_team=p["away_team"])
                 _write_game_folder(p["out_dir"], p["game"], p["spec"], boxes, histories,
                                    record, p["home_team"], p["away_team"])

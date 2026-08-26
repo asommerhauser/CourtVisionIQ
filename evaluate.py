@@ -94,8 +94,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Apply a dial package (JSON object of DIAL -> value) before simulating. "
                          "How a sharded run pins every process to the SAME inference dials.")
     ap.add_argument("--seed", type=int, default=0,
-                    help="Base seed for the Monte-Carlo sims (sim s uses seed+s). Shards and "
-                         "pooled runs pass it through, so a re-run reproduces exactly.")
+                    help="Base seed for the Monte-Carlo sims; each (game, sim) pair derives its "
+                         "own stream from it, so no two games replay the same draws. Shards and "
+                         "pooled runs pass it through, so a re-run reproduces exactly. Change it "
+                         "to resample a game set independently of an earlier run.")
     ap.add_argument("--state", default=DEFAULT_STATE_PATH, help="Full-run state file path.")
     return ap
 
