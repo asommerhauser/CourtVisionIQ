@@ -7,7 +7,7 @@ are heavily mean-reverting, so that baseline is strong; if the model doesn't cle
 "we predict specific-game box scores well" pitch is really just restating mean reversion.
 
 This is a **read-only, zero-simulation** check. It reuses the per-game records already persisted in a
-run's ``report.json`` (the model's 11-sim ``player_avg`` and the ``player_actual`` lines, matched by
+run's ``report.json`` (the model's mean-over-sims ``player_avg`` and the ``player_actual`` lines, matched by
 name — apples-to-apples with the headline report) and builds the baseline from the cleaned data:
 
   * **season-to-date (STD)** — the player's mean line over their games *earlier in the same season*

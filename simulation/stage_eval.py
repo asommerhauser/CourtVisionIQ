@@ -7,11 +7,12 @@ After a curriculum stage finishes training, we predict its sequential holdout (t
 
   1. **Per-game prediction folders** (descriptive names) under
      ``artifacts/predictions/<stage_name>/`` holding, for each game: the actual box score, the
-     11-sim *averaged* predicted box score (game score included), the actual play-by-play, and all
-     11 generated play-by-plays. Each game's evaluation record is also cached (``record.json``) so
-     an interrupted eval **resumes** — finished games are reloaded, not re-simulated.
+     *averaged* predicted box score over the sims (game score included), the actual play-by-play,
+     and every generated play-by-play. Each game's evaluation record is also cached
+     (``record.json``) so an interrupted eval **resumes** — finished games are reloaded, not
+     re-simulated.
   2. **A stage-level overall report** (the standard HTML + Parquet eval report) capturing win/
-     spread/box accuracy and the std across the 11 sims, written once all games are done.
+     spread/box accuracy and the std across the sims, written once all games are done.
 """
 from __future__ import annotations
 
@@ -61,7 +62,7 @@ def _game_labels(game) -> tuple[str, str, str]:
 
 
 def _averaged_box(record: dict, home_team: str, away_team: str) -> BoxScore:
-    """Build a BoxScore from a record's 11-sim per-player averages (game score included)."""
+    """Build a BoxScore from a record's per-sim per-player averages (game score included)."""
     def _lines(side: str) -> list[PlayerLine]:
         out = []
         for name, stats in record["player_avg"][side].items():
@@ -179,7 +180,7 @@ def evaluate_stage(stage_name: str, *, sim=None, df=None, run_label: str | None 
         """Build (and unless ``write_report=False``, write) the report over everything finished so
         far; return the report dict."""
         aggregate = _aggregate(records)
-        rep = build_report(records=records, aggregate=aggregate, n_sims=n_sims,
+        rep = build_report(records=records, aggregate=aggregate, n_sims=_reported_sims(records),
                            run_name=run_label or stage_name)
         if not write_report:
             rd = results_run_dir if results_run_dir is not None else Path(reports_root)
@@ -187,12 +188,27 @@ def evaluate_stage(stage_name: str, *, sim=None, df=None, run_label: str | None 
             rd = write_eval_report(rep, run_dir=results_run_dir)
         else:
             rd = write_eval_report(rep, reports_root=reports_root)
-        _print_summary(aggregate, len(records), n_sims)
+        _print_summary(aggregate, len(records), rep["n_sims"])
         rep["run_dir"] = str(rd)
         rep["predictions_dir"] = str(stage_dir)
         rep["done"] = len(records)
         rep["total"] = len(holdout_ids)
         return rep
+
+    def _reported_sims(recs: list[dict]) -> int:
+        """The sim count the finished games were ACTUALLY run at, not the one this call asked for.
+
+        A merge (``--report-only``, and the pooled run's merge step) simulates nothing, so its
+        ``n_sims`` argument is whatever the default happens to be -- which used to stamp a 100-sim
+        run as a 21-sim one. The records know: each carries the count it was built with.
+        """
+        counts = {int(r["n_sims"]) for r in recs if r.get("n_sims")}
+        if not counts:
+            return n_sims
+        if len(counts) > 1:
+            print(f"  WARNING: this run mixes sim counts ({', '.join(str(c) for c in sorted(counts))}"
+                  f"); reporting the smallest. Its per-game estimates are not equally precise.")
+        return min(counts)
 
     records: list[dict] = []
     new_done = 0
