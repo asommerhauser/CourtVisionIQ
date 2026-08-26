@@ -196,7 +196,8 @@ class FullRun:
     def eval(self, *, version: str | None = None, name: str | None = None,
              n_sims: int | None = None, concurrency: int | None = None,
              max_new: int | None = None, report_every: int | None = None,
-             shard: tuple[int, int] | None = None, seed: int = 0) -> None:
+             shard: tuple[int, int] | None = None, seed: int = 0,
+             subset: int | None = None) -> None:
         """Predict the holdout into a results run at results/v<version>/<eval-name>/.
 
         ``version`` defaults to the trained run's version. ``name`` names the eval folder (default:
@@ -208,6 +209,10 @@ class FullRun:
         are pooled. ``max_new`` caps NEW games this call (batched / interrupt-friendly); ``None`` runs
         the whole holdout, flushing an intermediate report every ``report_every`` games.
 
+        ``subset`` (--holdout N) narrows the run to an N-game slice of the holdout, pinned to the
+        run dir so every later call against it -- resume, shard, merge -- covers the same games.
+        It applies BEFORE the shard stride, so the pool still splits exactly the run's own games.
+
         ``shard`` = ``(i, n)``, 1-based: simulate only ``holdout[i-1::n]``, so n concurrent
         processes can split the holdout across CPU cores while sharing one GPU. Within a process
         the rollout's worker threads are GIL-bound, so processes are what turn spare cores into
@@ -217,7 +222,7 @@ class FullRun:
         partial writes would clobber each other); merge with :meth:`report` once every shard
         finishes. They also leave the run state untouched, since concurrent writers would race it.
         """
-        from reporting.eval_report import resolve_results_run_dir
+        from reporting.eval_report import pin_run_holdout, resolve_results_run_dir, subset_holdout
         from simulation.stage_eval import evaluate_stage
 
         self._require()
@@ -233,8 +238,16 @@ class FullRun:
         # `batch_size`, so VRAM is bounded by concurrency regardless of the total pooled.
         batch_size = concurrency or ROLLOUT_BATCH_SIZE
         games_per_batch = EVAL_GAMES_PER_BATCH
-        holdout = self.state["holdout_game_ids"]
-        run_dir = resolve_results_run_dir(name_, name=name, holdout_total=len(holdout))
+        full_holdout = self.state["holdout_game_ids"]
+        # Resolve the run dir against the count this run will actually cover (an auto eval-NNN
+        # decides "still incomplete?" from it), then pin the ids inside it.
+        run_dir = resolve_results_run_dir(
+            name_, name=name, holdout_total=len(subset_holdout(full_holdout, subset)))
+        holdout = pin_run_holdout(run_dir, full_holdout, subset=subset)
+        run_total = len(holdout)
+        if len(holdout) != len(full_holdout):
+            print(f"[eval] holdout subset: {run_total} of {len(full_holdout)} games "
+                  f"(g{holdout[0]} .. g{holdout[-1]}, pinned in {run_dir.name}/holdout.json)")
         if shard is None:
             self.state["last_eval_name"] = run_dir.name
             self._save()
@@ -242,7 +255,7 @@ class FullRun:
             i, n = shard
             holdout = holdout[i - 1::n]
             print(f"[eval] shard {i}/{n}: {len(holdout)} of "
-                  f"{len(self.state['holdout_game_ids'])} holdout games -> {run_dir}")
+                  f"{run_total} holdout games -> {run_dir}")
 
         report = evaluate_stage(
             name_, holdout_ids=holdout, n_sims=n_sims, max_new=max_new, seed0=seed,
@@ -342,18 +355,25 @@ class FullRun:
         print("[retrain-shot-type] done — shot_type now trained on {2pt, 3pt} only.")
 
     # --------------------------------------------------------------- report / status
-    def report(self, *, version: str | None = None, name: str | None = None) -> None:
-        """Rebuild the aggregate report over an eval run's finished games (no new sims)."""
-        from reporting.eval_report import resolve_results_run_dir
+    def report(self, *, version: str | None = None, name: str | None = None,
+               subset: int | None = None) -> None:
+        """Rebuild the aggregate report over an eval run's finished games (no new sims).
+
+        The sim count is read back off the finished records rather than assumed, and ``subset`` is
+        normally unnecessary: a subset run pinned its ids in the run dir when it was created.
+        """
+        from reporting.eval_report import pin_run_holdout, resolve_results_run_dir, subset_holdout
         from simulation.stage_eval import evaluate_stage
 
         self._require()
         name_ = model_name(version or self.state.get("version", DEFAULT_MODEL))
         name = name or self.state.get("last_eval_name")
-        holdout = self.state["holdout_game_ids"]
-        run_dir = resolve_results_run_dir(name_, name=name, holdout_total=len(holdout))
+        full_holdout = self.state["holdout_game_ids"]
+        run_dir = resolve_results_run_dir(
+            name_, name=name, holdout_total=len(subset_holdout(full_holdout, subset)))
+        holdout = pin_run_holdout(run_dir, full_holdout, subset=subset)
         report = evaluate_stage(
-            name_, holdout_ids=holdout, n_sims=STAGE_SIMS, max_new=0,
+            name_, holdout_ids=holdout, max_new=0,
             data_dir=self.state["data_dir"], processed_dir=self.state["processed_dir"],
             artifacts_root=model_root(name_), results_run_dir=run_dir,
         )

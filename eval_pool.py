@@ -173,13 +173,16 @@ class Shard:
 
 def shard_commands(*, model: str | None, run: str, n: int, dials_path, state_path,
                    run_dir, sims=None, concurrency=None, seed=0, python: str | None = None,
-                   tag: str = "") -> list[Shard]:
+                   tag: str = "", subset=None) -> list[Shard]:
     """Build the N ``evaluate.py --shard i/N`` commands and their log paths.
 
     ``dials_path`` is required, not optional: it is the only thing stopping a child from re-reading
     ``config.py`` and running different physics than the parent that launched it. ``report_every``
     is deliberately never forwarded -- an intermediate flush from a child would write exactly the
     shared report files a shard is not allowed to touch.
+
+    ``subset`` (--holdout N) is forwarded for the record, so a shard log shows the run's real shape;
+    the run dir's pinned ``holdout.json`` is what actually governs which games a child sees.
     """
     python = python or sys.executable
     logs = Path(run_dir) / "logs"
@@ -197,6 +200,8 @@ def shard_commands(*, model: str | None, run: str, n: int, dials_path, state_pat
             cmd += ["--concurrency", str(concurrency)]
         if seed:
             cmd += ["--seed", str(seed)]
+        if subset:
+            cmd += ["--holdout", str(subset)]
         shards.append(Shard(index=i, total=n, cmd=cmd,
                             log=logs / f"shard{tag}-{i}of{n}.log"))
     return shards
@@ -421,7 +426,8 @@ def run_procs(args) -> None:
     ``GameSimulator``, and this process should stay TF-free start to finish.
     """
     from models.artifacts import model_name                 # TF-free
-    from reporting.eval_report import resolve_results_run_dir   # pandas, not TF
+    from reporting.eval_report import (                          # pandas, not TF
+        pin_run_holdout, resolve_results_run_dir, subset_holdout)
 
     state_path = Path(args.state)
     if not state_path.is_file():
@@ -432,8 +438,15 @@ def run_procs(args) -> None:
         raise SystemExit(f"{state_path} has no holdout_game_ids.")
 
     name_ = model_name(args.model or state.get("version") or config.DEFAULT_MODEL)
-    run_dir = resolve_results_run_dir(name_, name=args.run, holdout_total=len(holdout))
+    subset = getattr(args, "holdout", None)
+    run_dir = resolve_results_run_dir(
+        name_, name=args.run, holdout_total=len(subset_holdout(holdout, subset)))
     run_name = run_dir.name
+
+    # Narrow to (and pin) the games this run covers BEFORE sizing the pool -- autosize_procs and
+    # every progress denominator below read len(holdout).
+    full_total = len(holdout)
+    holdout = pin_run_holdout(run_dir, holdout, subset=subset)
 
     # The dial package: written once, handed to every child. Without it each child re-reads
     # config.py and a runtime-tuned parent silently gets a report over two different tunings.
@@ -449,14 +462,17 @@ def run_procs(args) -> None:
             n, why = autosize_procs(holdout_games=remaining, requested=args.procs)
             if wave == 1:
                 print(f"[pool] {name_} -> {run_dir}")
-                print(f"[pool] {total} holdout games ({done} already done), dials -> {dials_path}")
+                subset_note = f" (subset of {full_total})" if total != full_total else ""
+                print(f"[pool] {total} holdout games{subset_note} ({done} already done), "
+                      f"dials -> {dials_path}")
                 print(f"[pool] {why}")
             if n <= 1 and wave == 1:
                 return []      # caller falls back to the in-process path
             return shard_commands(model=name_, run=run_name, n=n, dials_path=dials_path,
                                   state_path=state_path, run_dir=run_dir,
                                   sims=args.monte_carlo, concurrency=args.concurrency,
-                                  seed=args.seed, tag="" if wave == 1 else f"-w{wave}")
+                                  seed=args.seed, subset=subset,
+                                  tag="" if wave == 1 else f"-w{wave}")
 
         shards = run_waves(build=build, run_dir=run_dir, total_games=total)
         if not shards:
@@ -464,7 +480,7 @@ def run_procs(args) -> None:
             from training.full_run import FullRun            # the TF import, only on this path
             FullRun(state_path=str(state_path)).eval(
                 version=args.model, name=run_name, n_sims=args.monte_carlo,
-                concurrency=args.concurrency, seed=args.seed)
+                concurrency=args.concurrency, seed=args.seed, subset=subset)
             return
 
     assert_one_tuning(run_dir)

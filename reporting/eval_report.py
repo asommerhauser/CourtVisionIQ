@@ -82,6 +82,59 @@ def resolve_results_run_dir(model: str, *, name: str | None = None,
     run.mkdir(parents=True, exist_ok=True)
     return run
 
+
+# The game ids a run covers, pinned inside the run dir. Written the first time a run is created and
+# authoritative from then on: resumes, --shard children, --report-only and the pooled merge all read
+# it instead of re-deriving from the training state, so a subset run's denominators stay right with
+# no flag to remember and the run stays self-describing.
+RUN_HOLDOUT_NAME = "holdout.json"
+
+
+def subset_holdout(ids, n: int | None):
+    """Every ``len(ids)//n``-th id, ``n`` of them -- a subset that spans the whole holdout window.
+
+    ``n=None`` returns the list unchanged. Stride rather than a head slice because the holdout is
+    chronological: ``ids[:n]`` would draw every game from one narrow stretch of the calendar, with
+    the same teams, rest states and injury context correlated across the whole sample.
+
+    When ``n`` does not divide ``len(ids)`` the stride is rounded down and the tail is trimmed, so
+    the sample can stop short of the last game (100 -> 30 covers ids[0::3][:30], i.e. through
+    index 87). Exact divisors -- 100 -> 20, 50, 25, 10 -- span the full range.
+    """
+    ids = list(ids)
+    if n is None:
+        return ids
+    if n < 1:
+        raise ValueError(f"holdout subset must be >= 1, got {n}")
+    if n > len(ids):
+        raise ValueError(f"holdout subset of {n} asked for, but the holdout has {len(ids)} games")
+    return ids[::len(ids) // n][:n]
+
+
+def pin_run_holdout(run_dir, full_holdout, *, subset: int | None = None) -> list[int]:
+    """The game ids this run covers, pinned to ``run_dir/holdout.json`` on first use.
+
+    An existing pin wins: that is what makes a resume, a ``--shard`` child and a later
+    ``--report-only`` agree on the denominator without being told the subset again. Asking for a
+    ``subset`` that disagrees with the pin is an error rather than a silent re-slice -- the run's
+    finished games were simulated against the pinned set, and re-slicing would report them under a
+    total they never belonged to.
+    """
+    path = Path(run_dir) / RUN_HOLDOUT_NAME
+    wanted = [int(g) for g in subset_holdout(full_holdout, subset)]
+
+    if path.is_file():
+        pinned = [int(g) for g in json.loads(path.read_text(encoding="utf-8"))]
+        if subset is not None and pinned != wanted:
+            raise ValueError(
+                f"{path} pins {len(pinned)} games for this run, but --holdout {subset} selects "
+                f"{len(wanted)}. Use a new --run name, or drop --holdout to keep the pinned set.")
+        return pinned
+
+    path.write_text(json.dumps(wanted, indent=2), encoding="utf-8")
+    return wanted
+
+
 # Friendly labels for the box-accuracy stat keys.
 _STAT_LABELS = {
     "pts": "PTS", "fga": "FGA", "fgm": "FGM", "tpa": "3PA", "tpm": "3PM",

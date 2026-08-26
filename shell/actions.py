@@ -174,7 +174,7 @@ def apply_dial_file(path) -> int:
 # --- RUN                                                                   -- #
 # --------------------------------------------------------------------------- #
 
-def run_eval(session, name, *, games=None, sims=None, concurrency=None, seed=0,
+def run_eval(session, name, *, games=None, sims=None, concurrency=None, seed=0, subset=None,
              report_only=False, report_every=None, echo=print) -> dict:
     """Evaluate the resident model, writing to ``results/<model>/<run name>/``.
 
@@ -189,17 +189,21 @@ def run_eval(session, name, *, games=None, sims=None, concurrency=None, seed=0,
 
     ensure_tf()
     from config import EVAL_GAMES_PER_BATCH, ROLLOUT_BATCH_SIZE, STAGE_SIMS
-    from reporting.eval_report import resolve_results_run_dir
+    from reporting.eval_report import pin_run_holdout, resolve_results_run_dir, subset_holdout
     from simulation.stage_eval import evaluate_stage
 
-    run_dir = resolve_results_run_dir(session.model, name=name,
-                                      holdout_total=len(session.holdout_ids))
+    run_dir = resolve_results_run_dir(
+        session.model, name=name,
+        holdout_total=len(subset_holdout(session.holdout_ids, subset)))
+    holdout_ids = pin_run_holdout(run_dir, session.holdout_ids, subset=subset)
     df = cleaned_frame(session, echo=echo)
 
     n_sims = sims or STAGE_SIMS
     batch_size = concurrency or ROLLOUT_BATCH_SIZE
     echo(f"  {session.model} -> {run_dir}")
-    echo(f"  {len(session.holdout_ids)} holdout games, {n_sims} sims each, "
+    subset_note = (f" (subset of {len(session.holdout_ids)}, pinned)"
+                   if len(holdout_ids) != len(session.holdout_ids) else "")
+    echo(f"  {len(holdout_ids)} holdout games{subset_note}, {n_sims} sims each, "
          f"concurrency {batch_size}" + (f", max {games} new" if games else ""))
     if session.changed_dials:
         echo("  dials: " + ", ".join(f"{k} {a}->{b}"
@@ -207,7 +211,7 @@ def run_eval(session, name, *, games=None, sims=None, concurrency=None, seed=0,
 
     report = evaluate_stage(
         session.model, sim=session.sim, df=df, run_label=name or run_dir.name,
-        holdout_ids=session.holdout_ids, n_sims=n_sims,
+        holdout_ids=holdout_ids, n_sims=n_sims,
         max_new=0 if report_only else games, report_every=report_every,
         data_dir=session.data_dir, processed_dir=session.processed_dir,
         artifacts_root=session.artifacts_root, results_run_dir=run_dir,
@@ -218,7 +222,8 @@ def run_eval(session, name, *, games=None, sims=None, concurrency=None, seed=0,
     return report
 
 
-def run_eval_pooled(session, name, *, procs, sims=None, concurrency=None, seed=0, echo=print):
+def run_eval_pooled(session, name, *, procs, sims=None, concurrency=None, seed=0, subset=None,
+                    echo=print):
     """Evaluate across N child processes, then merge one report in this process.
 
     The parent supervises only -- it does not take a slice. It has to stay responsive to render the
@@ -241,7 +246,7 @@ def run_eval_pooled(session, name, *, procs, sims=None, concurrency=None, seed=0
         raise ShellError(f"no holdout games resolved for {session.model} "
                          f"(source tried: {session.holdout_source or 'none'}).")
 
-    from reporting.eval_report import resolve_results_run_dir
+    from reporting.eval_report import pin_run_holdout, resolve_results_run_dir, subset_holdout
 
     # Each child is a fresh `evaluate.py`, which reads the holdout + data paths from the run
     # state. The shell deliberately does NOT need that file (Session.resolve_holdout falls back to
@@ -256,17 +261,26 @@ def run_eval_pooled(session, name, *, procs, sims=None, concurrency=None, seed=0
             f"Run without --procs to evaluate in this process, or create the state on "
             f"this machine first.")
 
-    total = len(session.holdout_ids)
-    run_dir = resolve_results_run_dir(session.model, name=name, holdout_total=total)
+    # The equality check is against the FULL holdout on both sides: the children re-derive theirs
+    # from the state file, and a subset is applied identically on top (they read the same pinned
+    # holdout.json this call is about to write).
+    run_dir = resolve_results_run_dir(
+        session.model, name=name,
+        holdout_total=len(subset_holdout(session.holdout_ids, subset)))
 
     state_holdout = json.loads(state_path.read_text(encoding="utf-8")).get(
         "holdout_game_ids") or []
     if sorted(int(g) for g in state_holdout) != sorted(session.holdout_ids):
         raise ShellError(
             f"the holdout in {state_path} ({len(state_holdout)} games) is not the one this shell "
-            f"resolved ({total} games, from {session.holdout_source or 'unknown'}). The children "
-            f"would evaluate a different set of games than this report claims to cover. "
-            f"Run without --procs.")
+            f"resolved ({len(session.holdout_ids)} games, from "
+            f"{session.holdout_source or 'unknown'}). The children would evaluate a different set "
+            f"of games than this report claims to cover. Run without --procs.")
+
+    total = len(pin_run_holdout(run_dir, session.holdout_ids, subset=subset))
+    if total != len(session.holdout_ids):
+        echo(f"  holdout subset: {total} of {len(session.holdout_ids)} games, pinned in "
+             f"{run_dir.name}/holdout.json")
 
     # Every child re-reads config.py from disk, so a shell that tuned dials at runtime MUST hand
     # them over or the run silently mixes two tunings into one report.
@@ -292,20 +306,21 @@ def run_eval_pooled(session, name, *, procs, sims=None, concurrency=None, seed=0
             return []
         return shard_commands(model=session.model, run=run_dir.name, n=n,
                               dials_path=dials_path, state_path=state_path, run_dir=run_dir,
-                              sims=sims, concurrency=concurrency, seed=seed,
+                              sims=sims, concurrency=concurrency, seed=seed, subset=subset,
                               tag="" if wave == 1 else f"-w{wave}")
 
     shards = run_waves(build=build, run_dir=run_dir, total_games=total, echo=echo)
     if not shards and finished_games(run_dir) < total:
         echo("  pool of 1 -- running in this process instead.")
-        return run_eval(session, name, sims=sims, concurrency=concurrency, seed=seed, echo=echo)
+        return run_eval(session, name, sims=sims, concurrency=concurrency, seed=seed,
+                        subset=subset, echo=echo)
 
     assert_one_tuning(run_dir, echo=echo)
 
     # Merge in-process: TF is loaded and the cached frame skips re-reading every season CSV.
     echo("  merging the report over every finished game ...")
     report = run_eval(session, run_dir.name, sims=sims, concurrency=concurrency, seed=seed,
-                      report_only=True, echo=echo)
+                      subset=subset, report_only=True, echo=echo)
     if report["done"] < report["total"]:
         echo(f"  NOTE: {report['done']}/{report['total']} games -- the report covers finished "
              f"games only. Re-run to continue.")

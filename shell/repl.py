@@ -76,6 +76,9 @@ P_LOAD.add_argument("--force", action="store_true",
 P_RUN = _parser("run")
 P_RUN.add_argument("name", nargs="?", help="run name; omit for an auto eval-NNN")
 P_RUN.add_argument("--games", type=int, help="cap NEW games simulated this call")
+P_RUN.add_argument("--holdout", type=int, metavar="N",
+                   help="evaluate an N-game subset of the holdout (every total//N-th game); "
+                        "pinned to the run dir, unlike --games it changes the run's denominator")
 P_RUN.add_argument("--sims", "--monte-carlo", dest="sims", type=int,
                    help="Monte-Carlo sims per game (default STAGE_SIMS)")
 P_RUN.add_argument("--concurrency", type=int,
@@ -202,6 +205,11 @@ class CviqShell(cmd.Cmd):
         --procs is the third, separate knob: concurrency fills the GPU inside ONE process, but
         that process is GIL-bound to about one core, so --procs is what uses the rest of the box.
         The run dir is resolved once here and handed to every child, so an auto-named run is safe.
+
+        --holdout N narrows the run to N of the holdout's games (every total//N-th, so the sample
+        spans the season) and pins them to the run dir. Trading games for sims -- 'run s100g20
+        --holdout 20 --sims 100' -- costs about what the full holdout at 21 sims costs, but with
+        ~2.2x less Monte-Carlo error on each game.
         """
         a = P_RUN.parse_args(_split(arg))
         if a.procs and str(a.procs) != "1":
@@ -211,10 +219,11 @@ class CviqShell(cmd.Cmd):
                 raise ArgError("--games is the single-process interrupt knob and does not combine "
                                "with --procs. Drop one.")
             run_eval_pooled(self.session, a.name, procs=a.procs, sims=a.sims,
-                            concurrency=a.concurrency, seed=a.seed)
+                            concurrency=a.concurrency, seed=a.seed, subset=a.holdout)
             return
         run_eval(self.session, a.name, games=a.games, sims=a.sims, concurrency=a.concurrency,
-                 seed=a.seed, report_only=a.report_only, report_every=a.report_every)
+                 seed=a.seed, report_only=a.report_only, report_every=a.report_every,
+                 subset=a.holdout)
 
     def do_runs(self, arg):
         """runs [<model>] -- evaluation runs on disk under ./results."""

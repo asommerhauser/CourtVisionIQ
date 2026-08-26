@@ -15,6 +15,12 @@ with predicted/actual/variance box scores, and the generated play-by-plays under
   python evaluate.py --model v1.0 --run pace-097 --games 10
       Predict only the next 10 unfinished holdout games into that run, then stop (batched).
 
+  python evaluate.py --model v1.0 --run s100g20 --holdout 20 --monte-carlo 100 --seed 7 --procs auto
+      Flip the sampling: 20 of the 100 holdout games (every 5th, so the sample spans the season),
+      100 sims each. Same GPU cost as the whole holdout at 21 sims, but ~2.2x less Monte-Carlo
+      error per game -- the shape for telling model bias apart from sampling noise. The subset is
+      pinned to the run dir, so the shards and the merge all cover the same 20.
+
   python evaluate.py --model v1.0 --run trial1 --procs 4
       Same thing, supervised: sizes and launches 4 shard processes, shows one merged progress
       line, then merges the report once they finish. --procs auto sizes from usable cores and
@@ -79,6 +85,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "if you hit OOM, raise it to use more of the card. Independent of --monte-carlo.")
     ap.add_argument("--games", type=int, default=None,
                     help="Cap NEW games simulated this call (batched / interrupt-friendly). Default: all.")
+    ap.add_argument("--holdout", type=int, default=None, metavar="N",
+                    help="Evaluate an N-game SUBSET of the holdout: every (total//N)-th game, so "
+                         "the sample spans the whole holdout window. Pinned to the run dir on "
+                         "first use, so resumes, shards and --report-only reuse it. Unlike "
+                         "--games (which caps new games per call and leaves the denominator at "
+                         "the full holdout), this changes what the run covers.")
     ap.add_argument("--report-only", action="store_true",
                     help="Rebuild the report over finished games, no new sims.")
     ap.add_argument("--shard", default=None, metavar="I/N",
@@ -126,7 +138,8 @@ def main() -> None:
             ap.error("--report-only simulates nothing, so --procs has nothing to parallelize.")
         if args.games:
             ap.error("--games is the single-process interrupt knob; it does not combine with "
-                     "--procs. Drop one.")
+                     "--procs. Drop one (--holdout N, which changes what the run covers, does "
+                     "combine with --procs).")
         if str(args.procs) not in ("auto", ""):
             try:
                 if int(args.procs) < 1:
@@ -142,6 +155,9 @@ def main() -> None:
             ap.error(str(e))
         print(f"[dials] applied {len(applied)} from {args.dials}")
 
+    if args.holdout is not None and args.holdout < 1:
+        ap.error(f"--holdout must be a positive game count, got {args.holdout}")
+
     if args.procs and str(args.procs) != "1":
         from eval_pool import run_procs          # TF-free supervisor; children do the TF work
         return run_procs(args)
@@ -150,11 +166,11 @@ def main() -> None:
 
     run = FullRun(state_path=args.state)
     if args.report_only:
-        run.report(version=args.model, name=args.run)
+        run.report(version=args.model, name=args.run, subset=args.holdout)
     else:
         run.eval(version=args.model, name=args.run, n_sims=args.monte_carlo,
                  concurrency=args.concurrency, max_new=args.games, shard=shard,
-                 seed=args.seed)
+                 seed=args.seed, subset=args.holdout)
 
 
 if __name__ == "__main__":
