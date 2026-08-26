@@ -394,7 +394,7 @@ that actually needs a model, so `models`, `status`, `dials` and `runs` stay inst
 | `load <name> [--dials FILE] [--force]` | swap the resident model; `--force` overrides an arch/vocab mismatch |
 | `unload` | release it (frees host RAM; VRAM stays in TF's pool for the next load) |
 | `models` / `runs [<model>]` | what is on disk |
-| `run [<name>] [--games N] [--sims N] [--concurrency N] [--seed N] [--report-only]` | evaluate |
+| `run [<name>] [--games N] [--holdout N] [--sims N] [--concurrency N] [--seed N] [--report-only]` | evaluate |
 | `set <DIAL> <value>` / `unset <DIAL>` / `reset` | tune; dict dials take JSON |
 | `dials [--changed] [--save FILE] [--recommended]` / `dialfile <FILE>` | inspect / export a dial package |
 | `train <name> [--batch-size N] [--go]` / `train --status / --follow / --list` | launch + monitor |
@@ -479,6 +479,9 @@ python evaluate.py --model v1.0 --run pace-097 --monte-carlo 21 --concurrency 48
 # Predict only the next 10 unfinished games into that run, then stop (batched / resumable):
 python evaluate.py --model v1.0 --run pace-097 --games 10
 
+# Flip the sampling -- 20 of the holdout's games (every 5th), 100 sims each:
+python evaluate.py --model v1.0 --run s100g20 --holdout 20 --monte-carlo 100 --seed 7 --procs auto
+
 # Rebuild the report over finished games, no new sims:
 python evaluate.py --model v1.0 --run pace-097 --report-only
 
@@ -495,10 +498,28 @@ python evaluate.py --model v1.0 --run trial1 --procs 4      # or --procs auto
 - **`--procs`** — how many eval **processes** run at once over disjoint slices of the holdout.
   A third, separate knob: `--concurrency` fills the GPU inside one process, `--procs` uses the rest
   of the machine. `auto` sizes it from usable cores and free VRAM. Throughput only.
+- **`--holdout N`** — evaluate an N-game **subset**: every `total//N`-th game, so the sample spans
+  the whole holdout window instead of bunching at one end of a chronological list. Distinct from
+  `--games`, which caps *new* games per call and leaves the denominator at the full holdout; this
+  changes what the run covers. The chosen ids are pinned to `<run>/holdout.json` on first use, so
+  resumes, `--shard` children and `--report-only` all reuse them without being told again — and a
+  `--holdout` that disagrees with an existing pin is refused rather than silently re-slicing.
+  It composes with `--procs`.
+- **`--seed`** — base seed. Each `(game, sim)` pair derives its own RNG stream from it, so no two
+  games replay the same draws; **change it to resample a game set independently of an earlier
+  run**, since the same base reproduces the same sims exactly.
+
+**Trading games for sims.** The default shape is the whole holdout at `STAGE_SIMS` (100 × 21).
+`--holdout 20 --monte-carlo 100` costs about the same GPU time (2000 vs 2100 game-sims) but cuts
+each game's Monte-Carlo error ~2.2× — the shape for telling model *bias* apart from sampling
+*noise*, when a per-game residual is what you are chasing. The trade is a smaller cross-game
+sample, so aggregate win% over 20 games is noisy: it is a diagnosis run, not a headline-accuracy
+run.
 
 **A results run** (`results/v<version>/<eval-name>/`) contains:
 ```
 report.html  report.json          aggregate: win/spread/box/advanced accuracy + tuning dials
+holdout.json                      the game ids this run covers (see --holdout)
 data/                             queryable parquet (games, box_players, summary, run_summary, …)
 games/<matchup>/                  one folder per holdout game:
   game.html                       predicted (mean) / actual (raw) / variance box scores
