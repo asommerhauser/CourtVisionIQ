@@ -51,7 +51,8 @@ def test_pools_all_games_into_one_batched_call(monkeypatch):
     assert seen["n_calls"] == 1                 # one pooled rollout, not one-per-game
     assert len(seen["seeds"]) == 12             # 3 games x 4 sims
     assert seen["batch_size"] == 48
-    # Each game contributes n_sims jobs seeded seed0..seed0+n_sims-1, carrying its own roster.
+    # Without game_ids the caller doesn't know which game is which, so every game replays
+    # seed0..seed0+n_sims-1 (the standalone harness's contract).
     assert seen["seeds"] == [100, 101, 102, 103] * 3
     assert seen["rosters"] == ["g0_H"] * 4 + ["g1_H"] * 4 + ["g2_H"] * 4
 
@@ -81,3 +82,69 @@ def test_single_game_still_works(monkeypatch):
                             n_sims=3, seed0=7, batch_size=16)
     assert seen["seeds"] == [7, 8, 9]
     assert len(out) == 1 and len(out[0][0]) == 3
+
+
+def test_game_ids_give_every_game_its_own_streams(monkeypatch):
+    """The holdout evaluator passes real ids; no two games may replay the same seeds."""
+    seen = _patch(monkeypatch)
+    games = [(_FakeSpec(f"g{i}"), None, None, f"H{i}", f"A{i}") for i in range(3)]
+    ev.simulate_games(sim=None, games=games, n_sims=4, seed0=100, batch_size=48,
+                      game_ids=[298324, 298329, 298334])
+
+    seeds = seen["seeds"]
+    assert len(seeds) == 12 and len(set(seeds)) == 12      # no collisions within OR across games
+    assert seeds != [100, 101, 102, 103] * 3               # not the shared stream any more
+    assert all(0 <= s < 2 ** 31 - 1 for s in seeds)
+
+
+def test_game_seeds_do_not_depend_on_position(monkeypatch):
+    """This is the shard-equivalence guarantee: eval_pool slices holdout[i-1::n], so a game's
+    index differs in every shard. Seeding off the index would make a sharded run's games differ
+    from an unsharded one's."""
+    specs = {i: _FakeSpec(f"g{i}") for i in range(3)}
+    ids = [298324, 298329, 298334]
+
+    seen = _patch(monkeypatch)
+    ev.simulate_games(sim=None, games=[(specs[i], None, None, f"H{i}", f"A{i}") for i in range(3)],
+                      n_sims=3, seed0=7, batch_size=48, game_ids=ids)
+    forward = dict(zip(ids, [seen["seeds"][i:i + 3] for i in (0, 3, 6)]))
+
+    seen = _patch(monkeypatch)
+    ev.simulate_games(sim=None, games=[(specs[i], None, None, f"H{i}", f"A{i}") for i in (2, 0, 1)],
+                      n_sims=3, seed0=7, batch_size=48, game_ids=[ids[2], ids[0], ids[1]])
+    shuffled = dict(zip([ids[2], ids[0], ids[1]],
+                        [seen["seeds"][i:i + 3] for i in (0, 3, 6)]))
+
+    assert forward == shuffled
+
+
+def test_a_different_base_seed_resamples_independently(monkeypatch):
+    """--seed is how you get a fresh sample of the same games rather than a superset of an
+    earlier run's."""
+    games = [(_FakeSpec("g0"), None, None, "H", "A")]
+    seen = _patch(monkeypatch)
+    ev.simulate_games(sim=None, games=games, n_sims=5, seed0=0, batch_size=48, game_ids=[298324])
+    base0 = seen["seeds"]
+    seen = _patch(monkeypatch)
+    ev.simulate_games(sim=None, games=games, n_sims=5, seed0=7, batch_size=48, game_ids=[298324])
+    assert not set(base0) & set(seen["seeds"])
+
+
+def test_game_ids_must_line_up_with_games(monkeypatch):
+    _patch(monkeypatch)
+    games = [(_FakeSpec("g0"), None, None, "H", "A")]
+    try:
+        ev.simulate_games(sim=None, games=games, n_sims=2, seed0=0, batch_size=48,
+                          game_ids=[1, 2])
+    except ValueError as e:
+        assert "2 entries for 1 games" in str(e)
+    else:
+        raise AssertionError("mismatched game_ids should not be silently zipped short")
+
+
+def test_sim_seed_is_stable_across_processes():
+    """blake2b, not hash(): every shard is a separate process and hash() is salted per process."""
+    assert ev.sim_seed(0, 298324, 0) == ev.sim_seed(0, 298324, 0)
+    assert ev.sim_seed(0, 298324, 0) != ev.sim_seed(0, 298324, 1)
+    assert ev.sim_seed(0, 298324, 0) != ev.sim_seed(0, 298329, 0)
+    assert ev.sim_seed(0, 298324, 0) != ev.sim_seed(1, 298324, 0)

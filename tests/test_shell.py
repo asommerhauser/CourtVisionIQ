@@ -11,6 +11,7 @@ at load rather than mid-rollout -- without a 2.7 GB model.
 """
 from __future__ import annotations
 
+import importlib
 import json
 import sys
 import types
@@ -277,8 +278,11 @@ def loaded(fake_artifacts, monkeypatch, tmp_path):
 
     monkeypatch.setitem(sys.modules, "simulation.stage_eval",
                         types.SimpleNamespace(evaluate_stage=fake_stage))
+    real_eval_report = importlib.import_module("reporting.eval_report")
     monkeypatch.setitem(sys.modules, "reporting.eval_report", types.SimpleNamespace(
-        resolve_results_run_dir=lambda model, **kw: tmp_path / model / (kw.get("name") or "eval-001")))
+        resolve_results_run_dir=lambda model, **kw: tmp_path / model / (kw.get("name") or "eval-001"),
+        subset_holdout=real_eval_report.subset_holdout,
+        pin_run_holdout=real_eval_report.pin_run_holdout))
     return s, calls
 
 

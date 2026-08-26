@@ -248,3 +248,130 @@ def test_apply_dial_file_rejects_junk(tmp_path):
     bad.write_text("not json", encoding="utf-8")
     with pytest.raises(ValueError, match="not valid JSON"):
         config.apply_dial_file(bad)
+
+
+# --------------------------------------------------------------------------- #
+# --- --holdout N: a subset run                                            --- #
+# --------------------------------------------------------------------------- #
+
+def test_subset_is_a_spread_not_a_head_slice():
+    """The holdout is chronological: ids[:n] would draw every game from one stretch of the
+    calendar, with the same teams, rest states and injury context correlated across the sample."""
+    from reporting.eval_report import subset_holdout
+
+    ids = list(range(298324, 298424))              # the real 100-game holdout's shape
+    picked = subset_holdout(ids, 20)
+
+    assert len(picked) == 20
+    assert picked == ids[::5]                      # every 5th game
+    # Spread over the whole window rather than bunched at one end: first game included, last pick
+    # within one stride of the end, and the gaps uniform.
+    assert picked[0] == ids[0]
+    assert len(ids) - ids.index(picked[-1]) <= 5
+    assert {b - a for a, b in zip(picked, picked[1:])} == {5}
+    assert set(picked) <= set(ids), "a strict subset, so it stays comparable with earlier runs"
+
+
+def test_subset_of_none_is_the_whole_holdout():
+    from reporting.eval_report import subset_holdout
+    ids = list(range(10))
+    assert subset_holdout(ids, None) == ids
+
+
+@pytest.mark.parametrize("n", [0, -1, 101])
+def test_subset_rejects_impossible_counts(n):
+    from reporting.eval_report import subset_holdout
+    with pytest.raises(ValueError):
+        subset_holdout(list(range(100)), n)
+
+
+def test_the_pin_is_authoritative_for_later_calls(tmp_path):
+    """What makes a resume, a --shard child and a later --report-only agree on the denominator
+    without being told the subset again."""
+    from reporting.eval_report import pin_run_holdout
+
+    ids = list(range(1000, 1100))
+    run = tmp_path / "s100g20"
+
+    first = pin_run_holdout(run, ids, subset=20)
+    assert len(first) == 20
+    assert json.loads((run / "holdout.json").read_text()) == first
+
+    # A later call that knows nothing about the subset still covers exactly those 20.
+    assert pin_run_holdout(run, ids, subset=None) == first
+    # And re-stating the same subset is fine.
+    assert pin_run_holdout(run, ids, subset=20) == first
+
+
+def test_a_conflicting_subset_is_refused(tmp_path):
+    """The finished games were simulated against the pinned set; re-slicing would report them
+    under a total they never belonged to."""
+    from reporting.eval_report import pin_run_holdout
+
+    ids = list(range(1000, 1100))
+    run = tmp_path / "s100g20"
+    pin_run_holdout(run, ids, subset=20)
+
+    with pytest.raises(ValueError, match="pins 20 games"):
+        pin_run_holdout(run, ids, subset=50)
+
+
+def test_subset_applies_before_the_shard_stride(tmp_path, spy_eval):
+    """Order matters: the pool must split the run's OWN games, not the full holdout."""
+    holdout = list(range(1000, 1100))
+    run = FullRun(state_path=_state(tmp_path, holdout))
+
+    run.eval(name="s100g20", subset=20, shard=(2, 4))
+
+    subset = holdout[::5]
+    assert spy_eval["holdout_ids"] == subset[1::4]
+    assert set(spy_eval["holdout_ids"]) <= set(subset)
+
+
+def test_subset_shards_together_cover_the_subset_and_nothing_else(tmp_path, monkeypatch):
+    import simulation.stage_eval as stage_eval
+
+    holdout = list(range(2000, 2100))
+    claimed: list[int] = []
+    run_dir = tmp_path / "run"
+
+    def fake_evaluate_stage(stage_name, **kw):
+        claimed.extend(kw["holdout_ids"])
+        return {"done": 0, "total": len(kw["holdout_ids"]), "run_dir": str(run_dir)}
+
+    monkeypatch.setattr(stage_eval, "evaluate_stage", fake_evaluate_stage)
+    monkeypatch.setattr("reporting.eval_report.resolve_results_run_dir", lambda *a, **kw: run_dir)
+
+    state_path = _state(tmp_path, holdout)
+    for i in range(1, 5):
+        FullRun(state_path=state_path).eval(name="s100g20", subset=20, shard=(i, 4))
+
+    assert sorted(claimed) == holdout[::5]
+
+
+def test_report_only_reuses_the_pin_without_the_flag(tmp_path, spy_eval):
+    """The merge step (`--report-only`) is never told the subset -- it reads the pin."""
+    holdout = list(range(1000, 1100))
+    state_path = _state(tmp_path, holdout)
+    FullRun(state_path=state_path).eval(name="s100g20", subset=20)
+    assert len(spy_eval["holdout_ids"]) == 20
+
+    spy_eval.clear()
+    FullRun(state_path=state_path).report(name="s100g20")
+    assert spy_eval["holdout_ids"] == holdout[::5]
+    # A merge simulates nothing, so it must not assert a sim count -- evaluate_stage reads the
+    # real one back off the finished records instead (see test_stage_eval).
+    assert "n_sims" not in spy_eval
+
+
+def test_holdout_combines_with_procs():
+    """--games is rejected with --procs; --holdout, which changes what the run covers, is not."""
+    r = _cli("--holdout", "20", "--procs", "4", "--run", "x", "--state", "does-not-exist.json")
+    assert "--holdout" not in r.stderr
+    assert r.returncode != 2 or "No full-run state" in (r.stdout + r.stderr)
+
+
+def test_holdout_rejects_a_nonsense_count():
+    r = _cli("--holdout", "0")
+    assert r.returncode == 2
+    assert "--holdout must be a positive game count" in r.stderr

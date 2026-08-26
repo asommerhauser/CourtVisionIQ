@@ -156,6 +156,15 @@ def test_shard_commands_forward_the_seed(tmp_path):
         assert "--seed" not in s.cmd, "the default seed stays implicit"
 
 
+def test_shard_commands_forward_the_holdout_subset(tmp_path):
+    """Forwarded for the record, so a shard log shows the run's real shape. The run dir's pinned
+    holdout.json is what actually governs which games a child sees."""
+    for s in _shards(tmp_path, n=2, subset=20):
+        assert s.cmd[s.cmd.index("--holdout") + 1] == "20"
+    for s in _shards(tmp_path, n=2):
+        assert "--holdout" not in s.cmd, "a full-holdout run stays implicit"
+
+
 def test_shard_commands_never_forward_report_every(tmp_path):
     """An intermediate flush from a child writes exactly the files a shard must not touch."""
     for s in _shards(tmp_path, n=3):

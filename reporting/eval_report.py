@@ -120,7 +120,9 @@ def pin_run_holdout(run_dir, full_holdout, *, subset: int | None = None) -> list
     finished games were simulated against the pinned set, and re-slicing would report them under a
     total they never belonged to.
     """
-    path = Path(run_dir) / RUN_HOLDOUT_NAME
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    path = run_dir / RUN_HOLDOUT_NAME
     wanted = [int(g) for g in subset_holdout(full_holdout, subset)]
 
     if path.is_file():
