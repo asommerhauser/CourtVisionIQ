@@ -351,6 +351,20 @@ def test_importing_eval_pool_does_not_pull_tensorflow():
     assert r.stdout.strip() == "False"
 
 
+def test_run_procs_deferred_imports_resolve():
+    """run_procs imports lazily so the module stays TF-free, which also means a wrong import path
+    survives every unit test and only surfaces on the pod. It shipped that way once: model_name
+    was imported from models.artifacts while it lived in training.full_run, so
+    `evaluate.py --procs N` died on its first line."""
+    code = ("from models.artifacts import model_name; from reporting.eval_report import "
+            "pin_run_holdout, resolve_results_run_dir, subset_holdout; "
+            "print(model_name('1.0'))")
+    r = subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT,
+                       capture_output=True, text=True, timeout=180)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "v1.0"
+
+
 def test_a_failed_launch_does_not_orphan_the_children_already_running(tmp_path, monkeypatch):
     """A half-launched pool must not leave CUDA contexts running on a card nobody is watching."""
     launched = []

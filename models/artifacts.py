@@ -71,6 +71,23 @@ def model_root(name: str, models_root: str = MODELS_ROOT) -> str:
     return f"{models_root.rstrip('/')}/{slug}"
 
 
+def model_name(value: str) -> str:
+    """Resolve a model name, tolerating the legacy bare version format.
+
+    State files written before models were named store ``"1.0"``; the dir has always been
+    ``artifacts/v1.0``. Map a bare ``<major>.<minor>`` onto its ``v``-prefixed dir when that is
+    what exists, and otherwise pass the name through untouched so free-form names work.
+
+    Lives here rather than in ``training.full_run`` because ``eval_pool`` needs it and importing
+    ``training.full_run`` would pull in TensorFlow -- which the supervisor process must never do
+    (it would cost seconds per launch and take a CUDA context's worth of VRAM from the workers).
+    """
+    s = str(value).strip()
+    if re.fullmatch(r"\d+\.\d+", s) and s not in list_models():
+        return f"v{s}"
+    return s
+
+
 def list_models(models_root: str = MODELS_ROOT) -> list[str]:
     """Every loadable model name under ``models_root``, sorted.
 

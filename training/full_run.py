@@ -21,7 +21,6 @@ State machine (``full_run_state.json``), each step user-launched:
 from __future__ import annotations
 
 import json
-import re
 from datetime import datetime
 from pathlib import Path
 
@@ -29,7 +28,9 @@ from config import (
     DEFAULT_MODEL, EVAL_BATCH, EVAL_GAMES_PER_BATCH, FINAL_HOLDOUT_GAMES, FINAL_SEASON_FRACTION,
     FULL_RUN_STATE_PATH, ROLLOUT_BATCH_SIZE, SEED, STAGE_SIMS, SUBSET_MODEL_KEYS, TEST_FRAC,
 )
-from models.artifacts import list_models, model_root
+# model_name is re-exported: it lives in models.artifacts (TF-free, so eval_pool can reach
+# it), but train.py and the tests have always imported it from here.
+from models.artifacts import model_name, model_root  # noqa: F401
 from models.manifest import (new_manifest, record_head, snapshot_vocabs, vocab_fingerprint,
                              write_manifest)
 from models.registry import STAGE_MODEL_KEYS
@@ -38,19 +39,6 @@ from training.chronology import game_index, sequential_partition
 from training.subset import load_subset_games
 
 DEFAULT_STATE_PATH = FULL_RUN_STATE_PATH   # re-exported: train.py imports it from here
-
-
-def model_name(value: str) -> str:
-    """Resolve a model name, tolerating the legacy bare version format.
-
-    State files written before models were named store ``"1.0"``; the dir has always been
-    ``artifacts/v1.0``. Map a bare ``<major>.<minor>`` onto its ``v``-prefixed dir when that is
-    what exists, and otherwise pass the name through untouched so free-form names work.
-    """
-    s = str(value).strip()
-    if re.fullmatch(r"\d+\.\d+", s) and s not in list_models():
-        return f"v{s}"
-    return s
 
 
 class FullRun:
