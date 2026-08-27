@@ -164,6 +164,17 @@ EVAL_PROC_CORES = 2        # cores to budget per eval process (GIL-bound Python 
 EVAL_PROC_VRAM_GB = 4.0    # VRAM a loaded eval process costs (~3-4 GB for the 11 heads)
 EVAL_PROC_MAX = 8          # ceiling, so a 128-core pod does not fork a pathological pool
 
+# --- Eval durability (long pooled runs) ---
+# Also perf/safety knobs, NOT tuning dials: keep them out of _TUNING_KEYS or a benign difference
+# here would make assert_one_tuning claim the run mixed physics.
+# A CUDA OOM usually poisons TensorFlow for the life of the process, so a shard that fails this
+# many chunks in a row stops rather than burning GPU hours failing identically on every remaining
+# game; the pool's remainder wave respawns it with a clean context.
+EVAL_MAX_CONSECUTIVE_GAME_FAILURES = 3
+# How often the supervisor rebuilds report.html + data/*.parquet from the finished per-game
+# records while the shards are still running, so a 36-hour run is queryable long before it ends.
+EVAL_REPORT_EVERY_SEC = 300
+
 # --- Stint-length scheduler (StintLengthModel + GameController hybrid scheduler) ---
 # When the stint-length head is loaded, the Controller commits each entering player to a stint:
 # it samples a length (game-seconds on the floor) and schedules the player's exit at
@@ -231,6 +242,20 @@ _TUNING_KEYS = (
 )
 
 
+def encode_tuning(values: dict) -> dict:
+    """Put dial values in the shape a report stores: dict-valued dials JSON-encoded to a compact
+    string, so each sits cleanly in a single Parquet column rather than a struct.
+
+    Shared by :func:`tuning_snapshot` (live module values) and any caller reporting a dial file
+    written by :func:`write_dial_file`, which keeps dicts as dicts so they round-trip through
+    ``apply_dials``. Both must land in run_summary.parquet identically typed or the cross-run
+    knobs-to-results table stops concatenating.
+    """
+    import json as _json
+    return {k: _json.dumps(v, sort_keys=True) if isinstance(v, dict) else v
+            for k, v in values.items()}
+
+
 def tuning_snapshot() -> dict:
     """The live values of every rollout dial (read from this module at call time).
 
@@ -239,13 +264,8 @@ def tuning_snapshot() -> dict:
     (``SHOT_RESULT_BIAS`` / ``EVENT_BIAS`` / ``TYPE_BIAS``) are JSON-encoded to a compact string
     so each sits cleanly in a single Parquet column.
     """
-    import json as _json
     g = globals()
-    snap: dict = {}
-    for k in _TUNING_KEYS:
-        v = g[k]
-        snap[k] = _json.dumps(v, sort_keys=True) if isinstance(v, dict) else v
-    return snap
+    return encode_tuning({k: g[k] for k in _TUNING_KEYS})
 
 
 def get_dials() -> dict:

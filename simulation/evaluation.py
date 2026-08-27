@@ -36,6 +36,7 @@ import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
@@ -59,7 +60,11 @@ from simulation.stats import (
 # (stage_eval, tests) keep working and the rollout + metrics stay one import away.
 from simulation.eval_metrics import (  # noqa: F401
     spread_metrics, win_metrics, score_win_view, _stat_errors, _aggregate, _BOX_ACCURACY_STATS,
+    print_summary, reported_sims,
 )
+
+# Kept as the module-private name several call sites already import.
+_print_summary = print_summary
 
 DEFAULT_SIMS = 11
 
@@ -123,8 +128,12 @@ def simulate_repeated(sim: GameSimulator, spec, home_starters, away_starters, *,
                         away_starters=away_starters, season_context=spec.season_context(),
                         seed=_seed_for(seed0, game_id, s)) for s in range(n_sims)]
         histories = run_jobs_batched(sim, jobs, batch_size=batch_size, show_progress=show_progress)
-        boxes = [generate_box_score(h, home_team=home_team, away_team=away_team) for h in histories]
-        return (boxes, histories) if return_histories else boxes
+        ok = [h for h in histories if h is not None]
+        if len(ok) < len(histories):
+            print(f"  WARNING: {len(histories) - len(ok)} of {len(histories)} sims failed; "
+                  f"aggregating over the {len(ok)} that finished.")
+        boxes = [generate_box_score(h, home_team=home_team, away_team=away_team) for h in ok]
+        return (boxes, ok) if return_histories else boxes
 
     boxes: list[BoxScore] = []
     histories: list[list[dict]] = []
@@ -141,7 +150,9 @@ def simulate_repeated(sim: GameSimulator, spec, home_starters, away_starters, *,
 
 def simulate_games(sim: GameSimulator, games: list, *, n_sims: int, seed0: int,
                    batch_size: int = ROLLOUT_BATCH_SIZE, show_progress: bool = False,
-                   game_ids: list[int] | None = None):
+                   game_ids: list[int] | None = None,
+                   on_sim: Callable[[int, int, list, BoxScore], None] | None = None,
+                   boxes_out: list[list] | None = None):
     """Pool ``n_sims`` sims for **several** games into ONE batched rollout, then split back per game.
 
     A single game only keeps ~2 sims on the same head at once (its sims desync across the event/
@@ -156,6 +167,18 @@ def simulate_games(sim: GameSimulator, games: list, *, n_sims: int, seed0: int,
     ``game_ids`` (aligned to ``games``) switches seeding to :func:`sim_seed`, giving every
     ``(game, sim)`` pair its own stream instead of replaying ``seed0..seed0+n_sims-1`` once per
     game. Pass it whenever the caller knows the real game ids -- the holdout evaluator does.
+
+    ``on_sim(game_index, sim_index, history, box)`` switches on **streaming mode**: each sim is
+    scored and handed over the moment it finishes, and its history is then dropped rather than held
+    until the pool drains. At 100 sims that is the difference between a killed process losing three
+    hours of work and losing nothing. In streaming mode the returned histories are empty lists --
+    the caller has already been given each one -- and the returned boxes cover only the sims that
+    actually finished, so ``len(boxes) < n_sims`` is how a caller learns some failed.
+
+    ``boxes_out`` (a caller-owned ``[[None] * n_sims for _ in games]``) is filled **live** as sims
+    land, so a signal handler can read the boxes collected so far off a run that is being killed.
+
+    Without ``on_sim`` this is the original all-at-once path, unchanged.
     """
     if game_ids is not None and len(game_ids) != len(games):
         raise ValueError(f"game_ids has {len(game_ids)} entries for {len(games)} games")
@@ -163,25 +186,43 @@ def simulate_games(sim: GameSimulator, games: list, *, n_sims: int, seed0: int,
 
     jobs: list[GameJob] = []
     spans: list[tuple[int, int, str, str]] = []   # (start, end, home_team, away_team) per game
+    job_owner: dict[int, tuple[int, int]] = {}    # job index -> (game index, sim index)
     for g, (spec, home_starters, away_starters, home_team, away_team) in enumerate(games):
         gid = game_ids[g] if game_ids is not None else None
         start = len(jobs)
         for s in range(n_sims):
+            job_owner[len(jobs)] = (g, s)
             jobs.append(GameJob(
                 home_roster=spec.home_roster, away_roster=spec.away_roster,
                 season=str(spec.season), home_starters=home_starters, away_starters=away_starters,
                 season_context=spec.season_context(), seed=_seed_for(seed0, gid, s)))
         spans.append((start, len(jobs), home_team, away_team))
 
-    histories = run_jobs_batched(sim, jobs, batch_size=batch_size, show_progress=show_progress)
+    if on_sim is None:
+        histories = run_jobs_batched(sim, jobs, batch_size=batch_size, show_progress=show_progress)
 
-    out: list[tuple[list[BoxScore], list[list[dict]]]] = []
-    for start, end, home_team, away_team in spans:
-        game_histories = histories[start:end]
-        boxes = [generate_box_score(h, home_team=home_team, away_team=away_team)
-                 for h in game_histories]
-        out.append((boxes, game_histories))
-    return out
+        out: list[tuple[list[BoxScore], list[list[dict]]]] = []
+        for start, end, home_team, away_team in spans:
+            game_histories = [h for h in histories[start:end] if h is not None]
+            boxes = [generate_box_score(h, home_team=home_team, away_team=away_team)
+                     for h in game_histories]
+            out.append((boxes, game_histories))
+        return out
+
+    # Streaming: score each sim on the slot thread that produced it, hand it to the sink, and let
+    # the driver drop the history. Box scores are small, so those we do keep.
+    boxes_by_game = boxes_out if boxes_out is not None else [[None] * n_sims for _ in games]
+
+    def _on_complete(job_idx: int, history) -> None:
+        g, s = job_owner[job_idx]
+        _, _, home_team, away_team = spans[g]
+        box = generate_box_score(history, home_team=home_team, away_team=away_team)
+        boxes_by_game[g][s] = box       # list-item assignment: atomic under the GIL
+        on_sim(g, s, history, box)
+
+    run_jobs_batched(sim, jobs, batch_size=batch_size, show_progress=show_progress,
+                     on_complete=_on_complete, keep_histories=False)
+    return [([b for b in boxes_by_game[g] if b is not None], []) for g in range(len(games))]
 
 
 # --------------------------------------------------------------------------- box aggregation
@@ -280,6 +321,12 @@ def build_game_record(game_df, boxes: list[BoxScore], *, n_sims: int,
     ``seed_base`` is recorded so a run says which RNG streams produced it (see :func:`sim_seed`);
     records written before that existed simply carry ``None``.
     """
+    if not boxes:
+        # Otherwise this is a ZeroDivisionError three lines down, from a caller that has no idea
+        # which game it was. Every sim failing is a real (if rare) outcome now that one bad sim
+        # no longer takes the whole batch down with it.
+        gid = int(game_df["game_id"].iloc[0])
+        raise ValueError(f"game {gid}: every sim failed; no record can be built.")
     actual_box = generate_box_score(game_df, home_team=home_team, away_team=away_team)
     margins = [b.home_score - b.away_score for b in boxes]
     home_wins = sum(1 for m in margins if m > 0)
@@ -388,14 +435,6 @@ def evaluate_holdout(*, n_sims: int = DEFAULT_SIMS, games: int | None = None,
     return report
 
 
-def _print_summary(agg: dict, n_games: int, n_sims: int) -> None:
-    h = agg["headline"]
-    print(f"\n=== holdout evaluation  ({n_games} games x {n_sims} sims) ===")
-    print(f"  win-pick (vote)     {h['pick_accuracy'] * 100:5.1f}%   (Brier {h['brier']:.3f})")
-    print(f"  win-pick (score)    {h['score_pick_accuracy'] * 100:5.1f}%   "
-          f"(Brier {h['score_brier']:.3f})")
-    print(f"  point-spread MAE    {h['spread_mae']:5.1f} pts   (bias {agg['spread']['bias']:+.1f})")
-    print(f"  team points MAE     {h['points_mae']:5.1f} pts")
 
 
 def main():

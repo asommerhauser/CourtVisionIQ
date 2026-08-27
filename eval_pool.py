@@ -255,7 +255,8 @@ def _reap(shard: Shard) -> None:
 
 
 def run_pool(shards: list[Shard], *, run_dir, total_games: int, cwd=REPO_ROOT,
-             echo=print, poll: float = 0.5, render: bool = True) -> list[Shard]:
+             echo=print, poll: float = 0.5, render: bool = True,
+             on_tick=None) -> list[Shard]:
     """Launch every shard, render one merged progress line, and wait for them all to exit.
 
     Progress is read from the run dir rather than from the children: the count of per-game
@@ -265,6 +266,10 @@ def run_pool(shards: list[Shard], *, run_dir, total_games: int, cwd=REPO_ROOT,
     A failing child does not stop its siblings -- its games simply stay unfinished, which the
     resume path and the remainder wave already handle. Ctrl-C stops the pool and leaves every
     finished game cached.
+
+    ``on_tick`` (when given) is called once per poll while the pool runs -- the hook the supervisor
+    uses to rebuild the report from finished games mid-run. It must not raise; a bookkeeping error
+    has no business killing a pool that is hours in.
     """
     run_dir = Path(run_dir)
     start = time.monotonic()
@@ -288,6 +293,11 @@ def run_pool(shards: list[Shard], *, run_dir, total_games: int, cwd=REPO_ROOT,
                 _reap(s)
             if render:
                 _render(shards, run_dir, total_games, start, started)
+            if on_tick is not None:
+                try:
+                    on_tick()
+                except Exception as e:      # noqa: BLE001 - never kill the pool over bookkeeping
+                    echo(f"\n[pool] mid-run report failed ({e!r}); the run continues.")
             if any(s.rc is None for s in shards):
                 time.sleep(poll)
     except KeyboardInterrupt:
@@ -354,7 +364,7 @@ def report_failures(shards, *, echo=print, tail_lines: int = 40) -> list[Shard]:
 
 
 def run_waves(*, build, run_dir, total_games: int, cwd=REPO_ROOT, echo=print,
-              max_waves: int = 3, render: bool = True) -> list[Shard]:
+              max_waves: int = 3, render: bool = True, on_tick=None) -> list[Shard]:
     """Run the pool, then re-pool over whatever is still unfinished, up to ``max_waves``.
 
     ``build(wave, remaining)`` returns the shard commands for one wave (or an empty list to stop).
@@ -377,7 +387,7 @@ def run_waves(*, build, run_dir, total_games: int, cwd=REPO_ROOT, echo=print,
         # Every child of this wave is reaped inside run_pool before the next wave computes its
         # remainder, so two waves can never target the same game folder.
         run_pool(shards, run_dir=run_dir, total_games=total_games, cwd=cwd, echo=echo,
-                 render=render)
+                 render=render, on_tick=on_tick)
         all_shards.extend(shards)
         report_failures(shards, echo=echo)
         if finished_games(run_dir) <= before:
@@ -411,6 +421,94 @@ def assert_one_tuning(run_dir, *, echo=print) -> bool:
              f"{', '.join(sorted(mixed))}. The aggregate mixes tunings and is not comparable.")
         return False
     return True
+
+
+# ===================================================================== #
+# --- Reporting over finished games                                    --
+# ===================================================================== #
+
+def finished_records(run_dir) -> list[dict]:
+    """Every finished game's record. Skips ``record.partial.json`` -- those games are not done."""
+    out: list[dict] = []
+    for rec in sorted(Path(run_dir).glob("games/*/record.json")):
+        try:
+            out.append(json.loads(rec.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[pool] skipping unreadable {rec}: {e}")
+    return out
+
+
+def partial_games(run_dir) -> list[tuple[str, int, int]]:
+    """Games salvaged from a killed process: (folder, sims saved, sims requested)."""
+    out = []
+    for rec in sorted(Path(run_dir).glob("games/*/record.partial.json")):
+        if (rec.parent / "record.json").exists():
+            continue        # the wave came back and finished it properly
+        try:
+            d = json.loads(rec.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        out.append((rec.parent.name, int(d.get("n_sims") or 0),
+                    int(d.get("requested_n_sims") or 0)))
+    return out
+
+
+def build_run_report(run_dir, *, model: str, echo=print) -> dict | None:
+    """Rebuild report.html + report.json + data/*.parquet from the finished per-game records.
+
+    Runs **in this process** and reads nothing but ``games/*/record.json``, so it is safe to call
+    while the shards are still simulating: they run with ``write_report=False`` and never touch
+    these files. That is what makes a 36-hour run queryable before it ends, and it replaces the
+    ``evaluate.py --report-only`` child, which re-read every cleaned season CSV to simulate nothing.
+
+    Returns None when no game has finished yet.
+    """
+    from reporting.eval_report import build_report, write_eval_report
+    from simulation.eval_metrics import _aggregate, print_summary, reported_sims
+
+    run_dir = Path(run_dir)
+    records = finished_records(run_dir)
+    if not records:
+        return None
+
+    # The dials the CHILDREN ran, not this process's config: build_report defaults `tuning` to the
+    # live config, which here is stock config.py -- i.e. the wrong physics on a tuned run.
+    tuning = None
+    dials = run_dir / "dials.json"
+    if dials.is_file():
+        try:
+            # encode_tuning, not the raw file: write_dial_file keeps dict dials as dicts so they
+            # round-trip through apply_dials, but run_summary.parquet wants them JSON-encoded into
+            # one column each -- the same shape tuning_snapshot produces for every other run.
+            tuning = config.encode_tuning(json.loads(dials.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError) as e:
+            echo(f"[pool] could not read {dials} ({e}); reporting without a tuning snapshot.")
+
+    aggregate = _aggregate(records)
+    # run_name is the MODEL name, matching what evaluate_stage stamps, so a mid-run report and a
+    # --report-only merge are indistinguishable.
+    rep = build_report(records=records, aggregate=aggregate,
+                       n_sims=reported_sims(records, default=0), run_name=model, tuning=tuning)
+    write_eval_report(rep, run_dir=run_dir)
+    print_summary(aggregate, len(records), rep["n_sims"])
+    return rep
+
+
+def _periodic_report(run_dir, *, model: str, echo=print, every: float | None = None):
+    """An on_tick that rebuilds the report when new games have landed and `every` seconds passed."""
+    every = config.EVAL_REPORT_EVERY_SEC if every is None else every
+    state = {"t": time.monotonic(), "n": finished_games(run_dir)}
+
+    def tick() -> None:
+        now = time.monotonic()
+        done = finished_games(run_dir)
+        if done <= state["n"] or now - state["t"] < every:
+            return
+        state["t"], state["n"] = now, done
+        if build_run_report(run_dir, model=model, echo=echo) is not None:
+            echo(f"[pool] report refreshed over {done} finished games.")
+
+    return tick
 
 
 # ===================================================================== #
@@ -474,7 +572,8 @@ def run_procs(args) -> None:
                                   seed=args.seed, subset=subset,
                                   tag="" if wave == 1 else f"-w{wave}")
 
-        shards = run_waves(build=build, run_dir=run_dir, total_games=total)
+        shards = run_waves(build=build, run_dir=run_dir, total_games=total,
+                           on_tick=_periodic_report(run_dir, model=name_))
         if not shards:
             print("[pool] pool of 1 -- running in this process instead.")
             from training.full_run import FullRun            # the TF import, only on this path
@@ -484,7 +583,15 @@ def run_procs(args) -> None:
             return
 
     assert_one_tuning(run_dir)
-    merge_report(model=name_, run=run_name, state_path=state_path)
+    # In-process rather than the --report-only child: identical output, but no second TF import and
+    # no re-read of every season CSV to simulate nothing -- one less thing to fail at hour 36.
+    if build_run_report(run_dir, model=name_) is None:
+        print("[pool] no finished games -- nothing to report.")
+    else:
+        print(f"[pool] report -> {run_dir}")
+    for folder, got, want in partial_games(run_dir):
+        print(f"[pool] PARTIAL: {folder} holds {got}/{want} sims in record.partial.json "
+              f"(salvaged from a killed process, never completed).")
 
 
 def merge_report(*, model: str, run: str, state_path, python: str | None = None,
@@ -497,5 +604,6 @@ def merge_report(*, model: str, run: str, state_path, python: str | None = None,
 
 
 __all__ = ["Shard", "autosize_procs", "free_vram_gb", "usable_cores", "shard_commands",
-           "run_pool", "run_waves", "report_failures", "finished_games", "assert_one_tuning",
-           "run_procs", "merge_report", "MIN_GAMES_PER_SHARD"]
+           "run_pool", "run_waves", "report_failures", "finished_games", "finished_records",
+           "partial_games", "build_run_report", "assert_one_tuning", "run_procs", "merge_report",
+           "MIN_GAMES_PER_SHARD"]

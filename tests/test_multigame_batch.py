@@ -27,12 +27,18 @@ def _patch(monkeypatch):
     """Stub run_jobs_batched (one fake history per job) + generate_box_score (echoes the job)."""
     seen = {}
 
-    def fake_run_jobs_batched(sim, jobs, *, batch_size, show_progress=False):
+    def fake_run_jobs_batched(sim, jobs, *, batch_size, show_progress=False,
+                              on_complete=None, keep_histories=True, **kw):
         seen["seeds"] = [j.seed for j in jobs]
         seen["rosters"] = [j.home_roster[0] for j in jobs]
         seen["batch_size"] = batch_size
         seen["n_calls"] = seen.get("n_calls", 0) + 1
-        return [[{"job_index": i}] for i in range(len(jobs))]
+        seen["keep_histories"] = keep_histories
+        histories = [[{"job_index": i}] for i in range(len(jobs))]
+        if on_complete is not None:
+            for i, h in enumerate(histories):
+                on_complete(i, h)
+        return [None] * len(jobs) if not keep_histories else histories
 
     # simulate_games does a local `from simulation.batched_rollout import ... run_jobs_batched`.
     monkeypatch.setattr(br, "run_jobs_batched", fake_run_jobs_batched)
@@ -148,3 +154,73 @@ def test_sim_seed_is_stable_across_processes():
     assert ev.sim_seed(0, 298324, 0) != ev.sim_seed(0, 298324, 1)
     assert ev.sim_seed(0, 298324, 0) != ev.sim_seed(0, 298329, 0)
     assert ev.sim_seed(0, 298324, 0) != ev.sim_seed(1, 298324, 0)
+
+
+# ===================================================================== #
+# --- Streaming mode (on_sim): persist each sim as it lands            --
+# ===================================================================== #
+
+def test_streaming_hands_every_sim_over_with_its_game_and_sim_index(monkeypatch):
+    """The sink must be able to name the game and the sim, since it writes sim_NNN per game."""
+    _patch(monkeypatch)
+    games = [(_FakeSpec("g0"), None, None, "H0", "A0"),
+             (_FakeSpec("g1"), None, None, "H1", "A1")]
+
+    seen: list[tuple[int, int, int]] = []
+
+    def sink(g, s, history, box):
+        seen.append((g, s, history[0]["job_index"]))
+
+    ev.simulate_games(sim=None, games=games, n_sims=3, seed0=0, batch_size=48, on_sim=sink)
+
+    # Game 0 owns jobs 0-2, game 1 owns jobs 3-5 -- and the sink is told (game, sim), not job.
+    assert seen == [(0, 0, 0), (0, 1, 1), (0, 2, 2), (1, 0, 3), (1, 1, 4), (1, 2, 5)]
+
+
+def test_streaming_returns_boxes_but_drops_histories(monkeypatch):
+    """Streaming's whole point: the boxes survive in RAM, the big histories do not."""
+    seen = _patch(monkeypatch)
+    games = [(_FakeSpec("g0"), None, None, "H0", "A0"),
+             (_FakeSpec("g1"), None, None, "H1", "A1")]
+
+    out = ev.simulate_games(sim=None, games=games, n_sims=3, seed0=0, batch_size=48,
+                            on_sim=lambda g, s, h, b: None)
+
+    assert seen["keep_histories"] is False, "the driver must not retain histories when streaming"
+    assert len(out) == 2
+    for g, (boxes, histories) in enumerate(out):
+        assert histories == [], "the sink already got them"
+        assert [b[0] for b in boxes] == [g * 3, g * 3 + 1, g * 3 + 2]
+        assert boxes[0][1] == f"H{g}" and boxes[0][2] == f"A{g}"
+
+
+def test_streaming_fills_boxes_out_live_for_the_salvage_path(monkeypatch):
+    """A caller-owned list, filled as sims land -- what a signal handler reads mid-game."""
+    _patch(monkeypatch)
+    games = [(_FakeSpec("g0"), None, None, "H0", "A0")]
+    boxes_out = [[None] * 3]
+
+    ev.simulate_games(sim=None, games=games, n_sims=3, seed0=0, batch_size=48,
+                      on_sim=lambda g, s, h, b: None, boxes_out=boxes_out)
+
+    assert [b[0] for b in boxes_out[0]] == [0, 1, 2]
+
+
+def test_a_failed_sim_is_dropped_not_fatal(monkeypatch):
+    """One sim returning nothing must cost that sim, not the game."""
+    seen = _patch(monkeypatch)
+
+    def fake_run(sim, jobs, *, batch_size, show_progress=False, on_complete=None,
+                 keep_histories=True, **kw):
+        seen["n_calls"] = seen.get("n_calls", 0) + 1
+        # job 1 failed: the pool records None for it and carries on.
+        return [[{"job_index": 0}], None, [{"job_index": 2}]]
+
+    monkeypatch.setattr(br, "run_jobs_batched", fake_run)
+    games = [(_FakeSpec("g0"), None, None, "H0", "A0")]
+
+    (boxes, histories), = ev.simulate_games(sim=None, games=games, n_sims=3, seed0=0,
+                                            batch_size=48)
+
+    assert [b[0] for b in boxes] == [0, 2], "the failed sim is dropped, the others survive"
+    assert len(histories) == 2

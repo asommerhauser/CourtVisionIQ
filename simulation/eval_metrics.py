@@ -271,6 +271,34 @@ def _aggregate(records: list[dict]) -> dict:
     return {**_aggregate_core(records), "progression": progression(records)}
 
 
+
+def reported_sims(records: list[dict], *, default: int) -> int:
+    """The sim count the finished games were ACTUALLY run at, not the one a call asked for.
+
+    A merge (``--report-only``, and the pooled run's merge step) simulates nothing, so its
+    ``n_sims`` argument is whatever the default happens to be -- which used to stamp a 100-sim
+    run as a 21-sim one. The records know: each carries the count it was built with.
+    """
+    counts = {int(r["n_sims"]) for r in records if r.get("n_sims")}
+    if not counts:
+        return default
+    if len(counts) > 1:
+        print(f"  WARNING: this run mixes sim counts ({', '.join(str(c) for c in sorted(counts))}"
+              f"); reporting the smallest. Its per-game estimates are not equally precise.")
+    return min(counts)
+
+
+def print_summary(agg: dict, n_games: int, n_sims: int) -> None:
+    """The four-line headline every eval path prints. Here rather than in ``evaluation.py`` so the
+    pooled supervisor can print it without importing the rollout stack."""
+    h = agg["headline"]
+    print(f"\n=== holdout evaluation  ({n_games} games x {n_sims} sims) ===")
+    print(f"  win-pick (vote)     {h['pick_accuracy'] * 100:5.1f}%   (Brier {h['brier']:.3f})")
+    print(f"  win-pick (score)    {h['score_pick_accuracy'] * 100:5.1f}%   "
+          f"(Brier {h['score_brier']:.3f})")
+    print(f"  point-spread MAE    {h['spread_mae']:5.1f} pts   (bias {agg['spread']['bias']:+.1f})")
+    print(f"  team points MAE     {h['points_mae']:5.1f} pts")
+
 __all__ = [
     "spread_metrics", "win_metrics", "score_win_view", "_aggregate", "_aggregate_core",
     "progression", "_stat_errors", "_BOX_ACCURACY_STATS",

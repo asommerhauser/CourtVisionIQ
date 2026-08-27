@@ -385,3 +385,147 @@ def test_a_failed_launch_does_not_orphan_the_children_already_running(tmp_path, 
     assert len(launched) == 2
     assert all(s.rc is not None for s in launched), "survivors must have been terminated"
     assert all(s._fh is None for s in shards), "log handles must be closed"
+
+
+# ===================================================================== #
+# --- Reporting over finished games (mid-run and final)                --
+# ===================================================================== #
+
+def _game(run_dir, folder, payload, *, name="record.json"):
+    d = run_dir / "games" / folder
+    d.mkdir(parents=True, exist_ok=True)
+    (d / name).write_text(json.dumps(payload), encoding="utf-8")
+    return d
+
+
+def test_finished_records_ignores_partials(tmp_path):
+    """A salvaged game is not a finished game: it must not reach the aggregate, and it must not
+    drag the reported sim count down to whatever a killed process managed."""
+    import eval_pool as ep
+
+    _game(tmp_path, "g1", {"game_id": 1, "n_sims": 100})
+    _game(tmp_path, "g2", {"game_id": 2, "n_sims": 12}, name="record.partial.json")
+
+    records = ep.finished_records(tmp_path)
+
+    assert [r["game_id"] for r in records] == [1]
+    assert ep.finished_games(tmp_path) == 1
+
+
+def test_partial_games_lists_only_the_ones_never_completed(tmp_path):
+    import eval_pool as ep
+
+    _game(tmp_path, "g1", {"n_sims": 12, "requested_n_sims": 100}, name="record.partial.json")
+    # g2 was salvaged, then the remainder wave came back and finished it properly.
+    _game(tmp_path, "g2", {"n_sims": 9, "requested_n_sims": 100}, name="record.partial.json")
+    _game(tmp_path, "g2", {"game_id": 2, "n_sims": 100})
+
+    assert ep.partial_games(tmp_path) == [("g1", 12, 100)]
+
+
+def test_finished_records_skips_a_torn_file(tmp_path):
+    """The supervisor reads these while shards write them; a half-written file is not fatal."""
+    import eval_pool as ep
+
+    _game(tmp_path, "g1", {"game_id": 1, "n_sims": 100})
+    d = tmp_path / "games" / "g2"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "record.json").write_text('{"game_id": 2, "n_s', encoding="utf-8")
+
+    assert [r["game_id"] for r in ep.finished_records(tmp_path)] == [1]
+
+
+def test_build_run_report_uses_the_run_dials_not_the_live_config(tmp_path, monkeypatch):
+    """build_report defaults `tuning` to the supervisor's own config -- which is stock config.py,
+    i.e. the wrong physics for a run whose children were handed a dial file."""
+    import eval_pool as ep
+
+    _game(tmp_path, "g1", {"game_id": 1, "n_sims": 100})
+    _game(tmp_path, "g2", {"game_id": 2, "n_sims": 100})
+    # write_dial_file's real shape: scalars stay scalars, dict dials stay dicts.
+    (tmp_path / "dials.json").write_text(
+        json.dumps({"DELTA_TIME_SCALE": 1.23, "EVENT_BIAS": {"foul": 0.11}}), encoding="utf-8")
+
+    seen = {}
+
+    def fake_build_report(*, records, aggregate, n_sims, run_name, tuning=None):
+        seen.update(n_sims=n_sims, run_name=run_name, tuning=tuning, n=len(records))
+        return {"n_sims": n_sims}
+
+    monkeypatch.setattr("reporting.eval_report.build_report", fake_build_report)
+    monkeypatch.setattr("reporting.eval_report.write_eval_report",
+                        lambda rep, **kw: seen.setdefault("written", kw.get("run_dir")))
+    monkeypatch.setattr("simulation.eval_metrics._aggregate", lambda recs: {})
+    monkeypatch.setattr("simulation.eval_metrics.print_summary", lambda *a, **kw: None)
+
+    ep.build_run_report(tmp_path, model="v1.0")
+
+    # Dict dials must arrive JSON-encoded, exactly as tuning_snapshot would give them: they land
+    # in a single run_summary.parquet column, and a struct there would not concatenate with the
+    # string column every other run wrote.
+    assert seen["tuning"] == {"DELTA_TIME_SCALE": 1.23, "EVENT_BIAS": '{"foul": 0.11}'}
+    assert seen["run_name"] == "v1.0", "matches what evaluate_stage stamps, so a merge looks the same"
+    assert seen["n_sims"] == 100, "read off the records, not defaulted"
+    assert seen["n"] == 2
+    assert seen["written"] == tmp_path
+
+
+def test_build_run_report_is_none_before_any_game_finishes(tmp_path):
+    import eval_pool as ep
+
+    assert ep.build_run_report(tmp_path, model="v1.0") is None
+
+
+def test_periodic_report_waits_for_new_games_and_the_interval(tmp_path, monkeypatch):
+    """Mid-run rebuilds are throttled two ways so a 36-hour pool is not rebuilding constantly."""
+    import eval_pool as ep
+
+    built = []
+    monkeypatch.setattr(ep, "build_run_report",
+                        lambda rd, **kw: built.append(ep.finished_games(rd)) or {"n_sims": 1})
+
+    tick = ep._periodic_report(tmp_path, model="v1.0", every=0.0)
+    tick()                                          # no new games -> nothing
+    assert built == []
+
+    _game(tmp_path, "g1", {"game_id": 1, "n_sims": 100})
+    tick()
+    assert built == [1]
+
+    tick()                                          # still 1 game -> no rebuild
+    assert built == [1]
+
+
+def test_pool_tick_failure_does_not_kill_the_pool(tmp_path, monkeypatch):
+    """A bookkeeping error has no business ending a run that is hours in."""
+    import eval_pool as ep
+
+    _patch_launch(monkeypatch, lambda s: FakePopen(tmp_path, 2, tag=f"s{s.index}g"))
+    shards = _shards(tmp_path, n=2)
+
+    def boom():
+        raise RuntimeError("report exploded")
+
+    ep.run_pool(shards, run_dir=tmp_path, total_games=4, poll=0.0, on_tick=boom)
+
+    assert all(s.rc == 0 for s in shards), "the pool ran to completion despite the failing tick"
+
+
+def test_report_tuning_matches_the_shape_a_normal_run_records(tmp_path):
+    """A dial file round-trips into the same column types tuning_snapshot produces.
+
+    write_dial_file keeps dict dials as dicts so they survive apply_dials; the report wants them
+    JSON-encoded so each is one Parquet column. Reporting the file raw would give the pooled run's
+    run_summary.parquet struct columns where every other run has strings.
+    """
+    import config
+
+    config.write_dial_file(tmp_path / "dials.json")
+    raw = json.loads((tmp_path / "dials.json").read_text(encoding="utf-8"))
+
+    encoded = config.encode_tuning(raw)
+    snapshot = config.tuning_snapshot()
+
+    assert set(encoded) == set(snapshot)
+    assert {k: type(v) for k, v in encoded.items()} == {k: type(v) for k, v in snapshot.items()}
+    assert encoded == snapshot, "same dials in, same report row out"
