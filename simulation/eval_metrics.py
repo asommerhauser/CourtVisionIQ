@@ -22,10 +22,12 @@ import math
 import numpy as np
 
 from config import MARGIN_CALIBRATION_INTERCEPT, MARGIN_CALIBRATION_SLOPE
-from simulation.stats import ADVANCED_LABELS, score_win_prob
+from simulation.stats import ADVANCED_LABELS, MINUTES, score_win_prob, stat_value
 
-# Stat keys used in the team/player box-accuracy tables.
-_BOX_ACCURACY_STATS = ("pts", "fga", "fgm", "tpa", "tpm", "fta", "ftm",
+# Stat keys used in the team/player box-accuracy tables. "minutes" leads the list the way MIN leads
+# a box score; it is derived from the stored ``seconds`` by ``simulation.stats.stat_value``, so it
+# scores on records written before minutes was a reported stat.
+_BOX_ACCURACY_STATS = (MINUTES, "pts", "fga", "fgm", "tpa", "tpm", "fta", "ftm",
                        "oreb", "dreb", "ast", "stl", "blk", "tov", "pf")
 
 
@@ -150,8 +152,9 @@ def _aggregate_core(records: list[dict]) -> dict:
         pairs, stds = [], []
         for r in records:
             for side in ("home", "away"):
-                pairs.append((r["team_pred"][side][f], r["team_actual"][side][f]))
-                stds.append(r["team_std"][side][f])
+                pairs.append((stat_value(r["team_pred"][side], f),
+                              stat_value(r["team_actual"][side], f)))
+                stds.append(stat_value(r["team_std"][side], f))
         team_acc[f] = _stat_errors(pairs)
         team_reliability[f] = float(np.mean(stds)) if stds else 0.0
 
@@ -162,10 +165,10 @@ def _aggregate_core(records: list[dict]) -> dict:
         for r in records:
             for side in ("home", "away"):
                 for name in r["players"][side]:
-                    pred = r["player_avg"][side][name][f]
-                    actual = r["player_actual"][side].get(name, {}).get(f, 0.0)
+                    pred = stat_value(r["player_avg"][side][name], f)
+                    actual = stat_value(r["player_actual"][side].get(name, {}), f)
                     pairs.append((pred, actual))
-                    stds.append(r["player_std"][side][name][f])
+                    stds.append(stat_value(r["player_std"][side][name], f))
         player_acc[f] = _stat_errors(pairs)
         player_reliability[f] = float(np.mean(stds)) if stds else 0.0
 
@@ -194,6 +197,10 @@ def _aggregate_core(records: list[dict]) -> dict:
             "score_brier": win_score["brier"],
             "spread_mae": spread["mae"],
             "points_mae": team_acc["pts"]["mae"],
+            # Minutes are a per-player prediction (a team always plays ~240), so the headline
+            # tracks the player block -- that is the rotation model's error in the unit it is
+            # tuned in.
+            "player_minutes_mae": player_acc[MINUTES]["mae"],
         },
     }
 
@@ -211,6 +218,8 @@ def _segment_metrics(core: dict) -> dict:
         "score_brier": h["score_brier"],
         "spread_mae": h["spread_mae"],
         "points_mae": h["points_mae"],
+        "player_minutes_mae": h["player_minutes_mae"],
+        "player_minutes_bias": core["player_accuracy"][MINUTES]["bias"],
         "pace_bias": core["advanced"]["pace"]["bias"],
         "fga_bias": core["team_accuracy"]["fga"]["bias"],
         "efg_bias": core["advanced"]["efg"]["bias"],
@@ -298,6 +307,8 @@ def print_summary(agg: dict, n_games: int, n_sims: int) -> None:
           f"(Brier {h['score_brier']:.3f})")
     print(f"  point-spread MAE    {h['spread_mae']:5.1f} pts   (bias {agg['spread']['bias']:+.1f})")
     print(f"  team points MAE     {h['points_mae']:5.1f} pts")
+    if "player_minutes_mae" in h:
+        print(f"  player minutes MAE  {h['player_minutes_mae']:5.1f} min")
 
 __all__ = [
     "spread_metrics", "win_metrics", "score_win_view", "_aggregate", "_aggregate_core",

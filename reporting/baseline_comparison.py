@@ -35,13 +35,18 @@ import pandas as pd
 
 from data_loading import load_all_cleaned
 from simulation.box_score import generate_box_score
-from simulation.stats import BOX_STATS, player_stats
+from simulation.stats import BOX_STATS, MINUTES, player_stats, stat_value
 from simulation.eval_metrics import _stat_errors
 from training.chronology import game_index
 
-# Stats we compare (the report's counting stats; seconds is used only for the rotation filter).
-COMPARE_STATS = ("pts", "fga", "fgm", "tpm", "fta", "oreb", "dreb", "ast", "stl", "blk", "tov", "pf")
+# Stats we compare: minutes (derived from the stored ``seconds``) plus the report's counting stats.
+# Minutes get the same treatment as the rest — a player's minutes are as mean-reverting as their
+# points, so "we predict who plays how long" needs to clear the season-average bar too. (Raw
+# ``seconds`` is still what the rotation cohort filter reads.)
+COMPARE_STATS = (MINUTES, "pts", "fga", "fgm", "tpm", "fta", "oreb", "dreb", "ast", "stl", "blk",
+                 "tov", "pf")
 _STAT_LABELS = {
+    MINUTES: "MIN",
     "pts": "PTS", "fga": "FGA", "fgm": "FGM", "tpm": "3PM", "fta": "FTA", "oreb": "OREB",
     "dreb": "DREB", "ast": "AST", "stl": "STL", "blk": "BLK", "tov": "TO", "pf": "PF",
 }
@@ -127,12 +132,13 @@ def compare(run_dir: str | Path, *, data_dir: str = "./data", min_prior: int = 3
                 for c in row_cohorts:
                     n_player_games[c] += 1
                     for f in COMPARE_STATS:
-                        a = float(act.get(f, 0.0))
-                        pairs[c]["model"][f].append((float(model.get(f, 0.0)), a))
-                        pairs[c]["std"][f].append((float(std[f]), a))
-                        pairs[c]["full"][f].append((float(full[f]), a))
-                        me = abs(float(model.get(f, 0.0)) - a)
-                        be = abs(float(std[f]) - a)
+                        a = stat_value(act, f)
+                        pred = stat_value(model, f)
+                        pairs[c]["model"][f].append((pred, a))
+                        pairs[c]["std"][f].append((stat_value(std, f), a))
+                        pairs[c]["full"][f].append((stat_value(full, f), a))
+                        me = abs(pred - a)
+                        be = abs(stat_value(std, f) - a)
                         wins[c][f].append(1.0 if me < be else 0.5 if me == be else 0.0)
 
     table = {c: {f: {p: _stat_errors(pairs[c][p][f])["mae"] for p in predictors}
@@ -158,19 +164,35 @@ def compare(run_dir: str | Path, *, data_dir: str = "./data", min_prior: int = 3
 
 # --------------------------------------------------------------------------- render
 
-def _verdict(report: dict) -> str:
-    """One-line read on the rotation cohort's points: does the model beat season-to-date?"""
+def _stat_verdict(report: dict, stat: str, unit: str) -> str:
+    """One-line read on the rotation cohort for one stat: does the model beat season-to-date?"""
     rot = report["mae"]["rotation"]
-    m, s = rot["pts"]["model"], rot["pts"]["std"]
-    wr = report["model_winrate_vs_std"]["rotation"]["pts"] * 100
+    if stat not in rot:
+        return ""
+    m, s = rot[stat]["model"], rot[stat]["std"]
+    wr = report["model_winrate_vs_std"]["rotation"][stat] * 100
     if s <= 0:
         return "No rotation player-games to judge."
+    label = _STAT_LABELS[stat]
     rel = (m - s) / s * 100
     if m < s:
-        return (f"Rotation PTS: model MAE {m:.2f} beats season-to-date {s:.2f} "
-                f"({rel:+.1f}%), winning {wr:.0f}% of player-games. The pitch holds on points.")
-    return (f"Rotation PTS: model MAE {m:.2f} vs season-to-date {s:.2f} ({rel:+.1f}%), "
+        return (f"Rotation {label}: model MAE {m:.2f} {unit} beats season-to-date {s:.2f} "
+                f"({rel:+.1f}%), winning {wr:.0f}% of player-games.")
+    return (f"Rotation {label}: model MAE {m:.2f} {unit} vs season-to-date {s:.2f} ({rel:+.1f}%), "
             f"winning only {wr:.0f}% of player-games - not clearly beating mean reversion.")
+
+
+def _verdict(report: dict) -> str:
+    """The headline read: points (the pitch) and minutes (the rotation behind it).
+
+    Minutes are shown next to points because they gate every counting stat -- a points miss driven
+    by a minutes miss is a rotation problem, not a scoring one, and the two lines separate them.
+    """
+    pts = _stat_verdict(report, "pts", "pts")
+    if not pts or pts.startswith("No rotation"):
+        return pts or "No rotation player-games to judge."
+    mins = _stat_verdict(report, MINUTES, "min")
+    return f"{pts} " + (f"{mins}" if mins else "")
 
 
 def _esc(v) -> str:
@@ -219,7 +241,9 @@ def render_html(report: dict) -> str:
         f"<div class='verdict'>{_esc(_verdict(report))}</div>",
         "<p class='sub'>Lower MAE is better. <b>model−STD</b> negative (green) = model beats the "
         "season-to-date baseline on that stat. The rotation cohort is the honest test (the all-players "
-        "pool is padded with bench/zero lines both predictors trivially nail).</p>",
+        "pool is padded with bench/zero lines both predictors trivially nail). <b>MIN</b> is the "
+        "rotation prediction itself — every counting stat below it is downstream of getting a "
+        "player's minutes right.</p>",
         _html_table(report, "rotation"),
         _html_table(report, "all"),
         "<footer>Generated by CourtVisionIQ baseline_comparison — read-only, no simulation.</footer>",

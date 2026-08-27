@@ -24,6 +24,16 @@ BOX_STATS = (
     "oreb", "dreb", "ast", "stl", "blk", "tov", "pf", "pts",
 )
 
+# "minutes" is a *derived* accuracy stat. The rollout accrues ``seconds`` (that is what lives in a
+# stored box row), but minutes are what a box score reports and what a rotation model is judged on,
+# so the report layer treats "minutes" as a first-class predicted stat and derives it here. Reading
+# every accuracy loop through :func:`stat_value` means minutes can join the counting stats without
+# rewriting any record -- older runs re-report with minutes from their stored seconds.
+MINUTES = "minutes"
+
+# The stat keys the report layer scores, i.e. BOX_STATS plus the derived MINUTES.
+REPORT_STATS = BOX_STATS + (MINUTES,)
+
 # Full regulation game length and on-court slots, for pace normalization.
 _GAME_MINUTES = 48.0
 _ON_COURT = 5.0
@@ -32,6 +42,17 @@ _ON_COURT = 5.0
 def player_stats(line: PlayerLine) -> dict[str, float]:
     """The numeric stat dict for one player line (BOX_STATS only)."""
     return {f: float(getattr(line, f)) for f in BOX_STATS}
+
+
+def stat_value(stats: dict[str, float], key: str) -> float:
+    """One stat out of a stored stat dict, deriving :data:`MINUTES` from ``seconds``.
+
+    Missing keys read as 0.0 so a player absent from one side of a comparison (didn't play, or
+    wasn't simulated) pairs against a zero line rather than raising.
+    """
+    if key == MINUTES:
+        return float(stats.get("seconds", 0.0) or 0.0) / 60.0
+    return float(stats.get(key, 0.0) or 0.0)
 
 
 def team_totals(lines: list[PlayerLine]) -> dict[str, float]:
@@ -97,6 +118,9 @@ ADVANCED_LABELS = {
 
 __all__ = [
     "BOX_STATS",
+    "MINUTES",
+    "REPORT_STATS",
+    "stat_value",
     "player_stats",
     "team_totals",
     "possessions",
