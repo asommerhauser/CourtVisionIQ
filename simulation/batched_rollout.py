@@ -28,6 +28,7 @@ from __future__ import annotations
 import sys
 import threading
 import time
+import traceback
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Callable
@@ -203,7 +204,12 @@ class _Progress:
         if not self.enabled:
             return
         now = time.monotonic()
-        if not force and now - self._last_render < 0.25:   # throttle redraws
+        # A shard's stdout is a log file, not a terminal (see eval_pool._launch). Redrawing a
+        # carriage-return bar 4x/sec into a file leaves megabytes of overwritten frames that only
+        # render after stripping the CRs; a newline-terminated line every 30s makes `tail -f` the
+        # liveness check for a multi-hour shard.
+        tty = sys.stdout.isatty()
+        if not force and now - self._last_render < (0.25 if tty else 30.0):
             return
         self._last_render = now
         elapsed = max(now - self._start, 1e-6)
@@ -216,10 +222,10 @@ class _Progress:
         bar_n = 24
         filled = int(bar_n * done / total) if total else bar_n
         bar = "#" * filled + "-" * (bar_n - filled)
-        line = (f"\r[{bar}] {pct:5.1f}%  {done}/{total} sims  "
+        line = (f"[{bar}] {pct:5.1f}%  {done}/{total} sims  "
                 f"{rate_min:5.1f}/min  ev/s {ev / elapsed:6.0f}  fwd/s {ps / elapsed:6.0f}  "
                 f"batch {occ:4.1f}  ETA {self._fmt(eta)}   ")
-        sys.stdout.write(line)
+        sys.stdout.write(f"\r{line}" if tty else f"{line}\n")
         sys.stdout.flush()
 
     @staticmethod
@@ -236,7 +242,8 @@ class _Progress:
         elapsed = max(time.monotonic() - self._start, 1e-6)
         rate_hr = self.completed / (elapsed / 3600.0)
         per_1000 = (1000.0 / rate_hr) if rate_hr > 0 else float("inf")
-        sys.stdout.write("\n")
+        if sys.stdout.isatty():
+            sys.stdout.write("\n")
         print(f"[batched-rollout] {self.completed} game-sims in {self._fmt(elapsed)} "
               f"({rate_hr:.0f}/hr, avg batch {self.rows / self.passes if self.passes else 0:.1f}). "
               f"1,000 game-sims ≈ {self._fmt(per_1000)} of GPU wall-clock.")
@@ -248,7 +255,9 @@ class _Progress:
 
 def run_jobs_batched(master: GameSimulator, jobs: list[GameJob], *, batch_size: int,
                      greedy: bool = False, show_progress: bool = True,
-                     progress: _Progress | None = None) -> list[list[dict]]:
+                     progress: _Progress | None = None,
+                     on_complete: Callable[[int, list[dict]], None] | None = None,
+                     keep_histories: bool = True) -> list[list[dict] | None]:
     """Run ``jobs`` on a pool of ``batch_size`` concurrent slots; return histories in job order.
 
     ``batch_size`` is the number of games in flight at once (the VRAM knob), **not** a cohort
@@ -261,6 +270,16 @@ def run_jobs_batched(master: GameSimulator, jobs: list[GameJob], *, batch_size: 
 
     Scheduling only: ``histories`` is index-addressed and ``GameJob.seed`` does not depend on
     position, so which games happen to be concurrent cannot change any game's result.
+
+    ``on_complete(job_idx, history)`` (when given) fires **on the slot thread**, the moment that
+    job's rollout returns — the seam a caller uses to persist a finished sim immediately instead of
+    waiting for the whole pool to drain. Paired with ``keep_histories=False`` it also bounds memory:
+    the driver drops its reference, so a 100-sim game holds one history at a time per slot rather
+    than all 100 until the end. Both defaults reproduce the original behaviour exactly.
+
+    A job that raises is logged and skipped; its slot keeps pulling work. That matters more than it
+    sounds: a slot that dies never comes back, so one bad sim used to narrow the pool for the rest
+    of a multi-hour run.
     """
     histories: list[list[dict]] = [None] * len(jobs)  # type: ignore[list-item]
     if progress is None:
@@ -289,17 +308,28 @@ def run_jobs_batched(master: GameSimulator, jobs: list[GameJob], *, batch_size: 
         try:
             while (job_idx := _claim()) is not None:
                 job = jobs[job_idx]
-                wsim = _WorkerSim(master, coord, worker_id=slot)
-                ctrl = GameController(wsim, seed=job.seed, greedy=greedy)
-                ctrl.start(job.home_roster, job.away_roster, possession=job.possession,
-                           season=str(job.season), home_starters=job.home_starters,
-                           away_starters=job.away_starters, season_context=job.season_context)
                 history = None
                 try:
+                    wsim = _WorkerSim(master, coord, worker_id=slot)
+                    ctrl = GameController(wsim, seed=job.seed, greedy=greedy)
+                    ctrl.start(job.home_roster, job.away_roster, possession=job.possession,
+                               season=str(job.season), home_starters=job.home_starters,
+                               away_starters=job.away_starters, season_context=job.season_context)
                     history = ctrl.run()
-                    histories[job_idx] = history
+                    # Recorded BEFORE the sink runs: a failing sink must not lose a good sim.
+                    if keep_histories:
+                        histories[job_idx] = history
+                    if on_complete is not None:
+                        on_complete(job_idx, history)
+                except Exception as e:      # noqa: BLE001 - one bad sim must not kill the slot
+                    if sys.stdout.isatty():
+                        sys.stdout.write("\n")
+                    print(f"[batched-rollout] job {job_idx} (seed {job.seed}) failed: {e!r}")
+                    traceback.print_exc()
                 finally:
-                    progress.complete_one(len(history) if history else 0)
+                    n_events = len(history) if history else 0
+                    history = None          # release this slot's reference before the next claim
+                    progress.complete_one(n_events)
         finally:
             # Once per slot, at slot exit — the barrier counts slots, not games.
             coord.worker_done()

@@ -121,11 +121,12 @@ class _StubMaster:
         return {"y": stacked["x"]}
 
 
-def _patch_pool(monkeypatch, lengths):
+def _patch_pool(monkeypatch, lengths, fail=()):
     """Replace _WorkerSim/GameController so a "game" is just N coordinator requests.
 
     ``lengths[i]`` is how many requests job i makes — the knob that creates the ragged tails a
-    strict-cohort loop cannot backfill.
+    strict-cohort loop cannot backfill. ``fail`` is a set of job seeds whose rollout raises after
+    making its requests, standing in for a sim that dies mid-run.
     """
     import simulation.batched_rollout as br
 
@@ -143,6 +144,8 @@ def _patch_pool(monkeypatch, lengths):
         def run(self):
             for _ in range(lengths[self.seed]):
                 self.sim.coord.request(self.sim.wid, "m", {"x": np.array([[float(self.seed)]])})
+            if self.seed in fail:
+                raise RuntimeError(f"job {self.seed} blew up")
             return [{"event": "e"}] * lengths[self.seed]
 
     monkeypatch.setattr(br, "_WorkerSim", FakeWorkerSim)
@@ -201,3 +204,95 @@ def test_pool_with_no_jobs_is_a_noop():
     import simulation.batched_rollout as br
 
     assert br.run_jobs_batched(_StubMaster(), [], batch_size=8, show_progress=False) == []
+
+
+# ===================================================================== #
+# --- Streaming sink + per-job failure isolation                       --
+# ===================================================================== #
+
+def test_on_complete_fires_once_per_job_with_its_own_history(monkeypatch):
+    """The streaming seam: every finished sim is handed to the sink exactly once, in job terms."""
+    import simulation.batched_rollout as br
+
+    lengths = [3, 1, 4, 1, 5]
+    _patch_pool(monkeypatch, lengths)
+    jobs = [br.GameJob(home_roster=[], away_roster=[], seed=i) for i in range(len(lengths))]
+
+    seen: list[tuple[int, int]] = []
+    lock = threading.Lock()
+
+    def sink(job_idx, history):
+        with lock:
+            seen.append((job_idx, len(history)))
+
+    histories = br.run_jobs_batched(_StubMaster(), jobs, batch_size=2, show_progress=False,
+                                    on_complete=sink)
+
+    assert sorted(seen) == sorted(enumerate(lengths)), "each job streamed exactly once"
+    assert [len(h) for h in histories] == lengths, "keep_histories=True still returns them"
+
+
+def test_keep_histories_false_streams_without_retaining(monkeypatch):
+    """The memory bound: the sink sees every history, the returned list holds none of them."""
+    import simulation.batched_rollout as br
+
+    lengths = [2, 3, 4]
+    _patch_pool(monkeypatch, lengths)
+    jobs = [br.GameJob(home_roster=[], away_roster=[], seed=i) for i in range(len(lengths))]
+
+    streamed: list[int] = []
+    lock = threading.Lock()
+
+    def sink(job_idx, history):
+        with lock:
+            streamed.append(len(history))
+
+    histories = br.run_jobs_batched(_StubMaster(), jobs, batch_size=3, show_progress=False,
+                                    on_complete=sink, keep_histories=False)
+
+    assert sorted(streamed) == sorted(lengths), "the sink still saw every sim"
+    assert histories == [None] * len(lengths), "nothing retained"
+
+
+def test_a_failing_job_does_not_kill_its_slot(monkeypatch):
+    """The regression this guards: a raising sim used to kill its thread for the rest of the run.
+
+    With 2 slots and 3 of 8 jobs raising, a dead-slot pool would drop to width 1 and — because
+    ``worker_done`` never fires for a thread that died mid-loop — could strand the barrier. Every
+    surviving job must still finish, and the failures must land as ``None``, not as an exception.
+    """
+    import simulation.batched_rollout as br
+
+    lengths = [1] * 8
+    fail = {1, 4, 5}
+    _patch_pool(monkeypatch, lengths, fail=fail)
+    jobs = [br.GameJob(home_roster=[], away_roster=[], seed=i) for i in range(len(lengths))]
+
+    progress = br._Progress(total=len(jobs), enabled=False)
+    histories = br.run_jobs_batched(_StubMaster(), jobs, batch_size=2, show_progress=False,
+                                    progress=progress)
+
+    for i in range(len(lengths)):
+        if i in fail:
+            assert histories[i] is None, f"job {i} raised, so it has no history"
+        else:
+            assert histories[i] is not None, f"job {i} never ran - its slot died"
+    # complete_one still fires for a failed job, so the barrier accounting stays exact.
+    assert progress.completed == len(jobs)
+
+
+def test_a_failing_sink_does_not_lose_the_history(monkeypatch):
+    """A disk error while streaming must not discard a sim that actually ran."""
+    import simulation.batched_rollout as br
+
+    lengths = [2, 2]
+    _patch_pool(monkeypatch, lengths)
+    jobs = [br.GameJob(home_roster=[], away_roster=[], seed=i) for i in range(2)]
+
+    def sink(job_idx, history):
+        raise OSError("disk full")
+
+    histories = br.run_jobs_batched(_StubMaster(), jobs, batch_size=2, show_progress=False,
+                                    on_complete=sink)
+
+    assert [len(h) for h in histories] == lengths, "history is recorded before the sink runs"
