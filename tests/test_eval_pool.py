@@ -28,14 +28,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 def sizing(monkeypatch):
     """Pin every input to autosize_procs so each test moves exactly one of them."""
     monkeypatch.setattr(eval_pool, "usable_cores", lambda: 32)
-    monkeypatch.setattr(eval_pool, "free_vram_gb", lambda: 24.0)
+    monkeypatch.setattr(eval_pool, "free_vram_by_device", lambda: [24.0])
     monkeypatch.setattr(config, "EVAL_PROC_CORES", 2)
     monkeypatch.setattr(config, "EVAL_PROC_VRAM_GB", 4.0)
     monkeypatch.setattr(config, "EVAL_PROC_MAX", 8)
 
 
 def test_autosize_is_bound_by_vram(sizing, monkeypatch):
-    monkeypatch.setattr(eval_pool, "free_vram_gb", lambda: 16.0)
+    monkeypatch.setattr(eval_pool, "free_vram_by_device", lambda: [16.0])
     n, why = eval_pool.autosize_procs(holdout_games=100)
     assert n == 4                       # 16.0 / 4.0
     assert "vram" in why
@@ -56,7 +56,7 @@ def test_autosize_is_bound_by_the_amount_of_work(sizing):
 
 def test_autosize_respects_the_ceiling(sizing, monkeypatch):
     monkeypatch.setattr(eval_pool, "usable_cores", lambda: 256)
-    monkeypatch.setattr(eval_pool, "free_vram_gb", lambda: 512.0)
+    monkeypatch.setattr(eval_pool, "free_vram_by_device", lambda: [512.0])
     n, why = eval_pool.autosize_procs(holdout_games=1000)
     assert n == config.EVAL_PROC_MAX
     assert "cap 8" in why
@@ -70,9 +70,25 @@ def test_autosize_subtracts_reserved_vram(sizing):
     assert "24.0-8.0" in why
 
 
+def test_autosize_adds_up_every_card(sizing, monkeypatch):
+    """Shards are dealt one per card, so the VRAM budget is the sum, not card 0 alone."""
+    monkeypatch.setattr(config, "EVAL_PROC_MAX", 64)
+    monkeypatch.setattr(eval_pool, "free_vram_by_device", lambda: [16.0, 16.0])
+    n, why = eval_pool.autosize_procs(holdout_games=100)
+    assert n == 8                       # (16+16)/4, not 16/4
+    assert "over 2 gpus" in why
+
+
+def test_autosize_charges_the_resident_model_to_the_first_card_only(sizing, monkeypatch):
+    monkeypatch.setattr(config, "EVAL_PROC_MAX", 64)
+    monkeypatch.setattr(eval_pool, "free_vram_by_device", lambda: [16.0, 16.0])
+    n, _ = eval_pool.autosize_procs(holdout_games=100, reserved_vram_gb=8.0)
+    assert n == 6                       # (16-8)/4 on card 0 + 16/4 on card 1
+
+
 def test_autosize_falls_back_when_the_vram_probe_fails(sizing, monkeypatch):
     """No GPU probe must not mean no pool -- fall back to the core cap, and say so."""
-    monkeypatch.setattr(eval_pool, "free_vram_gb", lambda: None)
+    monkeypatch.setattr(eval_pool, "free_vram_by_device", lambda: None)
     n, why = eval_pool.autosize_procs(holdout_games=100)
     assert n == 8                       # cpu cap 16, ceiling 8
     assert "vram unknown" in why
@@ -102,7 +118,7 @@ def test_auto_forms_all_take_the_heuristic(sizing, requested):
 
 def test_autosize_never_returns_zero(sizing, monkeypatch):
     monkeypatch.setattr(eval_pool, "usable_cores", lambda: 1)
-    monkeypatch.setattr(eval_pool, "free_vram_gb", lambda: 0.5)
+    monkeypatch.setattr(eval_pool, "free_vram_by_device", lambda: [0.5])
     n, _ = eval_pool.autosize_procs(holdout_games=1)
     assert n == 1
 
@@ -123,6 +139,7 @@ def _shards(tmp_path, n=4, **kw):
     kw.setdefault("run", "trial1")
     kw.setdefault("dials_path", tmp_path / "dials.json")
     kw.setdefault("state_path", tmp_path / "state.json")
+    kw.setdefault("gpus", [])           # hermetic: never probe the test machine's cards
     return eval_pool.shard_commands(n=n, run_dir=tmp_path, **kw)
 
 
@@ -175,6 +192,55 @@ def test_shard_logs_are_distinct_files(tmp_path):
     shards = _shards(tmp_path, n=4)
     assert len({s.log for s in shards}) == 4
     assert all(s.log.parent.name == "logs" for s in shards)
+
+
+# --------------------------------------------------------------------------- #
+# --- GPU placement                                                        --- #
+# --------------------------------------------------------------------------- #
+
+def test_visible_gpus_honours_an_explicit_pin(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2, 3")
+    assert eval_pool.visible_gpus() == ["2", "3"]
+
+
+def test_visible_gpus_treats_an_empty_pin_as_no_gpu(monkeypatch):
+    """CUDA_VISIBLE_DEVICES="" is a deliberate CPU-only run, not "every card"."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    assert eval_pool.visible_gpus() == []
+
+
+def test_shards_are_dealt_round_robin_over_the_cards(tmp_path):
+    shards = _shards(tmp_path, n=5, gpus=["0", "1"])
+    assert [s.gpu for s in shards] == ["0", "1", "0", "1", "0"]
+
+
+def test_one_card_leaves_the_environment_alone(tmp_path):
+    """Nothing to spread across, so no CUDA_VISIBLE_DEVICES is invented for the child."""
+    assert all(s.gpu is None for s in _shards(tmp_path, n=4, gpus=["0"]))
+
+
+def test_launch_pins_the_child_to_its_card(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_popen(cmd, **kw):
+        seen.update(kw["env"])
+        return FakePopen(tmp_path, 0)
+
+    monkeypatch.setattr(eval_pool.subprocess, "Popen", fake_popen)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,5")
+    shard = _shards(tmp_path, n=2, gpus=["4", "5"])[1]
+    eval_pool._launch(shard, cwd=tmp_path)
+    shard._fh.close()
+
+    assert seen["CUDA_VISIBLE_DEVICES"] == "5"      # overwrites the parent's list
+    assert seen["TF_FORCE_GPU_ALLOW_GROWTH"] == "true"
+
+
+def test_the_rerun_hint_reproduces_the_pin(tmp_path, capsys):
+    shard = _shards(tmp_path, n=2, gpus=["0", "1"])[1]
+    shard.rc = 1
+    eval_pool.report_failures([shard])
+    assert "CUDA_VISIBLE_DEVICES=1 " in capsys.readouterr().out
 
 
 # --------------------------------------------------------------------------- #

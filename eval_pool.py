@@ -33,6 +33,13 @@ Design notes worth keeping:
     exactly the remainder. That recovers most of what a work queue would, with none of the
     protocol -- and every child of a wave is reaped before the next wave computes its remainder, so
     two waves can never target the same game folder.
+  * **One card per child, not one card per model.** Nothing in the model stack is multi-GPU:
+    without a distribution strategy TensorFlow places every op on ``/GPU:0``, so N unpinned
+    children all pile onto card 0 and every other card sits at 0%. The pool spreads the
+    *processes* instead -- shard i is launched with ``CUDA_VISIBLE_DEVICES`` set to card
+    ``(i-1) % len(visible_gpus())`` -- which needs no change to the rollout and keeps a shard the
+    single unit of both scheduling and placement. One visible card is left unpinned so the
+    single-GPU path inherits the caller's environment untouched.
   * **Dials travel with the pool.** A child re-reads ``config.py`` from disk, so a parent that
     tuned dials at runtime must hand them over explicitly or the run silently mixes two tunings
     into one report. :func:`shard_commands` requires the dial file for that reason, and
@@ -60,32 +67,86 @@ REPO_ROOT = Path(__file__).resolve().parent
 # --- Sizing                                                           --
 # ===================================================================== #
 
-def free_vram_gb() -> float | None:
-    """Free VRAM on device 0 in GiB, or None if it cannot be determined.
+def visible_gpus() -> list[str]:
+    """The CUDA devices this process may use, as the tokens a child passes back in.
 
-    Deliberately context-free -- both probes read the driver without initializing CUDA, so asking
-    the question does not itself cost the memory we are trying to measure.
+    ``CUDA_VISIBLE_DEVICES`` wins when it is set -- a caller who already pinned the pool to one
+    card (or to a UUID) means it, and we hand out a subset of exactly what they allowed. An empty
+    value is a deliberate "no GPU" and returns no devices, not every device.
+
+    Like :func:`free_vram_gb` the probes are context-free: counting devices must not itself create
+    a CUDA context, or the supervisor would take a worker's worth of VRAM just to ask.
     """
+    env = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if env is not None:
+        return [tok.strip() for tok in env.split(",") if tok.strip()]
     try:
         import pynvml
 
         pynvml.nvmlInit()
         try:
-            info = pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(0))
-            return info.free / (1024 ** 3)
+            return [str(i) for i in range(pynvml.nvmlDeviceGetCount())]
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=10)
+        if out.returncode == 0:
+            return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+    except Exception:
+        pass
+    return []
+
+
+def free_vram_gb(device: str | int | None = None) -> float | None:
+    """Free VRAM on one device in GiB, or None if it cannot be determined.
+
+    ``device`` is a physical index or a GPU UUID -- NVML and ``nvidia-smi`` both address the real
+    hardware regardless of what ``CUDA_VISIBLE_DEVICES`` hides, which is what makes it safe to ask
+    about a card this process is not itself allowed to use. ``None`` means device 0.
+
+    Deliberately context-free -- both probes read the driver without initializing CUDA, so asking
+    the question does not itself cost the memory we are trying to measure.
+    """
+    token = "0" if device is None else str(device)
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            handle = (pynvml.nvmlDeviceGetHandleByIndex(int(token)) if token.isdigit()
+                      else pynvml.nvmlDeviceGetHandleByUUID(token.encode()))
+            return pynvml.nvmlDeviceGetMemoryInfo(handle).free / (1024 ** 3)
         finally:
             pynvml.nvmlShutdown()
     except Exception:
         pass
     try:
         out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", "-i", token,
+             "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=10)
         if out.returncode == 0 and out.stdout.strip():
             return float(out.stdout.strip().splitlines()[0]) / 1024.0
     except Exception:
         pass
     return None
+
+
+def free_vram_by_device() -> list[float] | None:
+    """Free VRAM per visible device, or None if the pool cannot be sized from VRAM at all.
+
+    All-or-nothing on purpose: a partial answer (card 0 probed, card 1 didn't) would understate the
+    budget on one card and silently overbook the other. None sends the caller to the core cap,
+    which is the honest fallback.
+    """
+    gpus = visible_gpus()
+    if not gpus:
+        return None
+    frees = [free_vram_gb(d) for d in gpus]
+    return None if any(f is None for f in frees) else [f for f in frees if f is not None]
 
 
 def usable_cores() -> int:
@@ -130,15 +191,23 @@ def autosize_procs(*, holdout_games: int, requested=None,
     cpu_cap = max(1, cores // max(1, config.EVAL_PROC_CORES))
     work_cap = max(1, holdout_games // MIN_GAMES_PER_SHARD)
 
-    free = free_vram_gb()
+    per_device = free_vram_by_device()
     caps = [cpu_cap, work_cap, config.EVAL_PROC_MAX]
-    if free is None:
+    if per_device is None:
         vram_why = "vram unknown"
     else:
-        vram_cap = max(1, int((free - reserved_vram_gb) // config.EVAL_PROC_VRAM_GB))
+        # Children are spread one-per-card by shard_commands, so the budget is the SUM over cards
+        # -- but a resident model sits on the first visible device only (TF places on /GPU:0 unless
+        # told otherwise), so that card alone pays for it.
+        budgets = [f - (reserved_vram_gb if i == 0 else 0.0) for i, f in enumerate(per_device)]
+        vram_cap = max(1, sum(max(0, int(b // config.EVAL_PROC_VRAM_GB)) for b in budgets))
         caps.append(vram_cap)
-        vram_why = (f"vram ({free:.1f}-{reserved_vram_gb:.1f})/"
-                    f"{config.EVAL_PROC_VRAM_GB:g}={vram_cap}")
+        if len(budgets) == 1:
+            vram_why = (f"vram ({per_device[0]:.1f}-{reserved_vram_gb:.1f})/"
+                        f"{config.EVAL_PROC_VRAM_GB:g}={vram_cap}")
+        else:
+            vram_why = (f"vram {'+'.join(f'{b:.1f}' for b in budgets)} /"
+                        f"{config.EVAL_PROC_VRAM_GB:g}={vram_cap} over {len(budgets)} gpus")
 
     n = max(1, min(caps))
     why = (f"procs {n}  (cpu {cores}/{config.EVAL_PROC_CORES}={cpu_cap}, {vram_why}, "
@@ -153,11 +222,12 @@ def autosize_procs(*, holdout_games: int, requested=None,
 
 @dataclass
 class Shard:
-    """One child process: the command that runs it and where its output lands."""
+    """One child process: the command that runs it, the card it runs on, where its output lands."""
     index: int
     total: int
     cmd: list[str]
     log: Path
+    gpu: str | None = None
     proc: subprocess.Popen | None = None
     rc: int | None = None
     _fh: object = field(default=None, repr=False)
@@ -173,8 +243,8 @@ class Shard:
 
 def shard_commands(*, model: str | None, run: str, n: int, dials_path, state_path,
                    run_dir, sims=None, concurrency=None, seed=0, python: str | None = None,
-                   tag: str = "", subset=None) -> list[Shard]:
-    """Build the N ``evaluate.py --shard i/N`` commands and their log paths.
+                   tag: str = "", subset=None, gpus=None) -> list[Shard]:
+    """Build the N ``evaluate.py --shard i/N`` commands, their cards, and their log paths.
 
     ``dials_path`` is required, not optional: it is the only thing stopping a child from re-reading
     ``config.py`` and running different physics than the parent that launched it. ``report_every``
@@ -183,10 +253,19 @@ def shard_commands(*, model: str | None, run: str, n: int, dials_path, state_pat
 
     ``subset`` (--holdout N) is forwarded for the record, so a shard log shows the run's real shape;
     the run dir's pinned ``holdout.json`` is what actually governs which games a child sees.
+
+    ``gpus`` (default: every visible device) is dealt round-robin, one card per shard, and applied
+    as ``CUDA_VISIBLE_DEVICES`` at launch. Nothing in the stack is multi-GPU -- TensorFlow places
+    every op on ``/GPU:0`` absent a distribution strategy -- so on a 2-card box an unpinned pool
+    piles all N children onto card 0 and leaves card 1 idle at 0%. Processes are already the unit
+    of parallelism here, so one card per child is the whole fix. A single visible card is left
+    unpinned: there is nothing to spread, and inheriting the caller's environment untouched is the
+    smaller change.
     """
     python = python or sys.executable
     logs = Path(run_dir) / "logs"
     logs.mkdir(parents=True, exist_ok=True)
+    cards = list(visible_gpus() if gpus is None else gpus)
 
     shards = []
     for i in range(1, n + 1):
@@ -203,6 +282,7 @@ def shard_commands(*, model: str | None, run: str, n: int, dials_path, state_pat
         if subset:
             cmd += ["--holdout", str(subset)]
         shards.append(Shard(index=i, total=n, cmd=cmd,
+                            gpu=cards[(i - 1) % len(cards)] if len(cards) > 1 else None,
                             log=logs / f"shard{tag}-{i}of{n}.log"))
     return shards
 
@@ -234,6 +314,10 @@ def _launch(shard: Shard, *, cwd) -> None:
     # Without this the second child dies the moment it touches the GPU: TF grabs the whole card by
     # default, so children 2..N would find nothing left.
     env.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
+    if shard.gpu is not None:
+        # Assign, don't setdefault: the parent's own CUDA_VISIBLE_DEVICES is what shard_commands
+        # dealt these cards out of, so overwriting it hands this child its share of that same list.
+        env["CUDA_VISIBLE_DEVICES"] = shard.gpu
     shard._fh = open(shard.log, "w", encoding="utf-8", errors="replace")
     # Both streams into the log file, stdin closed: the supervisor never holds a pipe to drain, so
     # it cannot deadlock behind a child that out-writes the buffer.
@@ -274,6 +358,10 @@ def run_pool(shards: list[Shard], *, run_dir, total_games: int, cwd=REPO_ROOT,
     run_dir = Path(run_dir)
     start = time.monotonic()
     started = finished_games(run_dir)
+    cards = [s.gpu for s in shards if s.gpu is not None]
+    if len(set(cards)) > 1:
+        spread = ", ".join(f"cuda:{c} x{cards.count(c)}" for c in sorted(set(cards)))
+        echo(f"[pool] {len(shards)} shards over {len(set(cards))} gpus: {spread}")
     try:
         for s in shards:
             _launch(s, cwd=cwd)
@@ -359,7 +447,8 @@ def report_failures(shards, *, echo=print, tail_lines: int = 40) -> list[Shard]:
                 echo("    " + line)
         except OSError as e:
             echo(f"    (could not read log: {e})")
-        echo("  re-run just this shard:\n    " + " ".join(s.cmd))
+        pin = f"CUDA_VISIBLE_DEVICES={s.gpu} " if s.gpu is not None else ""
+        echo("  re-run just this shard:\n    " + pin + " ".join(s.cmd))
     return failed
 
 

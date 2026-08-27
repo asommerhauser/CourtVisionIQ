@@ -497,7 +497,8 @@ python evaluate.py --model v1.0 --run trial1 --procs 4      # or --procs auto
   unchanged.
 - **`--procs`** — how many eval **processes** run at once over disjoint slices of the holdout.
   A third, separate knob: `--concurrency` fills the GPU inside one process, `--procs` uses the rest
-  of the machine. `auto` sizes it from usable cores and free VRAM. Throughput only.
+  of the machine. `auto` sizes it from usable cores and free VRAM (summed over every visible card).
+  Throughput only.
 - **`--holdout N`** — evaluate an N-game **subset**: every `total//N`-th game, so the sample spans
   the whole holdout window instead of bunching at one end of a chronological list. Distinct from
   `--games`, which caps *new* games per call and leaves the denominator at the full holdout; this
@@ -552,6 +553,15 @@ usable cores, free VRAM, and how many games are left — printing which of those
 is byte-for-byte the single-process path. The same works in the shell: `run trial1 --procs 4`.
 Both forms need `training/full_run_state.json` on the machine, since every child is a fresh
 `evaluate.py`; without it the shell refuses by name and tells you to run without `--procs`.
+
+**Multiple GPUs.** Nothing in the model stack is multi-GPU — absent a distribution strategy,
+TensorFlow places every op on `/GPU:0` — so the pool spreads the *processes* instead: shard *i* is
+launched with `CUDA_VISIBLE_DEVICES` set to card `(i-1) % <visible cards>`. On a 2×H100 pod
+`--procs 16` runs 8 children per card and the pool prints the split before it launches
+(`[pool] 16 shards over 2 gpus: cuda:0 x8, cuda:1 x8`). Auto-sizing budgets each card separately
+and sums them, charging a resident shell model to card 0 only. Pin the pool to a subset by exporting
+`CUDA_VISIBLE_DEVICES` yourself — the shards are then dealt round-robin out of exactly that list —
+and a single visible card is left unpinned, so the one-GPU path is unchanged.
 
 Under the hood, `--shard I/N` is a first-class flag, so you can also drive the split by hand (across
 two machines, say): run `--shard 1/N .. N/N` with the same `--run`, then `--report-only` to merge.
