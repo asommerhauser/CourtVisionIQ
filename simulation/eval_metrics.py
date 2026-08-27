@@ -127,6 +127,37 @@ def _stat_errors(pairs: list[tuple[float, float]]) -> dict:
             "mae": float(np.abs(err).mean()), "bias": float(err.mean())}
 
 
+# --------------------------------------------------------------------------- minutes closeness
+
+def minutes_closeness(records: list[dict], *, within=(2, 5, 10)) -> dict:
+    """How close the sims get a player's minutes, pooled over every player-game.
+
+    MAE is the headline: the average miss on one player's minutes. ``within`` adds the same
+    within-N read the spread block uses -- the share of player-games called inside N minutes.
+
+    Bias is reported but is near-zero by construction (a team hands out ~240 player-minutes a game,
+    so a minute given to the wrong player is taken from the right one); MAE is the number that
+    survives that cancellation.
+    """
+    err = []
+    for r in records:
+        for side in ("home", "away"):
+            for name in r["players"][side]:
+                err.append(stat_value(r["player_avg"][side][name], MINUTES)
+                           - stat_value(r["player_actual"][side].get(name, {}), MINUTES))
+    e = np.asarray(err, float)
+    if not e.size:
+        return {"n_player_games": 0, "mae": 0.0, "bias": 0.0,
+                "within": {str(w): 0.0 for w in within}}
+    abs_err = np.abs(e)
+    return {
+        "n_player_games": int(e.size),
+        "mae": float(abs_err.mean()),
+        "bias": float(e.mean()),
+        "within": {str(w): float((abs_err <= w).mean()) for w in within},
+    }
+
+
 # --------------------------------------------------------------------------- set-level
 
 def _aggregate_core(records: list[dict]) -> dict:
@@ -312,5 +343,5 @@ def print_summary(agg: dict, n_games: int, n_sims: int) -> None:
 
 __all__ = [
     "spread_metrics", "win_metrics", "score_win_view", "_aggregate", "_aggregate_core",
-    "progression", "_stat_errors", "_BOX_ACCURACY_STATS",
+    "progression", "_stat_errors", "_BOX_ACCURACY_STATS", "minutes_closeness",
 ]
