@@ -398,6 +398,8 @@ def cmd_prune_finished(run_dir: Path, names_file: Path, *, log: Log, dry_run: bo
     and the whole operation is refused rather than half-applied.
     """
     require_no_live_pool(log, force=force)
+    if not names_file.is_file():
+        raise SystemExit(f"No such --already-home file: {names_file}")
     wanted = [ln.strip() for ln in names_file.read_text(encoding="utf-8").splitlines()]
     wanted = [w for w in wanted if w and not w.startswith("#")]
     if not wanted:
