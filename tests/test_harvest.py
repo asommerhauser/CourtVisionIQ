@@ -197,18 +197,26 @@ def test_prune_unfinished_clears_part_written_folders_only(run_dir, tmp_path, lo
     assert (run_dir / "games" / "game1_2023-01-10_AatH" / "playbyplay").is_dir()
 
 
-@pytest.mark.parametrize("mode", ["finished", "unfinished"])
-def test_pruning_refuses_while_a_shard_is_alive(run_dir, tmp_path, log, monkeypatch, mode):
+@pytest.fixture
+def live_shard(monkeypatch):
     monkeypatch.setattr(harvest, "live_evals",
                         lambda *a, **k: [(4242, "python evaluate.py --shard 1/16")])
+
+
+def test_prune_unfinished_refuses_while_a_shard_is_alive(run_dir, log, live_shard):
+    """A part-written folder is exactly what a live shard is streaming into."""
+    with pytest.raises(SystemExit):
+        harvest.cmd_prune_unfinished(run_dir, log=log, dry_run=False, force=False)
+    assert (run_dir / "games" / "game3_2023-01-12_AatH" / "playbyplay").is_dir()
+
+
+def test_prune_finished_still_runs_beside_a_live_pool(run_dir, tmp_path, log, live_shard):
+    """A game with a record.json is skipped by the resume path, so nothing is writing to it."""
     names = tmp_path / "already-home.txt"
     names.write_text("game1_2023-01-10_AatH\n", encoding="utf-8")
-    with pytest.raises(SystemExit):
-        if mode == "finished":
-            harvest.cmd_prune_finished(run_dir, names, log=log, dry_run=False, force=False)
-        else:
-            harvest.cmd_prune_unfinished(run_dir, log=log, dry_run=False, force=False)
-    assert (run_dir / "games" / "game1_2023-01-10_AatH" / "playbyplay").is_dir()
+    n, freed = harvest.cmd_prune_finished(run_dir, names, log=log, dry_run=False, force=False)
+    assert n == 1 and freed > 0
+    assert not (run_dir / "games" / "game1_2023-01-10_AatH" / "playbyplay").exists()
     assert (run_dir / "games" / "game3_2023-01-12_AatH" / "playbyplay").is_dir()
 
 
