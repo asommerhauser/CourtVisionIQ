@@ -168,8 +168,15 @@ def live_evals(pattern: str = "evaluate.py") -> list[tuple[int, str]] | None:
     return found
 
 
-def require_no_live_pool(log: Log, *, force: bool) -> None:
-    """Refuse to prune while a shard runs -- its in-flight folder is exactly the one with no record."""
+def require_no_live_pool(log: Log, *, force: bool, fatal: bool = True) -> None:
+    """Report -- and usually refuse -- when a shard is still running.
+
+    ``fatal=True`` is the rule for anything that touches folders without a ``record.json``: those are
+    exactly the folders a live shard owns, and deleting one mid-game throws away sims it is still
+    streaming. ``fatal=False`` is for the finished-only path, which is race-free for the same reason
+    the archiver is -- a game with a record is never re-simulated -- so a live pool is worth saying
+    out loud but is not a reason to stop.
+    """
     procs = live_evals()
     if procs is None:
         log("WARNING: no /proc on this platform; cannot confirm the pool is stopped.")
@@ -178,6 +185,10 @@ def require_no_live_pool(log: Log, *, force: bool) -> None:
         return
     for pid, cmd in procs:
         log(f"  live: pid {pid}  {cmd[:120]}")
+    if not fatal:
+        log(f"NOTE: {len(procs)} evaluate.py process(es) alive. Every game named here has a "
+            f"{RECORD} and is skipped by the resume path, so none of them is being written to.")
+        return
     if force:
         log(f"WARNING: {len(procs)} evaluate.py process(es) alive; --force given, continuing anyway.")
         return
@@ -397,7 +408,9 @@ def cmd_prune_finished(run_dir: Path, names_file: Path, *, log: Log, dry_run: bo
     ``record.json`` *here* -- one that does not means the two machines disagree about what finished,
     and the whole operation is refused rather than half-applied.
     """
-    require_no_live_pool(log, force=force)
+    # Not fatal here: every name is checked below for a record.json, and a game with a record is
+    # never re-simulated -- so this is the one prune that is safe beside a running pool.
+    require_no_live_pool(log, force=force, fatal=False)
     if not names_file.is_file():
         raise SystemExit(f"No such --already-home file: {names_file}")
     wanted = [ln.strip() for ln in names_file.read_text(encoding="utf-8").splitlines()]
