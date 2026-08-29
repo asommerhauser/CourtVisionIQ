@@ -3,6 +3,11 @@
 The pitch as written, with notes under each paragraph on what it means and where the
 soft spots are.
 
+> **Numbers reviewed 2026-08-29 against eval run `full4-s100`** (100 held-out games, 100 sims
+> each). Two paragraphs below need their figures restated before the pitch is given again — both
+> are flagged in-line. The good news is that the biggest soft spot in the old version, the scoring
+> shortfall, is closed.
+
 ---
 
 > CourtVisionIQ is a generative world-model for basketball. It applies the same class of
@@ -17,8 +22,12 @@ possession by possession and then look at who won. The win probability is what f
 running it many times, not what we calculate. That's the whole difference, and everything else
 in the pitch depends on it.
 
-If asked how many times we run it: tens of simulations per matchup in the runs these numbers
-come from. More is a compute dial, not a different model.
+If asked how many times we run it: **a hundred simulations per matchup** in the current numbers
+(earlier runs used 21). More is a compute dial, not a different model.
+
+If asked what "a large transformer" means here: eleven of them, one per decision the game asks
+(what happens next and when, who does it, was it a two or a three, did it go in, who checks in
+off the bench), about 140 million parameters combined, trained on 21 seasons of play-by-play.
 
 ---
 
@@ -30,10 +39,17 @@ come from. More is a compute dial, not a different model.
 > by decades of capital and every data source available, sits near 0.19. We are one version in,
 > and the gap between us and the sharpest money in sports is three hundredths.
 
-**Notes.** Brier score grades probabilities, not just picks — being confident and wrong costs you.
-Coin flip is 0.250, lower is better. It's the standard metric in forecasting.
+**⚠ Restate the numbers.** The 67 percent is from a single run and has not repeated. Across five
+runs on the same 100-game holdout, pick accuracy has come in at 61, 66, 62, 65 and 63 percent.
+**Say "mid-60s", not 67.** The Brier score is the stable one and it has if anything improved:
+**0.217** at the latest run, versus 0.2176 when that line was written.
 
-Two things to know:
+Why accuracy bounces and Brier doesn't: at 100 games, one game is a full percentage point, and
+pick accuracy throws away how confident we were. Brier grades the probability itself, so it uses
+all the information and moves less. Lead with Brier — it is also the number the comparisons are
+denominated in.
+
+Two other things to know:
 
 - FiveThirtyEight was shut down in 2025. Use past tense or a sports-analytics audience will
   catch it.
@@ -49,17 +65,27 @@ Two things to know:
 > pace, and well under a single assist of bias on playmaking. The win condition is one of the many
 > things we can measure, not the whole of what we do.
 
-**Notes.** Those three are real: pace bias is +0.04 possessions, shot attempts +1.6, assists
-−0.33. "Bias" means systematically off in a direction, which is the number that matters for a
-simulator — individual games are supposed to vary.
+**Notes.** Current figures, all "bias" — systematically off in a direction, which is the number
+that matters for a simulator, since individual games are supposed to vary:
 
-The soft spot: **simulated teams score about 11–12 points too few per game** (104 vs a real 116).
-The shape of the game is right; the finishing rates run low and we draw too few free throws.
-It's diagnosed, the fix is in the code, and the confirming run hasn't happened yet.
+| | Simulated | Real | Bias |
+|---|---|---|---|
+| Points per team | 115.4 | 115.9 | −0.5 |
+| Pace (possessions) | 101.1 | 100.7 | +0.5 |
+| Shot attempts | 89.3 | 88.1 | +1.2 |
+| Assists | 23.4 | 25.3 | −2.0 |
 
-So: don't claim projected totals or over/unders work today. If someone asks what we'd project for
-a game total, say it's the open calibration item and route it to Alec. It doesn't affect the win
-probability numbers above.
+**The scoring shortfall is fixed.** The old version of these notes flagged that simulated teams
+scored 11–12 points too few per game and said the confirming run hadn't happened. It has, four
+times over: points-per-team bias went from −11.5 to −0.5. Do not repeat the old caveat.
+
+The line to update is **assists**: the pitch says "well under a single assist of bias" and we are
+now at −2.0. Either say "within about two assists" or drop the assist clause and lead with points
+and pace, which are both inside half a unit.
+
+What's still honestly soft, if someone digs: effective field-goal percentage runs about 1.7 points
+low and we take about 2.3 too many threes. Both are on the list for the next training run, which
+teaches the model shot *location* rather than just two-versus-three.
 
 ---
 
@@ -69,8 +95,12 @@ probability numbers above.
 > manpower, are ones we already know how to pull.
 
 **Notes.** Worth raising the sample size yourself rather than waiting to be challenged on it. A
-hundred games is directional, not settled. The reason it isn't a thousand is GPU hours, not
-capability — the same harness runs the thousand unchanged.
+hundred games is directional, not settled — the accuracy bounce in paragraph two is exactly what a
+hundred-game sample looks like. The reason it isn't a thousand is GPU hours, not capability: the
+same harness runs the thousand unchanged.
+
+We have since pulled one of those levers ourselves — the latest run is 100 simulations per game
+instead of 21, five times the compute, and it is what tightened the box-score numbers above.
 
 Also true and worth saying if cost comes up: this is cheap by AI standards. A full train plus
 evaluation is dollars of rented GPU time. Basketball has a few hundred things that can happen;
@@ -93,16 +123,36 @@ without the player and reads the difference. That's an experiment, not a coeffic
 
 Tracking data needs a license — commercial terms go to Alec.
 
-One thing the model genuinely does not do yet: it doesn't track the score and clock, so
-end-of-game and clutch behavior isn't modeled. If someone asks about crunch time, say it's a
-known roadmap item. Don't claim it.
+Two things the model genuinely does not do yet, both roadmap items, neither claimable:
+
+- **It doesn't track the score and clock**, so end-of-game and clutch behavior isn't modeled. The
+  inputs are wired up and tested; the next training run is the first whose weights will use them.
+  If someone asks about crunch time, say it's the next train.
+- **Player minutes miss by about 5.7 minutes on average.** Minutes multiply every per-player stat,
+  so this is the ceiling on projected box scores for any individual player. Team totals are fine
+  (team minutes are off by under 2 of 241) — it's the split across the roster that's loose.
 
 ---
+
+## The one question to route, not answer
+
+**"Does it beat just using a player's season average?"** On per-player box scores, not yet — the
+model was about 8 percent behind season-to-date averages the last time we scored it head to head,
+though that gap has closed a long way (it was 44 percent behind in June) and the check hasn't been
+re-run against the current numbers. It's the honest open item and the team knows it. Don't
+volunteer it, don't deny it, and route the detail to Alec.
+
+The framing if pressed: NBA box scores are strongly mean-reverting, so season averages are a hard
+baseline to beat and beating them is not what a simulator is *for*. What the simulator gives you
+that an average cannot is the whole joint distribution — this player's line **given** this pace,
+this defense, this foul trouble, this game state — plus the counterfactuals. But that's an
+explanation, not a win, and it shouldn't be delivered as one.
 
 ## Route to Alec
 
 Data sources and licensing, commercial terms, anything score-level (totals, over/unders),
-production latency, feature timelines, other sports, deployment.
+production latency, feature timelines, other sports, deployment, and the season-average comparison
+above.
 
 "I'd rather have that exactly right than fast — let me get you Alec" is a fine answer and costs
 nothing.
