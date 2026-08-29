@@ -4,6 +4,23 @@ Scope agreed 2026-08-25. Four items, one free rider. Everything here targets the
 metrics — per-player box MAE and score MAE — plus year-to-year generalization for upcoming-season
 prediction (age, coach).
 
+> **Status 2026-08-29: nothing in this spec has been built yet.** Item 1's plumbing predates the
+> spec and is still the only thing in place; there is no `CLUTCH_LOSS_WEIGHT`, no zone vocabulary,
+> and no external age/coach tables in the tree. The spec below stands as written.
+>
+> Two things measured since it was agreed are worth carrying into the work:
+>
+> - **The score-MAE target moved.** `full4-s100` (100 games × 100 sims) put team points bias at
+>   −0.52 and pace bias at +0.47 — the scoring shortfall this spec was partly aimed at is now
+>   closed by dials. What remains on the shooting side is the *composition* problem item 3 attacks
+>   directly: eFG runs 1.7 points low while 3PA runs 2.3 attempts high. That strengthens the case
+>   for shot zones and weakens the case for further blunt eFG dialing.
+> - **Per-player minutes are now scored**, and they miss by **5.66 minutes** (MAE, `full4-s100`).
+>   Minutes multiply every per-player counting stat, so this is plausibly the largest single term
+>   in the per-player box MAE this train is targeting — and nothing in this spec addresses it. The
+>   rotation-minutes model stays parked below, but that parking is now a measured trade rather
+>   than an assumed one.
+
 | # | Item | New data source? | New model? | Status |
 |---|------|------------------|-----------|--------|
 | 1 | Game-state features (score / period / clock / team fouls) | no (derived) | no | **Plumbing already built** — activates with this train |
