@@ -359,11 +359,17 @@ few dollars of rented GPU time.
 
 ## 10. Future Work
 
-**Train 3** (specified in `docs/train3_spec.md`, not yet built): activate the game-state features;
-weight the loss toward close-and-late rows; expand `shot_type` from `{2pt, 3pt}` to seven court
-zones derived from the raw shot coordinates already on disk, so per-player-per-zone make rates are
-learned instead of dialed; add player age and coach (rolling team style priors plus a coach
-embedding) for year-to-year generalization.
+**Version 2** (theories in `docs/v2_theories.md`; nothing agreed or built): activate the
+game-state features; weight the loss toward close-and-late rows; expand `shot_type` from
+`{2pt, 3pt}` to seven court zones derived from the raw shot coordinates already on disk, so
+per-player-per-zone make rates are learned instead of dialed; add player age and coach (rolling
+team style priors plus a coach embedding) for year-to-year generalization.
+
+A second cluster of theories moves rules the simulator currently hard-codes into the data itself:
+free-throw counts (the rollout awards three free throws roughly twelve times too often, because the
+count is decided by a branch reading a head trained not to answer that question), the fouled player
+(present in the raw data, dropped by the cleaner), and a loss mask that would stop the event head
+from training on the ~22% of positions the rollout never visits.
 
 **Beyond that:**
 

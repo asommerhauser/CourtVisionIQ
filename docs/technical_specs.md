@@ -4,7 +4,7 @@
 
 **Status: current as of 2026-08-29 (model `v1.0`, eval run `full4-s100`).** Everything described
 here is built and running unless a line says otherwise; forward-looking work is confined to
-[Open work](#open-work) and `docs/train3_spec.md`.
+[Open work](#open-work) and `docs/v2_theories.md`.
 
 ---
 
@@ -616,16 +616,25 @@ either existed, with no retrain.
 
 ## Open work
 
-### Committed — train 3 (see `docs/train3_spec.md`)
+### Under consideration — v2 theories (see `docs/v2_theories.md`)
 
-| Item | Status |
-|---|---|
-| Game-state features (score / period / clock / team fouls) | Plumbing built and tested; **activates with the next full train** |
-| Clutch loss weighting | To build (rides on the existing `sample_weight` masks) |
-| Shot zones — expand `shot_type` from `{2pt, 3pt}` to 7 court zones | To build; changes the shared vocab, so it forces a full retrain |
-| Player age (external roster table) | To build |
-| Coach (rolling team style priors + coach embedding) | To build |
-| FT index (`num`/`outof`) — free rider | Cleaner change only |
+**Nothing below is agreed or built.** The theory doc carries the reasoning and the measurements
+behind each one. Ids are its own: `S` = schema (what the event stream should carry), `M` = model
+and training (how it consumes that stream).
+
+| # | Theory | Note |
+|---|---|---|
+| S1 | Shot zones — expand `shot_type` from `{2pt, 3pt}` to 7 court zones | Changes the shared vocab, so it forces a full retrain |
+| S2 | Free-throw count as a learned outcome (`shooting 2pt` / `shooting 3pt`) | The sim currently awards 3 FTs ~12x too often |
+| S3 | Fouled player as `secondary_player` on foul rows | Raw `opponent` is 98.1% populated and currently dropped |
+| S4 | Collapse the steal pair into one turnover row | Matches the pattern `block` already uses |
+| S5 | FT index (`num`/`outof`) | Cleaner change; also the label that makes S2 possible |
+| S6 | Player age (external roster table) | The name-matching join is the real work |
+| S7 | Coach (rolling team style priors + coach embedding) | External table |
+| M1 | Game-state features (score / period / clock / team fouls) | Plumbing built and tested; needs a train that consumes it |
+| M2 | Clutch loss weighting | Rides the existing `sample_weight` masks |
+| M3 | Recency / local-sequence bias in the backbone | Touches all 11 heads |
+| M4 | Play-boundary loss masking | 21.9% of event-head training positions never occur at inference |
 
 ### Parked
 
