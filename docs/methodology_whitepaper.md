@@ -359,7 +359,7 @@ few dollars of rented GPU time.
 
 ## 10. Future Work
 
-**Version 2** (theories in `docs/v2_theories.md`; nothing agreed or built): activate the
+**Version 2** (decided change set in `docs/v2_planned_changes.md`; nothing built yet): activate the
 game-state features; weight the loss toward close-and-late rows; expand `shot_type` from
 `{2pt, 3pt}` to seven court zones derived from the raw shot coordinates already on disk, so
 per-player-per-zone make rates are learned instead of dialed; add player age and coach (rolling

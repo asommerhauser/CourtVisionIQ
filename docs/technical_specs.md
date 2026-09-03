@@ -4,7 +4,7 @@
 
 **Status: current as of 2026-08-29 (model `v1.0`, eval run `full4-s100`).** Everything described
 here is built and running unless a line says otherwise; forward-looking work is confined to
-[Open work](#open-work) and `docs/v2_theories.md`.
+[Open work](#open-work) and `docs/v2_planned_changes.md`.
 
 ---
 
@@ -616,11 +616,11 @@ either existed, with no retrain.
 
 ## Open work
 
-### Under consideration — v2 theories (see `docs/v2_theories.md`)
+### Decided for v2 (see `docs/v2_planned_changes.md`)
 
-**Nothing below is agreed or built.** The theory doc carries the reasoning and the measurements
-behind each one. Ids are its own: `S` = schema (what the event stream should carry), `M` = model
-and training (how it consumes that stream).
+**Nothing below is built.** The planned-changes doc is the authority; it promotes the theories
+listed here into numbered changes (`R` rules, `D` schema, `F` features) or parks them with a
+reason. Ids below are the original theory ids; the doc's Appendix B maps them.
 
 | # | Theory | Note |
 |---|---|---|

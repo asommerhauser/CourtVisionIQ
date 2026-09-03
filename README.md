@@ -9,7 +9,7 @@ holdout games. Built on **TensorFlow 2.20 / Keras 3**.
 
 - `docs/methodology_whitepaper.md` — the modeling approach.
 - `docs/technical_specs.md` — architecture / data details.
-- `docs/v2_theories.md` — theories we are weighing for a version 2; nothing agreed or built.
+- `docs/v2_planned_changes.md` — Model 2: the decided change set (rules, schema, features, rotation); nothing built yet.
 
 ## Where it stands
 
