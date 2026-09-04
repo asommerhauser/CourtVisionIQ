@@ -620,7 +620,7 @@ either existed, with no retrain.
 
 **Nothing below is built.** The planned-changes doc is the authority; it promotes the theories
 listed here into numbered changes (`R` rules, `D` schema, `F` features) or parks them with a
-reason. Ids below are the original theory ids; the doc is organized by workstream.
+reason. Ids below are the original theory ids; the doc is organized by feature.
 
 | # | Theory | Note |
 |---|---|---|
