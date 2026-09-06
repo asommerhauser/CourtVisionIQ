@@ -1,0 +1,13 @@
+# Test-only dependencies, on top of requirements.txt (or requirements-gpu.txt).
+#
+# The suite in tests/ needs pytest, which is in neither runtime file -- so a fresh venv
+# could install every requirement and still not run a single test. Install with:
+#
+#     python -m pip install -r requirements-dev.txt
+#
+# and invoke as `python -m pytest`, which uses the active interpreter whether or not the
+# console script landed on PATH.
+#
+# Floor-pinned rather than exact-pinned like the runtime files: nothing here ships, and the
+# suite does not use any API that moves between minor versions.
+pytest>=8.0
