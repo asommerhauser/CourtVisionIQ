@@ -146,14 +146,20 @@ def test_predict_next_returns_raw_distribution(tmp_path):
     assert np.isfinite(pred["delta_seconds"])
 
 
-def test_possession_flips_on_change_of_possession(tmp_path):
+def test_the_simulator_does_not_track_possession(tmp_path):
+    """Possession lives on GameController alone; the simulator kept a second, disagreeing copy.
+
+    It flipped off result tokens, so a made FG (not a flip result) never moved it while the
+    controller's did, and a steal — two rows, both flip results — moved it twice for the
+    controller's one. Nothing ever read it but a test.
+    """
     sim = _load_sim(tmp_path)
-    sim.start_game(HOME_FIVE, AWAY_FIVE, possession="home", season="2003")
+    sim.start_game(HOME_FIVE, AWAY_FIVE, season="2003")
     sim.append_event("shot", "A", "2pt", "missed")
-    assert sim.possession == "home"           # a miss alone does not flip
     sim.append_event("rebound", "F", "defensive", "cop")
-    assert sim.possession == "away"            # change-of-possession outcome flips it
-    assert sim.history[-1]["possession"] == "away"
+
+    assert not hasattr(sim, "possession")
+    assert "possession" not in sim.history[-1]      # and no dead column on every row
 
 
 def test_substitution_swaps_roster(tmp_path):

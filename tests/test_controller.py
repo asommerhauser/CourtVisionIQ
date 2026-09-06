@@ -87,13 +87,13 @@ class FakeSim:
         self.calls.append(("stint", incoming, outgoing))
         return self.stint_seconds
 
-    def start_alternating(self, home_full, away_full, *, possession=HOME, season="2003",
+    def start_alternating(self, home_full, away_full, *, season="2003",
                           tipoff_time=0.0, greedy=False, greedy_starters=False,
                           season_context=None):
         self.calls.append(("start_alternating", greedy, greedy_starters))
 
     def start_with_starters(self, home_full, away_full, home_starters, away_starters,
-                            *, possession=HOME, season="2003", tipoff_time=0.0,
+                            *, season="2003", tipoff_time=0.0,
                             season_context=None):
         self.calls.append(("start_with_starters", list(home_starters), list(away_starters)))
         # The real simulator copies the full rosters here too (game_simulator.py:777) — keep
@@ -497,6 +497,129 @@ def test_fouls_before_the_window_do_not_count_toward_it():
     assert ctrl._in_bonus(AWAY) is False         # two period fouls, none in the window
 
 
+# ===================================================================== #
+# Dead-ball state — what actually stops play (and so allows substitutions)
+# ===================================================================== #
+
+def test_a_foul_kills_the_ball():
+    ctrl = make_controller(HOME)
+    ctrl.ball_dead = False
+    ctrl.sim.script(player=["F"], type=["personal"])   # defensive common foul, no FTs
+    ctrl._do_foul(delta=5.0)
+    assert ctrl.ball_dead is True
+
+
+def test_a_steal_stays_live_but_a_plain_turnover_kills_the_ball():
+    live = make_controller(HOME)
+    live.ball_dead = False
+    live.sim.script(player=["A", "F"], type=["steal"])
+    live._do_turnover(delta=5.0)
+    assert live.ball_dead is False              # the defense is already going the other way
+
+    dead = make_controller(HOME)
+    dead.ball_dead = False
+    dead.sim.script(player=["A"], type=["error"])
+    dead._do_turnover(delta=5.0)
+    assert dead.ball_dead is True               # whistle: out of bounds, travel
+
+
+def test_a_live_rebound_keeps_the_ball_live():
+    ctrl = make_controller(HOME)
+    config.DEADBALL_REBOUND_PROB = 0.0          # force the individual-rebound path
+    ctrl.ball_dead = True
+    ctrl.sim.script(type=["defensive"], player=["F"])
+    ctrl._do_rebound(delta=2.0)
+    assert ctrl.ball_dead is False
+
+
+def test_a_team_rebound_kills_the_ball():
+    ctrl = make_controller(HOME)
+    config.DEADBALL_REBOUND_PROB = 1.0          # force the dead-ball rebound path
+    ctrl.ball_dead = False
+    ctrl._do_rebound(delta=2.0)
+    assert ctrl.ball_dead is True
+
+
+def test_a_made_basket_only_stops_the_clock_late_in_the_period():
+    # Q1 with 1:30 left — the clock keeps running, so this is not a substitution opportunity.
+    early = make_controller(HOME)
+    early.clock = PERIOD_LENGTH - 90
+    early.sim.script(player=["A"], type=["2pt"], result=["made"])
+    early._do_shot(delta=5.0)
+    assert early.ball_dead is False
+
+    # Same 1:30 left, but in Q4 — the window is two minutes there, so the ball is dead.
+    late = make_controller(HOME)
+    late.clock = REGULATION - 90
+    late.sim.script(player=["A"], type=["2pt"], result=["made"])
+    late._do_shot(delta=5.0)
+    assert late.ball_dead is True
+
+
+def test_a_missed_shot_leaves_the_ball_live():
+    ctrl = make_controller(HOME)
+    ctrl.ball_dead = True
+    ctrl.sim.script(player=["A"], type=["2pt"], result=["missed"])
+    ctrl._do_shot(delta=5.0)
+    assert ctrl.ball_dead is False and ctrl.pending_rebound is True
+
+
+def test_the_last_free_throw_decides_whether_the_ball_is_live():
+    missed = make_controller(HOME)
+    missed.sim.script(result=["made", "missed"])
+    missed._free_throws("A", HOME, 2, live_last=True, retain=False)
+    assert missed.ball_dead is False            # missed last FT → live rebound
+    assert missed.pending_rebound is True
+
+    made = make_controller(HOME)
+    made.sim.script(result=["missed", "made"])
+    made._free_throws("A", HOME, 2, live_last=True, retain=False)
+    assert made.ball_dead is True               # made last FT → the other team inbounds
+
+
+def test_a_period_boundary_kills_the_ball():
+    ctrl = make_controller(HOME)
+    ctrl.ball_dead = False
+    ctrl.clock = PERIOD_LENGTH + 1              # into Q2
+    ctrl._check_period()
+    assert ctrl.ball_dead is True
+
+
+# ===================================================================== #
+# No play straddles a period boundary
+# ===================================================================== #
+
+def test_a_sampled_gap_is_clamped_at_the_buzzer():
+    ctrl = make_controller(HOME)
+    ctrl.clock = PERIOD_LENGTH - 10             # 10s left in Q1
+    ctrl._advance_clock(600.0)                  # a gap that would run deep into Q2
+    assert ctrl.clock == PERIOD_LENGTH          # stopped exactly at the buzzer, not past it
+
+
+def test_the_clamp_does_not_stall_the_clock_at_a_boundary():
+    """Sitting exactly on a boundary must advance into the next period, not deadlock."""
+    ctrl = make_controller(HOME)
+    ctrl.clock = float(PERIOD_LENGTH)
+    ctrl._advance_clock(10.0)
+    assert ctrl.clock > PERIOD_LENGTH
+
+
+def test_scheduled_subs_wait_for_a_dead_ball():
+    ctrl = GameController(FakeSim(scheduler=True, stint_seconds=300.0), seed=0)
+    ctrl.sim.home_full = HOME_FIVE + ["K"]
+    ctrl.stint_target_clock = {p: 100.0 for p in HOME_FIVE}
+    ctrl.clock = 400.0                          # everybody is overdue
+
+    ctrl.ball_dead = False
+    ctrl._process_scheduled_subs()
+    assert ctrl.sim.home_roster == HOME_FIVE    # live ball: nobody moves
+
+    ctrl.ball_dead = True
+    ctrl.sim.script(incoming=["K"])
+    ctrl._process_scheduled_subs()
+    assert "K" in ctrl.sim.home_roster          # the next whistle catches it
+
+
 def test_game_ends_at_regulation_when_not_tied():
     ctrl = make_controller(HOME)
     ctrl.score = {HOME: 100, AWAY: 98}
@@ -694,14 +817,19 @@ def test_force_sub_fires_when_team_starved():
     assert ctrl.sim.away_roster == AWAY_FIVE
 
 
-def test_force_sub_skips_during_pending_rebound():
+def test_force_sub_skips_while_the_ball_is_live():
     ctrl = GameController(FakeSim(), seed=0, sub_max_gap=300.0)
     ctrl.sim.home_full = HOME_FIVE + ["K"]
     ctrl.clock = 400.0
     ctrl.last_sub_clock = {HOME: 0.0, AWAY: 0.0}
-    ctrl.pending_rebound = True              # mid-play: no subbing at a live ball
+    ctrl.ball_dead = False                   # mid-play: no subbing at a live ball
     ctrl._maybe_force_sub()
     assert ctrl.sim.home_roster == HOME_FIVE
+    # ...and the same team gets its sub at the next whistle.
+    ctrl.ball_dead = True
+    ctrl.sim.script(player=["A"], incoming=["K"])
+    ctrl._maybe_force_sub()
+    assert "K" in ctrl.sim.home_roster
 
 
 # ===================================================================== #
@@ -734,6 +862,7 @@ def test_scheduled_sub_does_not_fire_before_target():
     ctrl = GameController(FakeSim(scheduler=True, stint_seconds=300.0), seed=0)
     ctrl.sim.home_full = HOME_FIVE + ["K"]
     ctrl.start(HOME_FIVE, AWAY_FIVE)
+    ctrl.ball_dead = True                    # the scheduler only ever runs at a dead ball
     ctrl.clock = 200.0                       # before any 300s target
     ctrl._process_scheduled_subs()
     assert ctrl.sim.home_roster == HOME_FIVE  # nobody is due yet
@@ -743,6 +872,7 @@ def test_scheduled_sub_pulls_most_overdue_at_target():
     ctrl = GameController(FakeSim(scheduler=True, stint_seconds=300.0), seed=0)
     ctrl.sim.home_full = HOME_FIVE + ["K"]
     ctrl.start(HOME_FIVE, AWAY_FIVE)
+    ctrl.ball_dead = True                    # the scheduler only ever runs at a dead ball
     ctrl.stint_target_clock["A"] = 250.0     # A is the most overdue on the home five
     ctrl.clock = 300.0
     ctrl.sim.script(incoming=["K"])
@@ -758,6 +888,7 @@ def test_scheduled_sub_pulls_most_overdue_at_target():
 def test_scheduled_sub_skips_when_no_bench():
     ctrl = GameController(FakeSim(scheduler=True, stint_seconds=300.0), seed=0)
     ctrl.start(HOME_FIVE, AWAY_FIVE)         # full == on-court, no bench either side
+    ctrl.ball_dead = True                    # the scheduler only ever runs at a dead ball
     ctrl.clock = 400.0                       # everyone overdue
     ctrl._process_scheduled_subs()
     # Nobody to bring in → no sub happened, the substitution head was never queried, and the
