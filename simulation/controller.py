@@ -27,6 +27,7 @@ import numpy as np
 # alias here would silently freeze the value from startup. See config._TUNING_KEYS.
 import config
 from models.conditional_time_model import ConditionalTimeModel
+from models.game_state_features import NON_TEAM_FOUL_TYPES
 from models.stint_length_model import StintLengthModel
 from models.substitution_model import START_TOKEN
 from simulation.game_simulator import GameSimulator, HOME, AWAY
@@ -68,9 +69,22 @@ COMMON_FOULS = {"personal", "loose ball", "away from play"}
 # common foul to stop the ball, awarded 1 FT + the fouled team retains (the cleaner maps both to
 # "free throw op"). Not in COMMON_FOULS — their outcome is fixed, not bonus-dependent.
 TAKE_FOULS = {"personal take", "transition take"}
-# Fouls that count toward a team's per-period foul total (the penalty count).
-TEAM_FOUL_TYPES = {"shooting", "personal", "loose ball", "away from play",
-                   "flagrant-1", "flagrant-2", "personal take", "transition take"}
+# Which foul types each side can legally commit. The foul-type head is conditioned on the fouler
+# but has no notion of which side he is on, so unmasked it will charge an offensive foul to a
+# defender or type an offensive player's foul as a shooting foul — and then the outcome resolves
+# for the wrong team. The fouler's side is resolved first and the head masked to that side's set.
+OFFENSIVE_SIDE_FOUL_TYPES = ["offensive", "loose ball", "technical", "flagrant-1", "flagrant-2"]
+DEFENSIVE_SIDE_FOUL_TYPES = [t for t in FOUL_TYPES if t != "offensive"]
+
+# Fouls that count toward a team's per-period foul total (the penalty count) have ONE definition,
+# imported from the game-state features (models/game_state_features.py:NON_TEAM_FOUL_TYPES) so the
+# trained feature and the sim cannot drift: every foul except technicals and offensive fouls,
+# charged to the fouling team whichever side he is on. The feature's scan resolves the team by
+# roster membership and cannot see offense/defense, so the sim must not gate on it either.
+def counts_as_team_foul(ftype: str) -> bool:
+    """Does ``ftype`` add to the fouling team's per-period penalty count?"""
+    return ftype not in NON_TEAM_FOUL_TYPES
+
 
 class GameController:
     """Drive a full single-game rollout off a loaded :class:`GameSimulator`, enforcing rules."""
@@ -113,6 +127,14 @@ class GameController:
         self.score = {HOME: 0, AWAY: 0}
         self.possession: str = HOME
         self.team_fouls = {HOME: 0, AWAY: 0}
+        # Team fouls committed inside the final 2:00 of the current period, tracked separately
+        # because the last-two-minutes penalty triggers on the second foul *in the window*, not
+        # on the second of the period (a team with 4 period fouls still gets one free one).
+        self.team_fouls_window = {HOME: 0, AWAY: 0}
+        # Name -> team, built once from the FULL rosters (see _build_team_map). Never read the
+        # on-court five for this: a bench or subbed-off player is not in it.
+        self.player_team: dict[str, str] = {}
+        self._build_team_map()
         self.ejected: set[str] = set()
         # Per-player personal-foul tally and the set already disqualified (6-foul DQ + ejections),
         # so a fouled-out/ejected player is pulled and can never be subbed back in.
@@ -174,6 +196,8 @@ class GameController:
                                        season=season, tipoff_time=0.0, greedy=self.greedy,
                                        greedy_starters=True, season_context=season_context)
         self.possession = possession
+        # Rebuild from this game's rosters, now that the simulator has been seeded.
+        self._build_team_map(home_full, away_full)
         # Every starter begins a stint at tip-off (clock 0); used by the fatigue nudge.
         for player in self._all_ten():
             self.stint_start[player] = 0.0
@@ -467,64 +491,101 @@ class GameController:
     def _do_foul(self, delta: float, *, rebounding: bool = False) -> None:
         """Foul: derive result from foul type (data_cleaner.py:137) + NBA bonus, expand FTs.
 
-        A foul drawn during a rebound is masked to common (non-shooting) types. A shooting foul
-        is handled specially for free-throw *count*: a 3pt shooting foul is 3 FTs, a 2pt is 2,
-        and a foul on a basket that just went in is an **and-1** (the basket counts, plus 1 FT).
+        Order is fouler → side → type: the fouler is sampled from all ten, his side resolved off
+        the full-roster team map, and only then is the foul-type head masked — to that side's
+        legal types, intersected with the rebounding mask when a missed shot is in the air. A
+        foul drawn during a rebound is masked to common (non-shooting) types. A shooting foul is
+        handled specially for free-throw *count*: a 3pt shooting foul is 3 FTs, a 2pt is 2, and a
+        foul on a basket that just went in is an **and-1** (the basket counts, plus 1 FT).
         ``delta`` enters as the marginal Δt and is reassigned to the authoritative Δt after the
         fouler is chosen.
         """
-        allowed_types = REBOUNDING_FOUL_TYPES if rebounding else FOUL_TYPES
         fouler = self.sim.predict_player("foul", self._all_ten(),
                                          delta_seconds=delta, greedy=self.greedy,
                                          temperature=self.player_temp)
         delta = self._advance_for("foul", fouler, delta)
+
+        # Resolve the side BEFORE typing the foul, then mask the head to what that side can
+        # commit. Typing first and asking about the side afterwards is what let an offensive
+        # player's foul resolve as a defensive one (and vice versa).
+        fouler_team = self._team_of(fouler)
+        on_defense = fouler_team == self._other(self._foul_offense())
+        side_types = DEFENSIVE_SIDE_FOUL_TYPES if on_defense else OFFENSIVE_SIDE_FOUL_TYPES
+        base_types = REBOUNDING_FOUL_TYPES if rebounding else FOUL_TYPES
+        allowed_types = [t for t in base_types if t in side_types]
+
         ftype = self.sim.predict_type("foul_type", "foul", fouler, allowed_types,
                                       delta_seconds=delta, greedy=self.greedy)
 
         if ftype == "shooting":
-            self._do_shooting_foul(fouler, delta)
+            self._do_shooting_foul(fouler, fouler_team, delta)
             return
 
-        fouler_team = self._team_of(fouler)
-        on_defense = fouler_team == self._other(self.possession)
-        offense = self.possession
+        # Free throws always go to the fouler's OPPONENT, in every branch. Reading possession
+        # here instead sent an offensive player's technical or flagrant to his own team.
+        ft_team = self._other(fouler_team)
 
-        # Count it toward the fouling team's per-period total (the bonus/penalty count).
-        if ftype in TEAM_FOUL_TYPES and on_defense:
-            self.team_fouls[fouler_team] += 1
+        # Count it toward the fouling team's per-period total (the bonus/penalty count), on
+        # whichever side he is on — see counts_as_team_foul.
+        if counts_as_team_foul(ftype):
+            self._count_team_foul(fouler_team)
 
         result, n_ft, retain = self._foul_outcome(ftype, fouler_team, on_defense)
         self._append("foul", fouler, ftype, result)
         self._charge_foul(fouler, ftype)
 
         if ftype == "offensive":
-            # Offensive foul = turnover: the offense loses the ball (no FTs).
-            self.possession = self._other(fouler_team)
+            # Offensive foul = turnover: the offense loses the ball (no FTs). Only reachable from
+            # the offense now, so the ball goes to the defense by construction.
+            self.possession = ft_team
             return
         if ftype == "flagrant-2":
             self._eject(fouler)
         if ftype == "technical":
-            # One technical FT, possession unchanged, dead ball (no rebound on a miss).
-            self._free_throws(self._pick_shooter(offense), offense, 1,
+            # One technical FT to the other side, then play resumes with whoever had the ball —
+            # a technical does not change possession. Dead ball, so no rebound on a miss.
+            held = self.possession
+            self._free_throws(self._pick_shooter(ft_team), ft_team, 1,
                               live_last=False, retain=True)
+            self.possession = held
             return
         if n_ft > 0:
-            self._free_throws(self._pick_shooter(offense), offense, n_ft,
+            self._free_throws(self._pick_shooter(ft_team), ft_team, n_ft,
                               live_last=not retain, retain=retain)
-        # else "nothing" → defensive foul, offense retains possession, no FTs.
+        # else "nothing" → common foul, no FTs, possession unchanged.
 
-    def _do_shooting_foul(self, fouler: str, delta: float) -> None:
+    def _foul_offense(self) -> str:
+        """Which team counts as the offense for a foul sampled right now.
+
+        Normally whoever has the ball. The exception is the **and-1**: a made basket flips
+        possession the instant it drops (``_do_shot``), so a foul sampled as the very next play
+        would classify the defender who fouled on the shot as an offensive player — masking
+        ``shooting`` away and making and-1s unreachable. While the previous row is a made field
+        goal, the possession that just ended is still the one this foul belongs to, so the
+        scoring team is the offense and the team scored on is the defense.
+        """
+        prev = self.sim.history[-1] if self.sim.history else None
+        if (prev is not None and prev.get("event") == "shot" and prev.get("result") == "made"
+                and prev.get("type") in FIELD_GOAL_TYPES):
+            scorer_team = self._team_of(prev.get("player"))
+            if scorer_team is not None:
+                return scorer_team
+        return self.possession
+
+    def _do_shooting_foul(self, fouler: str, fouler_team: str, delta: float) -> None:
         """A shooting foul: and-1 if a basket just went in, else 2 FTs (2pt) or 3 FTs (3pt).
 
         And-1 — the previous row is a made field goal — keeps the basket (already scored) and
         awards a single free throw to that shooter. Otherwise the fouled attempt is *not* logged
         as a field-goal attempt (NBA scoring); we sample the intended shot type only to decide
         whether it was a 2 (2 FTs) or a 3 (3 FTs), with the fouled offensive player shooting.
+
+        ``fouler_team`` is resolved by the caller before the type is sampled, so "a shooting foul
+        is defensive by definition" is now true by construction: ``shooting`` is not in the
+        offensive side's mask, so this is only ever reached for a defender.
         """
         self._append("foul", fouler, "shooting", "free throw")
         self._charge_foul(fouler, "shooting")
-        # A shooting foul is defensive by definition: the fouled team is the fouler's opponent.
-        fouler_team = self._team_of(fouler)
         shooting_team = self._other(fouler_team)
 
         prev = self.sim.history[-1 - 1] if len(self.sim.history) >= 2 else None  # row before foul
@@ -541,7 +602,7 @@ class GameController:
                                           delta_seconds=0.0, greedy=self.greedy)
             n_ft = 3 if stype == "3pt" else 2          # a 3pt shooting foul is three FTs
 
-        self.team_fouls[fouler_team] += 1              # always a defensive team foul
+        self._count_team_foul(fouler_team)             # always a defensive team foul
         self._free_throws(shooter, shooting_team, n_ft, live_last=True, retain=False)
 
     def _foul_outcome(self, ftype: str, fouler_team: str, on_defense: bool) -> tuple[str, int, bool]:
@@ -619,6 +680,7 @@ class GameController:
         period = self._period_index()
         if period != self._last_period:
             self.team_fouls = {HOME: 0, AWAY: 0}
+            self.team_fouls_window = {HOME: 0, AWAY: 0}
             self._last_period = period
         # End at a period boundary only when the score is not tied; otherwise open an OT.
         while self.clock >= self.period_end:
@@ -638,11 +700,29 @@ class GameController:
             return (int(self.clock // PERIOD_LENGTH) + 1) * PERIOD_LENGTH
         return REGULATION + (int((self.clock - REGULATION) // OT_LENGTH) + 1) * OT_LENGTH
 
+    def _in_last_two_minutes(self) -> bool:
+        return (self._current_period_end() - self.clock) <= 120.0
+
+    def _count_team_foul(self, team: str) -> None:
+        """Add one to ``team``'s per-period penalty count, and to the last-2:00 count in window.
+
+        One entry point so the period total and the window total cannot fall out of step, and so
+        both handlers (:meth:`_do_foul`, :meth:`_do_shooting_foul`) count identically.
+        """
+        self.team_fouls[team] += 1
+        if self._in_last_two_minutes():
+            self.team_fouls_window[team] += 1
+
     def _in_bonus(self, team: str) -> bool:
-        """NBA penalty: 5th team foul in a period, or 2nd in the final 2:00."""
-        fouls = self.team_fouls[team]
-        last_two_min = (self._current_period_end() - self.clock) <= 120.0
-        return fouls >= 5 or (last_two_min and fouls >= 2)
+        """NBA penalty: 5th team foul in a period, or the 2nd committed inside the final 2:00.
+
+        The window clause counts fouls *in the window*, not the period total — a team that
+        reaches the final 2:00 with 2 to 4 period fouls still gets one free foul there, and only
+        the second one inside the window puts them in the penalty.
+        """
+        if self.team_fouls[team] >= 5:
+            return True
+        return self._in_last_two_minutes() and self.team_fouls_window[team] >= 2
 
     # ===================================================================== #
     # --- Roster / possession / scoring helpers                            --
@@ -668,8 +748,30 @@ class GameController:
     def _all_ten(self) -> list[str]:
         return self.sim.home_roster + self.sim.away_roster
 
-    def _team_of(self, player: str) -> str:
-        return HOME if player in self.sim.home_roster else AWAY
+    def _build_team_map(self, home_full: list[str] | None = None,
+                        away_full: list[str] | None = None) -> None:
+        """Map every player on either full roster to his team, once, at tip-off.
+
+        Built from the FULL rosters rather than the on-court fives, and never rebuilt mid-game: a
+        player's team does not change, and :meth:`_disqualify` *removes* names from ``full``, so a
+        later rebuild would lose everyone who fouled out. :meth:`start` passes its own arguments
+        (the game spec's rosters); the no-argument form falls back to whatever the simulator is
+        holding, which is what a controller driven straight into a handler gets.
+        """
+        home = self.sim.home_full if home_full is None else home_full
+        away = self.sim.away_full if away_full is None else away_full
+        self.player_team = {p: HOME for p in home}
+        self.player_team.update({p: AWAY for p in away})
+
+    def _team_of(self, player: str) -> str | None:
+        """The player's team, or ``None`` for a non-player (``start``/``end``, an unknown name).
+
+        Reading ``sim.home_roster`` here — the on-court **five**, mutated in place by every
+        substitution — resolved every bench player, every subbed-off player and every sentinel
+        token to AWAY, which is how a foul-out mid-resolution could flip whose free throws they
+        were. Callers that may pass a sentinel (the and-1 check) rely on the ``None``.
+        """
+        return self.player_team.get(player)
 
     @staticmethod
     def _other(team: str) -> str:
@@ -708,6 +810,8 @@ class GameController:
         """Remove ``player`` from the game (full roster too, so no sub can bring him back) and,
         if he was on the floor, sub in the model's best available bench replacement."""
         team = self._team_of(player)
+        if team is None:                      # not on either roster — nothing to remove
+            return
         full = self.sim.home_full if team == HOME else self.sim.away_full
         if player in full:
             full.remove(player)

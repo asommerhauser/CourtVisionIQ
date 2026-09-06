@@ -96,6 +96,10 @@ class FakeSim:
                             *, possession=HOME, season="2003", tipoff_time=0.0,
                             season_context=None):
         self.calls.append(("start_with_starters", list(home_starters), list(away_starters)))
+        # The real simulator copies the full rosters here too (game_simulator.py:777) — keep
+        # that faithful, or a bench player is missing from anything keyed off home_full.
+        self.home_full = list(home_full)
+        self.away_full = list(away_full)
         self.home_roster = list(home_starters)
         self.away_roster = list(away_starters)
 
@@ -335,15 +339,162 @@ def test_flagrant2_ejects_fouler_and_keeps_possession():
 
 
 # ===================================================================== #
+# Side-aware fouls — the fouler's side is resolved before the type is sampled
+# ===================================================================== #
+
+def test_offense_side_fouler_is_masked_to_offensive_side_types():
+    ctrl = make_controller(HOME)
+    ctrl.sim.script(player=["A"], type=["offensive"])   # A is on the offense (home has the ball)
+    ctrl._do_foul(delta=5.0)
+
+    type_call = [c for c in ctrl.sim.calls if c[0] == "type"][0]
+    allowed = type_call[3]
+    # An offensive player cannot commit a shooting, personal, take or away-from-play foul.
+    assert "shooting" not in allowed
+    assert "personal" not in allowed
+    assert "away from play" not in allowed
+    assert "personal take" not in allowed and "transition take" not in allowed
+    assert set(allowed) == {"offensive", "loose ball", "technical", "flagrant-1", "flagrant-2"}
+
+
+def test_defense_side_fouler_is_masked_to_everything_but_offensive():
+    ctrl = make_controller(HOME)
+    ctrl.sim.script(player=["F", "A"], type=["shooting", "2pt"], result=["made", "made"])
+    ctrl._do_foul(delta=5.0)
+
+    allowed = [c for c in ctrl.sim.calls if c[0] == "type"][0][3]
+    assert "offensive" not in allowed       # a defender cannot commit an offensive foul
+    assert "shooting" in allowed
+
+
+def test_foul_side_is_resolved_before_the_type_is_sampled():
+    """The fouler must be picked first — the mask depends on which side he turns out to be on."""
+    ctrl = make_controller(HOME)
+    ctrl.sim.script(player=["A"], type=["offensive"])
+    ctrl._do_foul(delta=5.0)
+
+    kinds = [c[0] for c in ctrl.sim.calls if c[0] in ("player", "type")]
+    assert kinds[0] == "player" and kinds[1] == "type"
+
+
+def test_offense_side_technical_sends_free_throws_to_the_defense():
+    ctrl = make_controller(HOME)                 # home has the ball
+    # A (home, on offense) picks up a technical: the AWAY team shoots it, not home.
+    ctrl.sim.script(player=["A", "F"], type=["technical"], result=["made"])
+    ctrl._do_foul(delta=5.0)
+
+    fts = [r for r in rows(ctrl) if r["type"] == "free throw"]
+    assert len(fts) == 1 and fts[0]["player"] == "F"
+    assert ctrl.score[AWAY] == 1 and ctrl.score[HOME] == 0
+    assert ctrl.possession == HOME               # a technical does not change possession
+    assert ctrl.team_fouls[HOME] == 0            # technicals never count toward the penalty
+
+
+def test_offense_side_flagrant_sends_free_throws_and_the_ball_to_the_defense():
+    ctrl = make_controller(HOME)
+    ctrl.sim.script(player=["A", "F"], type=["flagrant-1"], result=["made", "made"])
+    ctrl._do_foul(delta=5.0)
+
+    assert ctrl.score[AWAY] == 2 and ctrl.score[HOME] == 0
+    assert ctrl.possession == AWAY               # flagrant: the fouled team gets the ball
+    assert ctrl.team_fouls[HOME] == 1            # charged to the fouling team, offense or not
+
+
+def test_offense_side_loose_ball_foul_counts_and_keeps_possession():
+    ctrl = make_controller(HOME)
+    ctrl.sim.script(player=["A"], type=["loose ball"])
+    ctrl._do_foul(delta=5.0)
+
+    (foul,) = rows(ctrl)
+    assert (foul["player"], foul["type"], foul["result"]) == ("A", "loose ball", "nothing")
+    assert ctrl.possession == HOME               # possession unchanged
+    assert ctrl.team_fouls[HOME] == 1            # still a team foul against the offense
+
+
+def test_team_of_resolves_a_bench_player_not_on_the_floor():
+    """Reading the on-court five resolved every bench player to AWAY."""
+    ctrl = GameController(FakeSim(), seed=0)
+    ctrl.start(HOME_FIVE + ["K"], AWAY_FIVE + ["L"],
+               home_starters=HOME_FIVE, away_starters=AWAY_FIVE)
+
+    assert "K" not in ctrl.sim.home_roster and "L" not in ctrl.sim.away_roster   # both benched
+    assert ctrl._team_of("K") == HOME
+    assert ctrl._team_of("L") == AWAY
+    assert ctrl._team_of("A") == HOME and ctrl._team_of("F") == AWAY
+    assert ctrl._team_of("start") is None        # sentinels are not players
+
+
+def test_foul_by_a_subbed_off_player_still_resolves_to_his_own_team():
+    ctrl = GameController(FakeSim(), seed=0)
+    ctrl.start(HOME_FIVE + ["K"], AWAY_FIVE, home_starters=HOME_FIVE, away_starters=AWAY_FIVE)
+    ctrl._apply_sub("A", "K")                    # A leaves the floor for K
+    assert "A" not in ctrl.sim.home_roster
+    # A is off the floor but still a home player — previously he resolved to AWAY.
+    assert ctrl._team_of("A") == HOME
+
+
+def test_and_one_survives_the_possession_flip_on_the_made_basket():
+    """A made FG flips possession, so the and-1 foul must not read as an offensive-side foul."""
+    ctrl = make_controller(AWAY)                 # made FG already flipped possession to AWAY
+    ctrl.sim.append_event("shot", "A", "2pt", "made", time=0)   # A (home) just scored
+    ctrl.sim.script(player=["G"], type=["shooting"], result=["made"])
+    ctrl._do_foul(delta=5.0)
+
+    allowed = [c for c in ctrl.sim.calls if c[0] == "type"][0][3]
+    assert "shooting" in allowed                 # G is still the defender on that possession
+
+
+# ===================================================================== #
 # Clock / period structure
 # ===================================================================== #
 
 def test_team_fouls_reset_on_period_boundary():
     ctrl = make_controller(HOME)
     ctrl.team_fouls = {HOME: 3, AWAY: 4}
+    ctrl.team_fouls_window = {HOME: 1, AWAY: 2}
     ctrl.clock = PERIOD_LENGTH + 1          # into Q2
     ctrl._check_period()
     assert ctrl.team_fouls == {HOME: 0, AWAY: 0}
+    assert ctrl.team_fouls_window == {HOME: 0, AWAY: 0}
+
+
+# ===================================================================== #
+# The last-two-minutes penalty
+# ===================================================================== #
+
+def test_last_two_minutes_penalty_needs_a_second_foul_inside_the_window():
+    ctrl = make_controller(HOME)
+    ctrl.clock = PERIOD_LENGTH - 90         # 1:30 left in Q1 — inside the window
+    ctrl.team_fouls[AWAY] = 2               # two period fouls, but none yet in the window
+    # The old rule read the period total here and called this the penalty already.
+    assert ctrl._in_bonus(AWAY) is False    # still one free foul in here
+
+    ctrl._count_team_foul(AWAY)             # first foul in the window
+    assert ctrl.team_fouls_window[AWAY] == 1
+    assert ctrl._in_bonus(AWAY) is False
+
+    ctrl._count_team_foul(AWAY)             # second foul in the window → penalty
+    assert ctrl.team_fouls[AWAY] == 4       # still under 5, so this is the window rule firing
+    assert ctrl._in_bonus(AWAY) is True
+
+
+def test_fifth_period_foul_is_the_penalty_regardless_of_the_window():
+    ctrl = make_controller(HOME)
+    ctrl.clock = 60.0                       # early in Q1, nowhere near the window
+    ctrl.team_fouls[AWAY] = 5
+    assert ctrl._in_bonus(AWAY) is True
+
+
+def test_fouls_before_the_window_do_not_count_toward_it():
+    ctrl = make_controller(HOME)
+    ctrl.clock = 60.0                       # early in the period
+    ctrl._count_team_foul(AWAY)
+    ctrl._count_team_foul(AWAY)
+    assert ctrl.team_fouls[AWAY] == 2
+    assert ctrl.team_fouls_window[AWAY] == 0     # neither was inside the last 2:00
+
+    ctrl.clock = PERIOD_LENGTH - 30              # now inside the window
+    assert ctrl._in_bonus(AWAY) is False         # two period fouls, none in the window
 
 
 def test_game_ends_at_regulation_when_not_tied():
@@ -437,7 +588,9 @@ def test_technical_fouls_never_count_toward_foul_out():
 
 def test_do_foul_charges_the_fouler():
     ctrl = make_controller(AWAY)                     # F (away) is on offense → clean "nothing" foul
-    ctrl.sim.script(player=["F"], type=["personal"])
+    # "loose ball" is the common foul an offensive player can legally commit (a "personal" is
+    # masked out on that side now), and it still resolves to "nothing" outside the bonus.
+    ctrl.sim.script(player=["F"], type=["loose ball"])
     ctrl._do_foul(delta=5.0)
     assert ctrl.player_fouls["F"] == 1
 

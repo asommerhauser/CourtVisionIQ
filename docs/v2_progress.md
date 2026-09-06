@@ -32,7 +32,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged
 
 | # | Branch / gate | Phase | Spec | Status | Merge |
 |---|---|---|---|---|---|
-| 1 | `feature/side-aware-fouls` | 1 | §1 | [ ] | |
+| 1 | `feature/side-aware-fouls` | 1 | §1 | [x] | f55758d |
 | 2 | `feature/dead-ball-state` | 1 | §2 | [ ] | |
 | — | **Gate A — Phase 1 short eval** | 1 | | [ ] | |
 | 3 | `feature/shot-zone-geometry` | 2 | §3 | [ ] | |
@@ -85,9 +85,18 @@ pytest tests/test_controller.py tests/test_game_state_features.py -q
 New cases required: an offense-side foul resolves to the offense, and a foul charged to a bench
 player resolves to the right team.
 
-**Result:** _(paste pass/fail summary here)_
+**Result:** 61 passed, 0 failed (test_controller.py + test_game_state_features.py). encoder/vocabs/ clean after the run.
 
-**Notes:**
+**Notes:** Beyond the spec: the side mask taken literally KILLS and-1s, because a made
+basket flips possession before the foul is sampled, so the defender who fouled on the shot
+reads as an offensive player and `shooting` is masked away. Added `_foul_offense()`, which
+treats the scoring team as the offense while the previous row is a made field goal - see
+correction F. Two existing tests adjusted: `test_do_foul_charges_the_fouler` scripted an
+offense-side `personal` foul (now illegal, switched to `loose ball`), and
+`FakeSim.start_with_starters` did not copy the full rosters the way the real simulator does
+at `game_simulator.py:777`. Also: **pytest is not in requirements.txt or requirements-gpu.txt**
+- it has to be installed into the venv by hand, and `python -m pytest` is the invocation that
+works. This will bite at every verification step.
 
 ### 2. `feature/dead-ball-state` — §2
 
@@ -551,6 +560,14 @@ but the fix is the reorder in `_do_foul`, not an edit to that line.
 without appending anything. §6 replacing it with learned team-rebound tokens therefore *adds* rows
 to the generated sequence, which is a change in row counts, not just in sampling.
 
+**F. The side mask, taken literally, makes and-1s unreachable.** A made basket flips possession
+the instant it drops (`_do_shot`), so a foul sampled as the very next play classifies the defender
+who fouled on the shot as an *offensive* player - and `shooting` is not in the offensive side's
+mask. Section 4 explicitly wants and-1s reachable, so leaving this would have set up a conflict two
+branches later. `GameController._foul_offense()` resolves it: while the previous row is a made
+field goal, the possession that just ended is the one the foul belongs to, so the scoring team is
+the offense. Found and fixed on `feature/side-aware-fouls`.
+
 ---
 
 ## Log
@@ -559,4 +576,4 @@ Append one line per merge. Newest last.
 
 | Date | Branch | Commit | Note |
 |---|---|---|---|
-| | | | |
+| 2026-09-06 | `feature/side-aware-fouls` | f55758d | 61 tests green; and-1 fix beyond spec (correction F) |
