@@ -121,6 +121,9 @@ TYPE_GEN_SPECS: dict[str, TypeGenSpec] = {
     "turnover_type": TypeGenSpec("turnover_type", "turnover", "type",   ("player",)),
     "foul_type":     TypeGenSpec("foul_type",     "foul",     "type",   ("player",)),
     "rebound_type":  TypeGenSpec("rebound_type",  "rebound",  "type",   ()),
+    # Which side called the timeout. Like rebound_type it carries NO condition_fields: no player
+    # is involved at all, so the call is decided from history alone.
+    "timeout_team":  TypeGenSpec("timeout_team",  "timeout",  "type",   ()),
 }
 
 # Shared family file names: one preprocess feeds every head (see module docstring).

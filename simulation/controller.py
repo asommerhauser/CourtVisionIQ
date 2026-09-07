@@ -44,6 +44,13 @@ MAX_EVENTS = 4000            # hard safety cap on rollout length (≈ 8× a real
 # continues, which is why a made basket is not by itself a substitution opportunity.
 LATE_CLOCK_STOP = 60.0       # Q1–Q3
 LATE_CLOCK_STOP_FINAL = 120.0  # Q4 and OT
+# Timeout budget (NBA): seven a game, at most four still available in the fourth quarter, at
+# most two inside the final three minutes, and two more granted per overtime.
+TIMEOUTS_PER_GAME = 7
+TIMEOUTS_MAX_Q4 = 4
+TIMEOUTS_MAX_LATE = 2
+TIMEOUTS_PER_OT = 2
+TIMEOUT_LATE_SECONDS = 180.0
 
 # Legal next-events the event head is masked to, per context. Substitution is intentionally NOT
 # here: subs are owned by the rotation scheduler (injected at stint expiry), and the retrained
@@ -51,6 +58,9 @@ LATE_CLOCK_STOP_FINAL = 120.0  # Q4 and OT
 # EventTimeModel._make_dataset), so there is no substitution mass to renormalize away.
 OPEN_PLAY_EVENTS = ["shot", "assist", "turnover", "foul"]
 POST_MISS_EVENTS = ["rebound", "foul"]   # a rebound is only legal right after a miss
+# A timeout is legal only while the ball is dead and the calling team still has one. It is
+# appended to whichever mask applies rather than living in either, so the gate is explicit.
+TIMEOUT_EVENT = "timeout"
 
 # Conditional-head token whitelists (intentional sampling / masking).
 SHOT_TYPES = list(ZONE_TOKENS)           # a live field goal is one of the fifteen court zones
@@ -70,10 +80,12 @@ FOUL_TYPES = ["personal", SHOOTING_2PT, SHOOTING_3PT, "offensive", "loose ball",
 # keeps us from double-counting a real missed FGA *and* awarding shooting-foul free throws.
 REBOUNDING_FOUL_TYPES = ["personal", "loose ball", "away from play"]
 FIELD_GOAL_TYPES = ZONE_TOKENS
-# A live rebound is offensive (shooting team keeps the ball) or defensive (possession flips).
-# The rebound-type head is masked to these two; the rare "null"/team rebound is modeled
-# separately by DEADBALL_REBOUND_PROB below (the ball just changes hands with no row).
-REBOUND_TYPES = ["offensive", "defensive"]
+# A rebound is offensive (shooting team keeps the ball) or defensive (possession flips), and
+# either can be a TEAM rebound -- nobody credited, the ball out of bounds off someone. The head
+# learns the team share from ~11.9k real examples a season instead of it being a coin flip on
+# DEADBALL_REBOUND_PROB, which emitted no row at all and so taught the model nothing.
+TEAM_REBOUND_TYPES = ("team offensive", "team defensive")
+REBOUND_TYPES = ["offensive", "defensive", *TEAM_REBOUND_TYPES]
 
 # Common fouls that can trigger bonus free throws when the defense is in the penalty.
 COMMON_FOULS = {"personal", "loose ball", "away from play"}
@@ -143,6 +155,7 @@ class GameController:
         # because the last-two-minutes penalty triggers on the second foul *in the window*, not
         # on the second of the period (a team with 4 period fouls still gets one free one).
         self.team_fouls_window = {HOME: 0, AWAY: 0}
+        self.timeouts_left = {HOME: TIMEOUTS_PER_GAME, AWAY: TIMEOUTS_PER_GAME}
         # Name -> team, built once from the FULL rosters (see _build_team_map). Never read the
         # on-court five for this: a bench or subbed-off player is not in it.
         self.player_team: dict[str, str] = {}
@@ -186,6 +199,12 @@ class GameController:
         # still runs. The event head's marginal Δt is still read each step and used to condition the
         # actor pick (PlayerModel's unchanged next_delta_time contract).
         self.use_condtime: bool = ConditionalTimeModel.KEY in self.sim.heads
+
+        # --- Timeouts ---
+        # Optional like the stint and conditional-time heads: a bundle trained before 2.0 has no
+        # timeout_team head and no "timeout" event token, so it simply never calls one rather
+        # than asking the event head for a token it has never seen.
+        self.use_timeouts: bool = "timeout_team" in self.sim.heads
 
     # ===================================================================== #
     # --- Setup + main loop                                                --
@@ -244,9 +263,7 @@ class GameController:
         """
         post_miss = self.pending_rebound
         self.pending_rebound = False
-        allowed = POST_MISS_EVENTS if post_miss else self.open_play_events
-
-        event, marginal = self._sample_event(allowed)
+        event, marginal = self._sample_event(self._event_menu(post_miss))
 
         if event == "shot":
             self._do_shot(marginal)
@@ -260,11 +277,25 @@ class GameController:
             self._do_rebound(marginal)
         elif event == "substitution":
             self._do_substitution(marginal)
+        elif event == TIMEOUT_EVENT:
+            self._do_timeout(marginal)
 
         self._check_period()
         if self.use_scheduler:
             self._process_scheduled_subs()
         self._maybe_force_sub()   # cadence backstop (and the legacy in-game sub path's safety net)
+
+    def _event_menu(self, post_miss: bool) -> list[str]:
+        """The events the event head may be sampled from right now.
+
+        A timeout is the one context-gated entry: legal only while the ball is dead, only when
+        some team still has one under the budget, and only when the timeout head is loaded at
+        all. Everything else is the fixed open-play / post-miss mask.
+        """
+        allowed = POST_MISS_EVENTS if post_miss else self.open_play_events
+        if self.use_timeouts and self.ball_dead and self._timeout_teams():
+            return [*allowed, TIMEOUT_EVENT]
+        return list(allowed)
 
     def _sample_event(self, allowed: list[str]) -> tuple[str, float]:
         """Run the event/time head and pick the next event from ``allowed`` (masked).
@@ -400,6 +431,41 @@ class GameController:
             self.ball_dead = True        # whistle: out of bounds, travel, offensive foul
         self.possession = self._other(offense)
 
+    def _timeouts_available(self, team: str) -> int:
+        """How many timeouts ``team`` may still call right now, budget caps applied.
+
+        Seven a game, but at most four still usable once the fourth quarter starts and at most
+        two inside its final three minutes — the caps bite regardless of how many are banked, so
+        a team that hoarded all seven cannot spend them in the last minute.
+        """
+        left = self.timeouts_left[team]
+        if self._period_index() < 3:                   # Q1–Q3: no cap beyond the total
+            return left
+        if self._current_period_end() - self.clock <= TIMEOUT_LATE_SECONDS:
+            return min(left, TIMEOUTS_MAX_LATE)
+        return min(left, TIMEOUTS_MAX_Q4)
+
+    def _timeout_teams(self) -> list[str]:
+        """The teams that could call a timeout right now — the type head's mask."""
+        return [t for t in (HOME, AWAY) if self._timeouts_available(t) > 0]
+
+    def _do_timeout(self, delta: float) -> None:
+        """A timeout: the seventh conditional type head picks which side called it.
+
+        No player is involved, so the row is ``timeout / none / <home|away>`` and the head is
+        masked to the teams that still have one. The ball stays dead afterwards, which is the
+        whole point — this is the substitution opportunity the sim never had after a made basket.
+        """
+        teams = self._timeout_teams()
+        if not teams:                                  # both budgets spent (mask should prevent)
+            return
+        team = self.sim.predict_type("timeout_team", TIMEOUT_EVENT, None, teams,
+                                     delta_seconds=delta, greedy=self.greedy)
+        self._advance_clock(delta)
+        self._append(TIMEOUT_EVENT, "none", team, "none")
+        self.timeouts_left[team] -= 1
+        self.ball_dead = True
+
     def _do_rebound(self, delta: float) -> None:
         """Resolve a rebound after a miss: pick the off/def type, then the rebounder on that team.
 
@@ -411,25 +477,28 @@ class GameController:
         team rebound / out-of-bounds — and the ball simply changes hands with no row.
         """
         offense = self.possession  # team that just missed
-        if self.rng.random() < config.DEADBALL_REBOUND_PROB:
-            self._advance_clock(delta)                 # no rebounder to time on → marginal gap
-            self.possession = self._other(offense)     # out of bounds → other team
-            self.ball_dead = True                      # a team rebound is a dead ball
-            return
-        # Off/def type then the rebounder are sampled on the marginal Δt; the authoritative Δt for the
-        # clock is then conditioned on the decided rebounder.
+        # Off/def and team-or-not both come from the type head on the marginal Δt; the
+        # authoritative Δt is then conditioned on the decided rebounder (a team rebound has
+        # none, so it times on the marginal gap).
         rtype = self.sim.predict_type("rebound_type", "rebound", None, REBOUND_TYPES,
                                       delta_seconds=delta, greedy=self.greedy)
-        five = self._offense_five() if rtype == "offensive" else self._defense_five()
-        rebounder = self.sim.predict_player("rebound", five,
-                                            delta_seconds=delta, greedy=self.greedy,
-                                            temperature=self.player_temp)
-        self._advance_for("rebound", rebounder, delta)
-        self.ball_dead = False                         # a live rebound: play continues
-        if rtype == "offensive":                       # offensive rebound — offense retains
-            self._append("rebound", rebounder, "offensive", "null")
-        else:                                          # defensive rebound — possession flips
-            self._append("rebound", rebounder, "defensive", "cop")
+        offensive = rtype.endswith("offensive")
+        team_rebound = rtype in TEAM_REBOUND_TYPES
+
+        if team_rebound:
+            rebounder = "none"                         # nobody is credited; skip the pick
+            self._advance_clock(delta)
+            self.ball_dead = True                      # out of bounds: the ball is inbounded
+        else:
+            five = self._offense_five() if offensive else self._defense_five()
+            rebounder = self.sim.predict_player("rebound", five,
+                                                delta_seconds=delta, greedy=self.greedy,
+                                                temperature=self.player_temp)
+            self._advance_for("rebound", rebounder, delta)
+            self.ball_dead = False                     # a live rebound: play continues
+
+        self._append("rebound", rebounder, rtype, "null" if offensive else "cop")
+        if not offensive:                              # defensive board — possession flips
             self.possession = self._other(offense)
 
     def _do_substitution(self, delta: float) -> None:
@@ -756,6 +825,9 @@ class GameController:
             self.team_fouls = {HOME: 0, AWAY: 0}
             self.team_fouls_window = {HOME: 0, AWAY: 0}
             self.ball_dead = True           # a period break is a dead ball
+            if period >= 4:                 # entering an overtime: two more timeouts each
+                for team in (HOME, AWAY):
+                    self.timeouts_left[team] += TIMEOUTS_PER_OT
             self._last_period = period
         # End at a period boundary only when the score is not tied; otherwise open an OT.
         while self.clock >= self.period_end:

@@ -220,6 +220,10 @@ def _home_away_flag(row: dict, home_roster: list[str], away_roster: list[str]) -
     event = str(row.get("event"))
     if event in SKIP_HOME_AWAY_EVENTS:
         return 0
+    if event == "timeout":
+        # No player is involved — the calling side is the row's `type`, exactly as the cleaner
+        # writes it. Without this a timeout would export as 0 and drift from the cleaned data.
+        return 1 if str(row.get("type")) == "home" else 2
     ref = row.get("secondary_player") if event == "substitution" else row.get("player")
     if ref in home_roster:
         return 1

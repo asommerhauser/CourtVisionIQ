@@ -32,7 +32,8 @@ REQUIRED_HEADS = {"player", "substitution", "shot_type", "shot_result",
 class FakeSim:
     """Scripted stand-in for GameSimulator — no TF graph, no artifacts."""
 
-    def __init__(self, scheduler: bool = False, stint_seconds: float = 300.0):
+    def __init__(self, scheduler: bool = False, stint_seconds: float = 300.0,
+                 timeouts: bool = False):
         self.home_roster = list(HOME_FIVE)
         self.away_roster = list(AWAY_FIVE)
         self.home_full = list(HOME_FIVE)
@@ -41,6 +42,8 @@ class FakeSim:
         self.heads = {k: object() for k in REQUIRED_HEADS}
         if scheduler:                       # opt-in to the stint-length scheduler path
             self.heads["stint_length"] = object()
+        if timeouts:                        # opt-in to the timeout_team head
+            self.heads["timeout_team"] = object()
         self.stint_seconds = stint_seconds  # fixed length returned by predict_stint_length
         self.rng = np.random.default_rng(0)
         self.calls: list[tuple] = []
@@ -214,7 +217,7 @@ def test_rebound_type_head_decides_split_before_player():
     # The off/def split comes from the rebound_type head, masked to the two live types.
     type_call = [c for c in ctrl.sim.calls if c[0] == "type"][0]
     assert type_call[1] == "rebound_type"
-    assert type_call[3] == ["offensive", "defensive"]
+    assert type_call[3] == ["offensive", "defensive", "team offensive", "team defensive"]
 
 
 # ===================================================================== #
@@ -501,6 +504,123 @@ def test_fouls_before_the_window_do_not_count_toward_it():
 
 
 # ===================================================================== #
+# Timeouts
+# ===================================================================== #
+
+def _timeout_ctrl(possession=HOME):
+    ctrl = GameController(FakeSim(timeouts=True), seed=0)
+    ctrl.possession = possession
+    return ctrl
+
+
+def test_a_timeout_is_only_offered_at_a_dead_ball():
+    ctrl = _timeout_ctrl()
+    ctrl.ball_dead = False
+    assert "timeout" not in ctrl._event_menu(post_miss=False)
+    ctrl.ball_dead = True
+    assert "timeout" in ctrl._event_menu(post_miss=False)
+    assert "timeout" not in ctrl.open_play_events        # never in the base menu itself
+
+
+def test_a_team_out_of_timeouts_cannot_be_offered_one():
+    ctrl = _timeout_ctrl()
+    ctrl.ball_dead = True
+    ctrl.timeouts_left = {HOME: 0, AWAY: 0}
+    assert "timeout" not in ctrl._event_menu(post_miss=False)
+
+
+def test_a_timeout_emits_a_row_and_spends_the_budget():
+    ctrl = _timeout_ctrl()
+    ctrl.sim.script(type=["home"])
+    ctrl._do_timeout(delta=5.0)
+
+    (row,) = rows(ctrl)
+    assert (row["event"], row["player"], row["type"]) == ("timeout", "none", "home")
+    assert ctrl.timeouts_left[HOME] == 6 and ctrl.timeouts_left[AWAY] == 7
+    assert ctrl.ball_dead is True          # the point: a substitution opportunity
+
+
+def test_the_budget_is_seven_a_game():
+    ctrl = _timeout_ctrl()
+    assert ctrl.timeouts_left == {HOME: 7, AWAY: 7}
+    for _ in range(7):
+        ctrl.sim.script(type=["home"])
+        ctrl._do_timeout(delta=1.0)
+    assert ctrl.timeouts_left[HOME] == 0
+    assert HOME not in ctrl._timeout_teams()            # masked out of the head's choices
+    assert AWAY in ctrl._timeout_teams()
+
+
+def test_the_fourth_quarter_caps_what_is_still_usable():
+    """A team that hoarded all seven cannot spend them all in the fourth."""
+    ctrl = _timeout_ctrl()
+    ctrl.clock = 60.0                                   # Q1
+    assert ctrl._timeouts_available(HOME) == 7
+    ctrl.clock = REGULATION - 300                        # Q4, 5:00 left
+    assert ctrl._timeouts_available(HOME) == 4
+    ctrl.clock = REGULATION - 100                        # Q4, inside the final 3:00
+    assert ctrl._timeouts_available(HOME) == 2
+
+
+def test_overtime_grants_two_more_each():
+    ctrl = _timeout_ctrl()
+    ctrl.timeouts_left = {HOME: 1, AWAY: 0}
+    ctrl.score = {HOME: 100, AWAY: 100}                  # tied, so the game opens an OT
+    ctrl.clock = REGULATION + 1
+    ctrl._check_period()
+    assert ctrl.timeouts_left == {HOME: 3, AWAY: 2}
+
+
+def test_a_bundle_without_the_head_never_calls_a_timeout():
+    """Weights trained before 2.0 have no timeout_team head and no "timeout" event token."""
+    ctrl = make_controller(HOME)                        # FakeSim without the timeout head
+    assert ctrl.use_timeouts is False
+    ctrl.ball_dead = True
+    assert "timeout" not in ctrl._event_menu(post_miss=False)
+
+
+# ===================================================================== #
+# Team rebounds
+# ===================================================================== #
+
+def test_a_team_rebound_emits_a_row_and_picks_no_rebounder():
+    """DEADBALL_REBOUND_PROB flipped possession silently and emitted NO row at all."""
+    ctrl = make_controller(HOME)
+    ctrl.sim.script(type=["team defensive"])
+    ctrl._do_rebound(delta=2.0)
+
+    (reb,) = rows(ctrl)
+    assert (reb["event"], reb["player"], reb["type"]) == ("rebound", "none", "team defensive")
+    assert not [c for c in ctrl.sim.calls if c[0] == "player"]   # nobody is credited
+    assert ctrl.possession == AWAY                                # defensive board flips it
+
+
+def test_a_team_offensive_rebound_keeps_possession():
+    ctrl = make_controller(HOME)
+    ctrl.sim.script(type=["team offensive"])
+    ctrl._do_rebound(delta=2.0)
+
+    (reb,) = rows(ctrl)
+    assert (reb["type"], reb["result"]) == ("team offensive", "null")
+    assert ctrl.possession == HOME
+    assert ctrl.ball_dead is True          # out of bounds: inbounded, not live off the rim
+
+
+def test_the_rebound_head_sees_all_four_tokens():
+    ctrl = make_controller(HOME)
+    ctrl.sim.script(type=["offensive"], player=["B"])
+    ctrl._do_rebound(delta=2.0)
+    allowed = [c for c in ctrl.sim.calls if c[0] == "type"][0][3]
+    assert allowed == ["offensive", "defensive", "team offensive", "team defensive"]
+
+
+def test_the_deadball_rebound_dial_is_gone():
+    """It was a coin flip standing in for a distribution the head can now learn."""
+    assert not hasattr(config, "DEADBALL_REBOUND_PROB")
+    assert "DEADBALL_REBOUND_PROB" not in config._TUNING_KEYS
+
+
+# ===================================================================== #
 # The fouled player
 # ===================================================================== #
 
@@ -676,7 +796,6 @@ def test_a_steal_stays_live_but_a_plain_turnover_kills_the_ball():
 
 def test_a_live_rebound_keeps_the_ball_live():
     ctrl = make_controller(HOME)
-    config.DEADBALL_REBOUND_PROB = 0.0          # force the individual-rebound path
     ctrl.ball_dead = True
     ctrl.sim.script(type=["defensive"], player=["F"])
     ctrl._do_rebound(delta=2.0)
@@ -685,8 +804,8 @@ def test_a_live_rebound_keeps_the_ball_live():
 
 def test_a_team_rebound_kills_the_ball():
     ctrl = make_controller(HOME)
-    config.DEADBALL_REBOUND_PROB = 1.0          # force the dead-ball rebound path
     ctrl.ball_dead = False
+    ctrl.sim.script(type=["team defensive"])   # no player pick on a team board
     ctrl._do_rebound(delta=2.0)
     assert ctrl.ball_dead is True
 

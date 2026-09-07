@@ -109,7 +109,7 @@ EVENT_BIAS: dict[str, float] = {"foul": 0.11, "turnover": -0.08}
 # v1.0 full2 (all values below already applied): FTA still over +1.44 (team level) even with PF now
 # under -0.71 -- cut shooting-foul share further so FTA keeps falling as EVENT_BIAS.foul is restored
 # above. OREB landed close (+0.46) while DREB is still over (+1.17); bumped the offensive split back
-# up a touch to protect OREB's share while DEADBALL_REBOUND_PROB (below) pulls more total volume,
+# up a touch to protect OREB's share while the deadball-rebound dial (since removed) pulled volume,
 # mostly from DREB, on the next pass. "loose ball" left untouched to isolate its effect this round.
 TYPE_BIAS: dict[str, dict[str, float]] = {
     # "shooting" split into two tokens in 2.0; the fitted +0.15 is carried onto both so the
@@ -222,21 +222,11 @@ FOUL_OUT_LIMIT = 6
 # at Δt=0). Lowering it trims that long tail and nudges pace UP, so it's the secondary pace lever
 # after DELTA_TIME_SCALE (leave at 60 while tuning the scale; try ~45 only if pace still lags).
 MAX_DELTA = 60.0
-# Probability a missed shot yields no individual rebound (an out-of-bounds / dropped team rebound):
-# the ball just changes hands with no row. The off/def split of real rebounds is the rebound-type
-# head's job; this is only the rare no-rebounder case. The controller imports this.
-# Raised 0.06 -> 0.09: v1.0 full1 (100-game holdout) had OREB *and* DREB both over by the same
-# +2.22 -- total individually-attributed rebound volume is inflated on both sides, not just the
-# off/def split (that's TYPE_BIAS.rebound_type's job, tuned separately above). More dead-ball
-# rebounds pulls both counts down together without touching the split.
-# Raised further 0.09 -> 0.10: v1.0 full2 landed OREB close (+0.46) but DREB is still over (+1.17)
-# -- the rebound_type.offensive cut (also made in full2) pulled OREB down twice as hard as DREB.
-# Pulling a bit more total volume here, offset by bumping rebound_type.offensive back up above, so
-# the extra cut lands mostly on DREB. This should also trim the pace bias regression full2 saw
-# (+0.50 -> +0.95): pace ~= FGA - OREB + TOV + 0.44*FTA, so full2's OREB drop mechanically pushed
-# the pace estimate up; restoring some FTA (via EVENT_BIAS.foul above) and reeling in rebounds
-# further both pull pace back down as a side effect, not a direct target.
-DEADBALL_REBOUND_PROB = 0.10
+# DEADBALL_REBOUND_PROB is gone. It flipped possession on a coin toss and emitted NO ROW,
+# so the model never saw a team rebound and could not learn its share. The rebound-type
+# head now carries "team offensive"/"team defensive" tokens and learns it from the data.
+# Its fitted history (0.09 -> 0.10, chasing the OREB/DREB split and the pace bias) is in
+# git; do not resurrect the value -- refit rebound_type from zero after the 2.0 train.
 
 # Post-hoc linear calibration on predicted point margin, applied only when aggregating spread
 # metrics for the eval report (simulation/eval_metrics.py) -- never to the raw per-game record, so
@@ -251,7 +241,7 @@ MARGIN_CALIBRATION_INTERCEPT = -0.31
 # Rollout dials captured into each evaluation report (reporting/eval_report.py) so tuning settings
 # are recorded alongside results for cross-run analysis. Order is the display order in the report.
 _TUNING_KEYS = (
-    "DELTA_TIME_SCALE", "MAX_DELTA", "DEADBALL_REBOUND_PROB",
+    "DELTA_TIME_SCALE", "MAX_DELTA",
     "PLAYER_TEMPERATURE", "EVENT_TEMPERATURE", "TYPE_TEMPERATURE", "RESULT_TEMPERATURE",
     "SUB_TEMPERATURE", "SUB_INCOMING_TEMPERATURE", "SUB_FATIGUE_WEIGHT", "SUB_MAX_GAP_SECONDS",
     "STINT_SAMPLE_SIGMA", "STINT_LENGTH_SCALE", "STINT_MAX_SECONDS", "FOUL_OUT_LIMIT",
