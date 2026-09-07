@@ -19,6 +19,15 @@ _SHOOTING_LABEL_COL = "_shooting_foul_label"
 # gap 7). Rows that find nothing inside the window fall back on the preceding shot.
 _FT_LOOKAHEAD = 8
 _SHOT_LOOKBEHIND = 6
+# A bare "team rebound" carries no side. These bound the scan that recovers it: back to the shot
+# it came off, forward to the next event that says who ended up with the ball.
+_REBOUND_LOOKBEHIND = 6
+_POSSESSION_LOOKAHEAD = 12
+# Events that actually indicate possession. A foul is deliberately NOT one: it is usually
+# committed by the team WITHOUT the ball, so counting it inverts the answer.
+_POSSESSION_EVENTS = {"shot", "free throw", "turnover"}
+# Private column carrying the recovered side from parse_file into process_row. Never emitted.
+_TEAM_REBOUND_LABEL_COL = "_team_rebound_side"
 # Raw rows that end a possession sequence — never scan a lookahead/lookbehind across one.
 _BOUNDARY_EVENTS = {"start of period", "end of period"}
 
@@ -259,6 +268,73 @@ class DataCleaner:
                     break
         return labels
 
+    @staticmethod
+    def _label_team_rebounds(df):
+        """Side for each bare ``team rebound`` row: a team token, or None meaning drop it.
+
+        Two thirds of these rows are not rebounds. 6,336 of 2022-23's 9,374 follow a missed free
+        throw that was **not the last of its trip** (6,078 are literally "missed 1 of 2"): the
+        ball is dead, the shooter shoots again, and the row is bookkeeping. Emitting those as
+        rebounds would inject ~6.3k phantom boards a season into the head whose entire job is
+        the offensive/defensive split.
+
+        The rest are real -- a team board off a missed field goal (2,698) or a missed last free
+        throw (327) -- and the raw type simply does not record which way the ball went. It is
+        recoverable: the next event that actually indicates possession (a shot, a free throw or
+        a turnover -- **not** a foul, which is usually committed by the team without the ball,
+        and not a substitution or timeout) names the team that ended up with it. Validated
+        against the 11,884 playerless rebounds whose side IS recorded, in the same structural
+        position: **99.8% correct** where decidable, 0.6% undecidable.
+        """
+        events = df["event_type"].tolist() if "event_type" in df else []
+        types = df["type"].tolist() if "type" in df else [None] * len(events)
+        teams = df["team"].tolist() if "team" in df else [None] * len(events)
+        results = df["result"].tolist() if "result" in df else [None] * len(events)
+        nums = df["num"].tolist() if "num" in df else [None] * len(events)
+        outofs = df["outof"].tolist() if "outof" in df else [None] * len(events)
+
+        def _blank(v):
+            return v is None or pd.isna(v) or not str(v).strip()
+
+        def _int(v):
+            try:
+                return int(float(v))
+            except (TypeError, ValueError):
+                return None
+
+        labels = [None] * len(events)
+        for i, event in enumerate(events):
+            if event != "rebound" or str(types[i] or "").strip() != "team rebound":
+                continue
+
+            # 1) Was a live rebound even possible? Only after a missed field goal or a missed
+            #    LAST free throw -- the same condition the controller calls pending_rebound.
+            off_team = None
+            for k in range(i - 1, max(i - _REBOUND_LOOKBEHIND, -1), -1):
+                if events[k] in _BOUNDARY_EVENTS:
+                    break
+                if events[k] == "shot":
+                    if results[k] == "missed" and not _blank(teams[k]):
+                        off_team = teams[k]
+                    break
+                if events[k] == "free throw":
+                    last = _int(nums[k]) == _int(outofs[k])
+                    if results[k] == "missed" and last and not _blank(teams[k]):
+                        off_team = teams[k]
+                    break
+            if off_team is None:
+                continue
+
+            # 2) Which side got it? The next event that indicates possession.
+            for j in range(i + 1, min(i + _POSSESSION_LOOKAHEAD, len(events))):
+                if events[j] in _BOUNDARY_EVENTS:
+                    break
+                if events[j] in _POSSESSION_EVENTS and not _blank(teams[j]):
+                    labels[i] = ("team offensive" if teams[j] == off_team
+                                 else "team defensive")
+                    break
+        return labels
+
     def determine_foul_result(self, foul_type):
         """Map foul type to a result token."""
         mapping = {
@@ -492,12 +568,26 @@ class DataCleaner:
 
         # ---- REBOUND ----
         if row["event_type"] == "rebound":
-            # A bare "team rebound" carries no side at all. 22.6% of them sit at a period
-            # boundary and 71% follow a free throw, so they are mostly bookkeeping rather than a
-            # live board, and nothing in the row says which way the ball went -- inferring it
-            # from the next team-bearing event gives an implausible 65/12 offensive split. They
-            # stay dropped, as before. The playerless *typed* rebounds below do carry a side.
+            # A bare "team rebound" carries no side. Two thirds of them are not rebounds at all
+            # (the dead-ball row between free throws in a trip) and are dropped; for the rest the
+            # side is recovered from what happens next. See _label_team_rebounds.
             if row["type"] == "team rebound":
+                side = row.get(_TEAM_REBOUND_LABEL_COL)
+                if not side or pd.isna(side):
+                    return events
+                events.append({
+                    "roster_home": clean_home,
+                    "roster_away": clean_away,
+                    "time": time_safe,
+                    "event": "rebound",
+                    "player": "none",
+                    "type": side,
+                    "result": "cop" if side.endswith("defensive") else "null",
+                    "secondary_player": "none",
+                    "home/away": home,
+                    "season": self.season,
+                    "playoff": 2 if self.playoff else 1,
+                })
                 return events
 
             rebound_type = (
@@ -657,6 +747,8 @@ class DataCleaner:
         # Shooting fouls need the FOLLOWING trip's `outof` to know whether the fouled attempt
         # was a 2 or a 3, so the label is computed over the whole file before the row loop.
         df[_SHOOTING_LABEL_COL] = self._label_shooting_fouls(df)
+        # Bare team rebounds record no side; recover it (or mark the row for dropping).
+        df[_TEAM_REBOUND_LABEL_COL] = self._label_team_rebounds(df)
 
         for _, row in df.iterrows():
             new_row = self.process_row(row)

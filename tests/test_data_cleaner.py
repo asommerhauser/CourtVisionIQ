@@ -435,12 +435,59 @@ def test_a_credited_rebound_is_unchanged(tmp_path):
     assert (reb["type"], reb["player"]) == ("offensive", "Alice")
 
 
-def test_a_bare_team_rebound_is_still_dropped(tmp_path):
-    """It carries no side, and 22.6% sit at a period boundary — bookkeeping, not a board."""
+def _miss(player, team):
+    return {"event_type": "shot", "player": player, "team": team, "result": "missed"}
+
+
+_BARE = {"event_type": "rebound", "player": None, "type": "team rebound", "result": None,
+         "team": None}
+
+
+def test_a_bare_team_rebounds_side_is_recovered_from_the_next_possession(tmp_path):
+    """The raw type records no side; the next possession-bearing event does."""
+    kept = _parse(tmp_path, [
+        _miss("Alice", "LAL"), _miss("Frank", "BOS"),      # resolve both abbreviations
+        _miss("Frank", "BOS"), _BARE, _miss("Gus", "BOS"),   # BOS kept it -> offensive
+        _miss("Frank", "BOS"), _BARE, _miss("Alice", "LAL"),  # LAL got it -> defensive
+    ])
+    reb = kept[kept["event"] == "rebound"]
+    assert list(reb["type"]) == ["team offensive", "team defensive"]
+    assert list(reb["result"]) == ["null", "cop"]
+
+
+def test_a_team_rebound_between_free_throws_is_not_a_rebound(tmp_path):
+    """6,336 of 2022-23's 9,374 bare rows are this: the ball is dead, the shooter shoots again."""
     cleaned = _parse(tmp_path, [
-        {"event_type": "rebound", "player": None, "type": "team rebound", "result": None},
+        _miss("Alice", "LAL"), _miss("Frank", "BOS"),
+        {"event_type": "free throw", "player": "Alice", "team": "LAL", "result": "missed",
+         "num": 1, "outof": 2},
+        _BARE,
+        {"event_type": "free throw", "player": "Alice", "team": "LAL", "result": "made",
+         "num": 2, "outof": 2},
     ])
     assert cleaned[cleaned["event"] == "rebound"].empty
+
+
+def test_a_team_rebound_with_no_following_possession_is_dropped(tmp_path):
+    """End-of-period boards: nobody ever gets the ball, so there is no side to record."""
+    cleaned = _parse(tmp_path, [
+        _miss("Alice", "LAL"), _miss("Frank", "BOS"),
+        _miss("Frank", "BOS"), _BARE,
+    ])
+    assert cleaned[cleaned["event"] == "rebound"].empty
+
+
+def test_a_foul_is_never_read_as_possession(tmp_path):
+    """A foul is usually committed by the team WITHOUT the ball — counting it inverts the side."""
+    cleaned = _parse(tmp_path, [
+        _miss("Alice", "LAL"), _miss("Frank", "BOS"),
+        _miss("Frank", "BOS"), _BARE,
+        {"event_type": "foul", "player": "Alice", "team": "LAL", "type": "personal",
+         "opponent": "Gus", "result": None},
+        _miss("Gus", "BOS"),                               # BOS actually had it -> offensive
+    ])
+    reb = cleaned[cleaned["event"] == "rebound"].iloc[0]
+    assert reb["type"] == "team offensive"
 
 
 # ---------------------------------------------------------------------------
