@@ -38,7 +38,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged
 | 3 | `feature/shot-zone-geometry` | 2 | §3 | [x] | 8434786 |
 | 4 | `feature/shot-zones` | 2 | §3 | [x] | 27a3327 |
 | 5 | `feature/ft-count-tokens` | 2 | §4 | [x] | 4b0dd09 |
-| 6 | `feature/fouled-player` | 2 | §5 | [ ] | |
+| 6 | `feature/fouled-player` | 2 | §5 | [x] | 715cedb |
 | 7 | `feature/timeouts-team-rebounds` | 2 | §6 | [ ] | |
 | 8 | `feature/schema-cleanup` | 2 | §7 | [ ] | |
 | — | **Gate B — the re-clean + vocab rebuild** | 2 | | [ ] | |
@@ -320,9 +320,24 @@ Write raw `opponent` into it (`none` for technicals), and let `_pick_shooter`
 pytest tests/test_data_cleaner.py tests/test_controller.py tests/test_encoder.py -q
 ```
 
-**Result:**
+**Result:** 144 passed (data_cleaner + controller + encoder).
 
-**Notes:**
+**Notes:** Measured before writing anything: the raw `opponent` column is **100% populated
+for every non-technical foul type** in 2022-23 and **100% empty for technicals** - exactly
+the split the spec assumed - and it matches the actual free-throw shooter **99.5%** of the
+time. That last figure is what justifies collapsing the victim and the shooter into one
+draw instead of a foul row naming nobody plus an unrelated draw.
+
+`_pick_shooter` survives for **technicals only**, against the spec's "gives way to the
+fouled player": a technical genuinely has no victim, and someone still has to shoot.
+Collapsing it entirely would mean inventing a name for a field the real data leaves blank.
+
+`_do_shooting_foul` is reordered so the and-1 check runs before the foul row is appended
+(`prev` moved from `history[-2]` to `history[-1]`); the and-1 case needs no draw at all
+because the scorer is the player who was fouled.
+
+Cost: **every foul now draws a victim**, where before only fouls producing free throws drew
+anyone. One extra player-head call per foul, ~40 a game.
 
 ### 7. `feature/timeouts-team-rebounds` — §6
 
@@ -682,3 +697,4 @@ Append one line per merge. Newest last.
 | 2026-09-06 | `feature/shot-zone-geometry` | 8434786 | 42 green; zone validation table passes all gates (correction H) |
 | 2026-09-07 | `feature/shot-zones` | 27a3327 | full suite green; 13 test files re-tokenized, not 6 |
 | 2026-09-07 | `feature/ft-count-tokens` | 4b0dd09 | phantom shot_type sample deleted; and-1 rule added (correction I) |
+| 2026-09-07 | `feature/fouled-player` | 715cedb | 144 green; opponent 100% populated except technicals |

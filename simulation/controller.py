@@ -569,7 +569,12 @@ class GameController:
             self._count_team_foul(fouler_team)
 
         result, n_ft, retain = self._foul_outcome(ftype, fouler_team, on_defense)
-        self._append("foul", fouler, ftype, result)
+        # Who got fouled. Sampled BEFORE the row is emitted so it can ride in secondary_player,
+        # and reused as the free-throw shooter -- one player, drawn once, instead of a foul row
+        # that names nobody plus an unrelated draw for the shooter. A technical has no victim
+        # (the raw `opponent` column is empty for 100% of them), so it stays "none".
+        fouled = "none" if ftype == "technical" else self._pick_fouled_player(ft_team)
+        self._append("foul", fouler, ftype, result, secondary=fouled)
         self._charge_foul(fouler, ftype)
         self.ball_dead = True          # every foul is a whistle; _free_throws may revive it
 
@@ -582,14 +587,15 @@ class GameController:
             self._eject(fouler)
         if ftype == "technical":
             # One technical FT to the other side, then play resumes with whoever had the ball —
-            # a technical does not change possession. Dead ball, so no rebound on a miss.
+            # a technical does not change possession. Dead ball, so no rebound on a miss. The
+            # shooter is an independent draw here precisely because nobody was fouled.
             held = self.possession
             self._free_throws(self._pick_shooter(ft_team), ft_team, 1,
                               live_last=False, retain=True)
             self.possession = held
             return
         if n_ft > 0:
-            self._free_throws(self._pick_shooter(ft_team), ft_team, n_ft,
+            self._free_throws(fouled, ft_team, n_ft,
                               live_last=not retain, retain=retain)
         # else "nothing" → common foul, no FTs, possession unchanged.
 
@@ -630,25 +636,27 @@ class GameController:
         is defensive by definition" is true by construction: neither shooting token is in the
         offensive side's mask, so this is only ever reached for a defender.
         """
-        self._append("foul", fouler, ftype, "free throw")
-        self._charge_foul(fouler, ftype)
-        self.ball_dead = True          # whistle; _free_throws decides the state after the trip
         shooting_team = self._other(fouler_team)
 
-        prev = self.sim.history[-1 - 1] if len(self.sim.history) >= 2 else None  # row before foul
+        # The and-1 check reads the row BEFORE the foul, so it must run before the foul row is
+        # appended -- the fouled player has to be known to ride in secondary_player.
+        prev = self.sim.history[-1] if self.sim.history else None
         and_one = (prev is not None and prev.get("event") == "shot"
                    and prev.get("result") == "made" and prev.get("type") in FIELD_GOAL_TYPES
                    and self._team_of(prev.get("player")) == shooting_team)
 
         if and_one:
-            shooter = prev["player"]                   # the player who made the basket
+            fouled = prev["player"]                    # the player who made the basket
             n_ft = 1                                   # the basket already counted
         else:
-            shooter = self._pick_shooter(shooting_team)
+            fouled = self._pick_fouled_player(shooting_team)
             n_ft = 3 if ftype == SHOOTING_3PT else 2   # straight off the sampled foul token
 
+        self._append("foul", fouler, ftype, "free throw", secondary=fouled)
+        self._charge_foul(fouler, ftype)
+        self.ball_dead = True          # whistle; _free_throws decides the state after the trip
         self._count_team_foul(fouler_team)             # always a defensive team foul
-        self._free_throws(shooter, shooting_team, n_ft, live_last=True, retain=False)
+        self._free_throws(fouled, shooting_team, n_ft, live_last=True, retain=False)
 
     def _foul_outcome(self, ftype: str, fouler_team: str, on_defense: bool) -> tuple[str, int, bool]:
         """Map a foul to (result token, number of FTs, retain-possession) — bonus-aware.
@@ -679,8 +687,21 @@ class GameController:
             return ("free throw", 2, False)
         return ("nothing", 0, False)
 
+    def _pick_fouled_player(self, team: str) -> str:
+        """Sample which player on ``team`` was fouled — and therefore shoots any free throws.
+
+        Drawing fouls is a skill (rim pressure, shooting motion, being the player in the bonus)
+        and the model could not represent it: every foul row carried ``secondary_player="none"``,
+        so there was no ground truth for who drew a foul anywhere in the corpus. The raw
+        ``opponent`` column has it for 100% of non-technical fouls, and matches the actual
+        free-throw shooter 99.5% of the time, so one draw serves both roles.
+        """
+        return self.sim.predict_player("shot", self._five_of(team),
+                                       delta_seconds=0.0, greedy=self.greedy,
+                                       temperature=self.player_temp)
+
     def _pick_shooter(self, team: str) -> str:
-        """Sample which player on ``team`` takes the awarded free throws (the fouled player)."""
+        """Sample a free-throw shooter with no fouled player to inherit — technicals only."""
         return self.sim.predict_player("shot", self._five_of(team),
                                        delta_seconds=0.0, greedy=self.greedy,
                                        temperature=self.player_temp)

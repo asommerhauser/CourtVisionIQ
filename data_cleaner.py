@@ -536,6 +536,13 @@ class DataCleaner:
                 # the whole file (needs the *following* trip's `outof`); see _label_shooting_fouls.
                 foul_type = row.get(_SHOOTING_LABEL_COL) or SHOOTING_2PT
             foul_result = self.determine_foul_result(foul_type)
+            # Who got fouled, from the raw `opponent` column. Populated for 100% of non-technical
+            # fouls (2022-23) and empty for 100% of technicals, which have no victim. It shares
+            # the player embedding (encoder.encode_secondary_player delegates to player_vocab),
+            # so every head sees the fouled player through history at no architectural cost --
+            # and drawing fouls stops being a skill the model cannot represent.
+            fouled = row.get("opponent")
+            fouled = str(fouled).strip() if pd.notna(fouled) and str(fouled).strip() else "none"
             events.append({
                 "roster_home": clean_home,
                 "roster_away": clean_away,
@@ -544,7 +551,7 @@ class DataCleaner:
                 "player": row["player"] if pd.notna(row["player"]) else "null",
                 "type": foul_type,
                 "result": foul_result,
-                "secondary_player": "none",
+                "secondary_player": fouled,
                 "home/away": home,
                 "season": self.season,
                 "playoff": 2 if self.playoff else 1,

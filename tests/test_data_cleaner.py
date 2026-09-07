@@ -58,6 +58,8 @@ _DEFAULT_ROW = {
     # KEPT from 2.0 on — a shooting foul's free-throw count is read off the following trip's
     # `outof` (and, for an and-1, the preceding basket's `points`). See _label_shooting_fouls.
     "outof": None, "num": None, "points": None,
+    # KEPT from 2.0 on — the fouled player, written into a foul row's secondary_player.
+    "opponent": None,
     "possession": None,
     "original_x": None, "original_y": None,
     "description": None,
@@ -372,6 +374,47 @@ def test_non_shot_rows_never_get_a_zone(tmp_path):
     for _, row in cleaned.iterrows():
         if row["event"] in ("turnover", "foul"):
             assert row["type"] not in ZONE_TOKENS, f"{row['event']} typed as {row['type']}"
+
+
+# ---------------------------------------------------------------------------
+# The fouled player — foul rows name who drew the foul
+# ---------------------------------------------------------------------------
+
+def test_foul_rows_carry_the_fouled_player(tmp_path):
+    """Before 2.0 every foul row was secondary_player="none" — no ground truth anywhere."""
+    cleaned = _parse(tmp_path, [
+        {"event_type": "foul", "player": "Frank", "type": "personal", "opponent": "Bob",
+         "result": None},
+    ])
+    foul = cleaned[cleaned["event"] == "foul"].iloc[0]
+    assert foul["player"] == "Frank" and foul["secondary_player"] == "Bob"
+
+
+def test_a_technical_has_no_fouled_player(tmp_path):
+    """The raw `opponent` column is empty for 100% of technicals — nobody is fouled."""
+    cleaned = _parse(tmp_path, [
+        {"event_type": "foul", "player": "Frank", "type": "technical", "opponent": None,
+         "result": None},
+    ])
+    assert cleaned[cleaned["event"] == "foul"].iloc[0]["secondary_player"] == "none"
+
+
+def test_an_offensive_foul_names_the_defender_who_drew_it(tmp_path):
+    cleaned = _parse(tmp_path, [
+        {"event_type": "foul", "player": "Alice", "type": "offensive charge",
+         "opponent": "Ivy", "result": None},
+    ])
+    foul = cleaned[cleaned["event"] == "foul"].iloc[0]
+    assert (foul["type"], foul["secondary_player"]) == ("offensive", "Ivy")
+
+
+def test_a_blank_opponent_falls_back_to_none(tmp_path):
+    for blank in (None, "", "   "):
+        cleaned = _parse(tmp_path, [
+            {"event_type": "foul", "player": "Frank", "type": "personal", "opponent": blank,
+             "result": None},
+        ])
+        assert cleaned[cleaned["event"] == "foul"].iloc[0]["secondary_player"] == "none"
 
 
 # ---------------------------------------------------------------------------
