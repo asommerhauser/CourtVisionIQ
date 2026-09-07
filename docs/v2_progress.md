@@ -34,7 +34,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged
 |---|---|---|---|---|---|
 | 1 | `feature/side-aware-fouls` | 1 | §1 | [x] | f55758d |
 | 2 | `feature/dead-ball-state` | 1 | §2 | [x] | 5ea3afd |
-| — | **Gate A — Phase 1 short eval** | 1 | | [ ] | |
+| — | **Gate A — Phase 1 short eval** | 1 | | skipped | - |
 | 3 | `feature/shot-zone-geometry` | 2 | §3 | [ ] | |
 | 4 | `feature/shot-zones` | 2 | §3 | [ ] | |
 | 5 | `feature/ft-count-tokens` | 2 | §4 | [ ] | |
@@ -144,9 +144,14 @@ python evaluate.py --model v1.0 --run p1-smoke --holdout 8 --monte-carlo 5 --see
 Looking for: it runs clean, and FTA / PF / the offensive-defensive foul split move in the expected
 direction. Send back the summary table, not the whole log. This is a sanity check, not a verdict.
 
-**Result:**
+**Result:** Skipped, deliberately (2026-09-06).
 
-**Notes:**
+**Notes:** Not run. The cost was not judged worth the signal, and this eval was only ever
+a sanity check, not a verdict. The consequence to be aware of: **Phase 1 now has no
+measurement of its own.** If a later phase produces an ambiguous result, there is no
+datapoint isolating the controller-rule changes from everything downstream, and no way to
+recover one - the re-clean at Gate B makes the v1.0 weights unable to produce a meaningful
+sim. Phase 1 rides on its 76 passing tests alone.
 
 ---
 
