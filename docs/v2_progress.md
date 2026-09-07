@@ -92,7 +92,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | 8 | `feature/schema-cleanup` | 2 | §7 | [x] | 0605a35 |
 | — | **Gate B — the re-clean + vocab rebuild** | 2 | | [ ] | |
 | 9 | `feature/shared-backbone` | 3 | §9 pre | [x] | b9ff4ea |
-| 10a | `feature/local-attention` | 3 | §9 | [ ] | |
+| 10a | `feature/local-attention` | 3 | §9 | [x] | f402341 |
 | 10b | `feature/possession-clock` | 3 | §9 | [ ] | |
 | 11 | `feature/rotation-model` | 3 | §8 | [ ] | |
 | 12 | `feature/training-changes` | 3 | §10 | [ ] | |
@@ -614,9 +614,36 @@ python -m pytest tests/ -q
 `test_model_persistence.py` and `test_backbone.py` are the ones that matter: with the switch off,
 the graph must be identical to today's.
 
-**Result:**
+**Result:** Full suite: 663 passed, 1 failed - the failure my own window test (see Notes);
+15 passed on `test_local_attention.py` after the fix. `test_model_persistence` green with the
+banded path as the default, no OOM and no shape errors anywhere.
 
-**Notes:**
+**Notes:** The layer emits the band's **lower edge only** - `(i - j) < window`. The upper edge
+would be redundant: `MultiHeadAttention(use_causal_mask=True)` already forbids attending
+forward, and skipping it saves a comparison over a (B, H, SEQ, SEQ) tensor. The consequence is
+that **the emitted mask is not the window** - at `window=1` the band alone is the whole upper
+triangle - and only `band AND causal` is meaningful. My first test asserted the identity
+matrix from the band alone and failed; the test now checks the conjunction, with a row-count
+assertion (row `r` sees `min(r + 1, window)` keys) rather than a restatement of the band
+formula. Behaviour was never wrong.
+
+Both mask paths keep the layer name `attn_pad_mask`, so flipping the switch perturbs no layer
+naming and the by-name reload contract holds either way. Neither layer has weights, and the
+full `.keras` reload records the class in its config, so a saved model rebuilds the right one.
+
+`LOCAL_ATTENTION_HEADS = 0` rebuilds the pre-2.0 graph exactly - same `KeyPaddingMask`, same
+(B, 1, SEQ) shape - which is what makes the post-train A/B a real comparison rather than an
+approximation. Pinned by a test.
+
+Correction K acted on: both settings are in `ARCH_KEYS`, neither is in `_TUNING_KEYS`, and a
+test asserts each.
+
+Side benefit: with the default at 2 and most tiny-dim tests building at `num_heads=2`, the
+existing suite now exercises the banded path throughout rather than only the new test file.
+
+**Not measured, and not measurable from here:** the mask is ~176 MB of bool at `SEQ=600`,
+`H=8`, batch 64. One allocation shared by all six blocks, not six, but watch memory on the
+first real train.
 
 ### 10b. `feature/possession-clock` — §9, the shot-clock proxy
 
@@ -911,3 +938,4 @@ Append one line per merge. Newest last.
 | 2026-09-07 | `feature/timeouts-team-rebounds` | b54685f | 628 green; team-rebound side recovered at 99.8% (correction J) |
 | 2026-09-07 | `feature/schema-cleanup` | 0605a35 | merged on instruction, verified after: 634 green; Phase 2 complete |
 | 2026-09-07 | `feature/shared-backbone` | b9ff4ea | layer-name diff clean; correction G closed; workstream 10 split into 10a/10b |
+| 2026-09-07 | `feature/local-attention` | f402341 | 663 green; switch-off parity pinned; ARCH_KEYS entry added (correction K) |

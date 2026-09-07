@@ -7,8 +7,8 @@ projection to ``model_dim``, the learned positional embedding, the key-padding m
 pre-norm transformer blocks, and a final layer norm. Six copies meant six places to keep in
 step, and §9's local-attention masking would have had to land in each of them separately.
 
-This module owns that stack. Layer names are carried over verbatim, because weight reload
-matches **by name**: ``from_artifacts`` rebuilds the graph from config and restores into it,
+This module owns that stack -- which is also what lets §9's local attention land in one place
+instead of six. Layer names are carried over verbatim, because weight reload matches **by name**: ``from_artifacts`` rebuilds the graph from config and restores into it,
 and the single-file ``<key>.keras`` reload does the same. A rename here is silent at build
 time and surfaces later as a failed -- or partially restored -- reload.
 ``scripts/dump_layer_names.py`` exists to check exactly that.
@@ -24,6 +24,7 @@ import tensorflow as tf
 import keras
 from keras import layers
 
+import config
 from config import NUM_LAYERS, NUM_HEADS, FF_DIM
 
 
@@ -74,6 +75,78 @@ class KeyPaddingMask(layers.Layer):
         return (input_shape[0], 1, input_shape[1])
 
 
+@keras.saving.register_keras_serializable(package="cviq")
+class BandedAttentionMask(layers.Layer):
+    """Per-head attention mask: the first ``local_heads`` heads see only a trailing window.
+
+    Attention builds each row from a weighted average over every earlier row, and nothing pushes
+    any head toward the last few -- but basketball is overwhelmingly local. Restricting a minority
+    of heads to a short window gives the block a recency bias without taking global context away
+    from the rest, and it needs no new weights and no custom kernel: it is the same masking
+    mechanism as the padding mask, one axis wider.
+
+    Turns a (B, SEQ) float pad-mask into a (B, H, SEQ, SEQ) boolean mask. Local heads get
+    ``band AND pad``, global heads get ``pad`` alone. Only the band's *lower* edge is applied --
+    ``MultiHeadAttention(use_causal_mask=True)`` already forbids attending forward, so the upper
+    edge would be redundant.
+
+    Costs one (B, H, SEQ, SEQ) bool tensor -- about 176 MB at SEQ=600, H=8, batch 64. It is built
+    once outside the block loop and shared by every block, the same lifetime the plain padding
+    mask already has.
+    """
+
+    def __init__(self, num_heads: int, local_heads: int, window: int, **kwargs):
+        super().__init__(**kwargs)
+        if not 0 < local_heads <= num_heads:
+            raise ValueError(
+                f"local_heads must be in (0, {num_heads}], got {local_heads}. "
+                "Zero local heads is the plain KeyPaddingMask path, not this layer.")
+        if window < 1:
+            raise ValueError(f"window must be at least 1, got {window}")
+        self.num_heads = num_heads
+        self.local_heads = local_heads
+        self.window = window
+
+    def call(self, m):
+        pad = tf.cast(m, "bool")                             # (B, SEQ)
+        seq = tf.shape(pad)[1]
+        i = tf.range(seq)[:, tf.newaxis]
+        j = tf.range(seq)[tf.newaxis, :]
+        band = (i - j) < self.window                         # (SEQ, SEQ), lower edge only
+        is_local = tf.range(self.num_heads) < self.local_heads
+        per_head = tf.where(is_local[:, tf.newaxis, tf.newaxis],
+                            band[tf.newaxis], tf.ones_like(band)[tf.newaxis])
+        return per_head[tf.newaxis] & pad[:, tf.newaxis, tf.newaxis, :]
+
+    def compute_output_shape(self, input_shape):
+        seq = input_shape[1]
+        return (input_shape[0], self.num_heads, seq, seq)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"num_heads": self.num_heads, "local_heads": self.local_heads,
+                    "window": self.window})
+        return cfg
+
+
+def _attention_mask(pad_mask, num_heads):
+    """The mask every block attends under -- banded per-head, or the plain padding mask.
+
+    Both carry the layer name ``attn_pad_mask``, so flipping the switch perturbs no layer
+    naming and the reload contract holds either way; neither layer has weights, and the full
+    ``.keras`` reload records the class in its config.
+
+    ``config.LOCAL_ATTENTION_HEADS`` is read here, at build time, rather than imported at module
+    load, so a test can set it and rebuild.
+    """
+    local = int(getattr(config, "LOCAL_ATTENTION_HEADS", 0) or 0)
+    if local <= 0:
+        return KeyPaddingMask(name="attn_pad_mask")(pad_mask)
+    return BandedAttentionMask(
+        num_heads, local, int(config.LOCAL_ATTENTION_WINDOW), name="attn_pad_mask",
+    )(pad_mask)
+
+
 def build_backbone(parts, pad_mask, *, seq_len, d_model,
                    num_layers=NUM_LAYERS, num_heads=NUM_HEADS, ff_dim=FF_DIM, dropout=0.2):
     """Fuse ``parts``, add position, and run the causal transformer stack.
@@ -84,7 +157,9 @@ def build_backbone(parts, pad_mask, *, seq_len, d_model,
     the concat down is identical, which is why it lives here.
 
     ``pad_mask`` is the (B, SEQ) float mask (1 real / 0 pad). Attention is causal
-    (``use_causal_mask=True``) on top of the key-padding mask.
+    (``use_causal_mask=True``) on top of the key-padding mask, and when
+    ``config.LOCAL_ATTENTION_HEADS`` is non-zero a band restricts that many heads per block to a
+    trailing window -- see :class:`BandedAttentionMask`.
 
     Returns the (B, SEQ, ``d_model``) encoded sequence, layer-normalized, ready for the
     head's own output layers.
@@ -97,8 +172,8 @@ def build_backbone(parts, pad_mask, *, seq_len, d_model,
     x = AddPositionalEmbedding(seq_len, d_model, name="positional_embedding")(x)
     x = layers.Dropout(dropout, name="emb_dropout")(x)
 
-    # ---- Attention mask: (B, 1, SEQ) boolean key-padding mask ----
-    attn_mask = KeyPaddingMask(name="attn_pad_mask")(pad_mask)
+    # ---- Attention mask: key padding, plus the per-head band when local heads are on ----
+    attn_mask = _attention_mask(pad_mask, num_heads)
 
     # ---- Causal transformer encoder ----
     for i in range(num_layers):

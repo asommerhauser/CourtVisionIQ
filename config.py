@@ -22,6 +22,22 @@ NUM_HEADS = 8              # attention heads (key_dim = MODEL_DIM // NUM_HEADS =
 FF_DIM = 1536              # feed-forward inner dim per block (was 1024)
 ROSTER_SAB_LAYERS = 3      # Set-Attention blocks in the roster set-encoder (was 2)
 
+# --- Local attention (models/backbone.py) ---
+# Attention averages each row over every earlier row, and nothing pushes any head toward the last
+# few -- but basketball is overwhelmingly local. These restrict the FIRST N of the NUM_HEADS heads
+# in every block to a trailing window, by a banded mask ANDed into the key-padding mask; the
+# remaining heads stay global. No new weights and no custom kernel, so the split is free.
+#
+# ARCHITECTURE, not a rollout dial: they are in models/manifest.ARCH_KEYS and deliberately NOT in
+# _TUNING_KEYS. Weights trained with local heads have adapted to the restriction, so reloading
+# them into an all-global graph is silently wrong rather than an error -- the manifest check is
+# what catches it. A/B-ing the setting therefore means a retrain, not a re-run.
+#
+# LOCAL_ATTENTION_HEADS = 0 disables the mechanism entirely and rebuilds the pre-2.0 graph
+# unchanged, which is what makes that A/B a clean comparison.
+LOCAL_ATTENTION_HEADS = 2   # heads per block restricted to the window (0 = all global)
+LOCAL_ATTENTION_WINDOW = 8  # rows a local head can see, inclusive of its own row
+
 # --- Rollout sampling (GameController / GameSimulator) ---
 # Per-head softmax temperature for the rollout: <1 sharpens (emphasizes the head's preference),
 # >1 flattens toward uniform, 1.0 is the raw model. Every categorical pick routes through

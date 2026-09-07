@@ -35,8 +35,14 @@ VOCAB_SNAPSHOT_DIR = "vocabs"
 SCHEMA = 1
 
 # Capacity dims the graph is rebuilt from; a mismatch means the weights will not load.
+#
+# LOCAL_ATTENTION_* are here for the opposite reason: they change no weight shapes at all, so a
+# model trained with local heads reloads into an all-global graph with no error and no shape
+# mismatch -- just quietly wrong attention in every rollout. Recording them is the only thing
+# that makes that mismatch visible.
 ARCH_KEYS = ("MODEL_DIM", "NUM_LAYERS", "NUM_HEADS", "FF_DIM", "ROSTER_SAB_LAYERS",
-             "MAX_SEQUENCE_LENGTH", "ROSTER_SIZE")
+             "MAX_SEQUENCE_LENGTH", "ROSTER_SIZE",
+             "LOCAL_ATTENTION_HEADS", "LOCAL_ATTENTION_WINDOW")
 
 
 def _git(*args) -> str:
