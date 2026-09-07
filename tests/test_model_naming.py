@@ -170,9 +170,16 @@ def test_holdout_prefers_the_manifest(tmp_path):
     assert ids == [7, 8, 9] and "manifest" in src
 
 
-def test_holdout_skips_an_empty_processed_manifest(tmp_path):
-    """The real failure seen on disk: holdout_games.json present but containing []."""
+def test_holdout_skips_an_empty_processed_manifest(tmp_path, monkeypatch):
+    """The real failure seen on disk: holdout_games.json present but containing [].
+
+    ``processed_dir`` is not the only place ``resolve_holdout`` looks: two of its fallbacks --
+    ``./training/full_run_state.json`` and ``./results/<model>/`` -- are resolved against the
+    CWD, so on a machine that has actually trained, the real run state answers first and this
+    test never reaches the raise. ``chdir`` into ``tmp_path`` isolates both.
+    """
     from shell.session import Session
+    monkeypatch.chdir(tmp_path)
     (tmp_path / config.HOLDOUT_MANIFEST_NAME).write_text("[]", encoding="utf-8")
     s = Session(processed_dir=str(tmp_path))
     s.model = "nonexistent-model"

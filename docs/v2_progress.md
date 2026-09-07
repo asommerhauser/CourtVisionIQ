@@ -28,6 +28,11 @@ The workstream 8 caveat is closed: the full suite was run on 2026-09-07 after th
 came back **634 passed / 1 failed**, the failure being the pre-existing correction G test-
 isolation bug. Every branch in Phase 2 is now verified by a real pytest run.
 
+**Workstream 9 was built ahead of Gate B and is merged.** Phase 3's §9 work touches neither
+the cleaner nor the vocabularies, so it does not wait on the clean; workstream 10a can start
+the same way. Only 10b (the possession clock) needs Gate B's output, and only to *measure* --
+it reads cleaned rows, and the ones on disk are still v1.0 shaped.
+
 ### What Gate B is actually testing
 
 Five branches changed the cleaned-data schema and the token vocabulary before a single clean
@@ -86,8 +91,9 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | 7 | `feature/timeouts-team-rebounds` | 2 | §6 | [x] | b54685f |
 | 8 | `feature/schema-cleanup` | 2 | §7 | [x] | 0605a35 |
 | — | **Gate B — the re-clean + vocab rebuild** | 2 | | [ ] | |
-| 9 | `feature/shared-backbone` | 3 | §9 pre | [ ] | |
-| 10 | `feature/local-context` | 3 | §9 | [ ] | |
+| 9 | `feature/shared-backbone` | 3 | §9 pre | [x] | b9ff4ea |
+| 10a | `feature/local-attention` | 3 | §9 | [ ] | |
+| 10b | `feature/possession-clock` | 3 | §9 | [ ] | |
 | 11 | `feature/rotation-model` | 3 | §8 | [ ] | |
 | 12 | `feature/training-changes` | 3 | §10 | [ ] | |
 | 13 | `feature/quarter-eval-splits` | 4 | §11 | [ ] | |
@@ -532,34 +538,120 @@ heads, and *above* the region in which conditioning vectors get concatenated.
 
 **Verify**
 ```bash
-pytest tests/ -q
+git checkout 522ce8f && python scripts/dump_layer_names.py > /tmp/before.txt
+git checkout feature/shared-backbone && python scripts/dump_layer_names.py > /tmp/after.txt
+diff /tmp/before.txt /tmp/after.txt
+python -m pytest tests/ -q
 ```
 `tests/test_model_persistence.py` is the one that matters: layer names must not change, or weight
 reload breaks against existing artifacts.
+
+**Result:** Layer-name diff **clean** - every hunk was a `Preprocessed ...` line carrying the
+run's temp directory, with no layer line among them. Full suite: 639 passed, 12 failed, the
+twelve all being the new name test's own order assertion (see Notes); `test_backbone.py` 16
+passed after the fix. Correction G is gone from the failure list - the suite is otherwise green.
+encoder/vocabs/ untouched after the run.
+
+**Notes:** The six-way copy was confirmed byte-identical by line-range diff before anything
+was touched: from `fusion_concat` through `final_ln` the six `def model()` bodies differ in
+**exactly one line**, the argument list handed to `Concatenate`. So `build_backbone` takes
+that list as `parts` and owns the concat too, rather than leaving a seventh near-copy behind.
+
+`AddPositionalEmbedding` and `KeyPaddingMask` moved into `models/backbone.py` with the stack -
+every remaining use was inside the extracted region, so no head imports them any more. Their
+`register_keras_serializable(package="cviq")` key is `cviq>ClassName` and carries no module
+path, so models saved before the move still deserialize; `test_full_keras_model_loads` covers it.
+
+**Two things I got wrong, both in the checking apparatus rather than the refactor.** The name
+test asserted graph order over *every* backbone layer and failed on all twelve cases at
+`attn_pad_mask`: that layer hangs off the `pad_mask` input rather than the running tensor, so
+it is a side branch and Keras may place it anywhere after that input in the topological sort.
+Order is now asserted over the main tensor path only, with presence asserted separately and the
+wiring proved functionally by a probe that a masked-out key cannot influence a later real row.
+And `scripts/dump_layer_names.py` let preprocess's summary line onto stdout - that line carries
+the temp directory, so the first before/after diff showed eleven spurious hunks. It prints to
+stderr now.
+
+The duplicated `def model(self, num_layers=..., num_heads=..., ff_dim=..., dropout=0.2)`
+signature is deliberately left alone: it is each head's public API, and unifying it means
+editing six signatures plus their `from_artifacts` rebuild paths for no behavioural gain.
+
+Correction G was fixed here as the branch's first commit, so the suite is clean going into
+the rest of Phase 3.
+
+### 10a. `feature/local-attention` — §9, the banded heads
+
+**Split from workstream 10.** The spec bundles the local heads and the shot-clock proxy into one
+feature, but they are independent: one is architecture, the other a preprocessing input; they
+verify against different test files, and only the proxy needs Gate B's output. Splitting keeps a
+bad result in one separable from the other, which is how Phase 2 was run.
+
+**Scope.** Two of the eight attention heads in every block restricted to the last eight rows by a
+banded mask — the same mechanism as the padding mask — behind a `LOCAL_ATTENTION_HEADS` config
+switch. Six heads stay global. No new inputs, no new weights, no custom kernel.
+
+Now a one-place change: `models/backbone.py` owns the mask, so this lands once rather than six
+times. That was the whole point of workstream 9.
+
+- `config.py` — `LOCAL_ATTENTION_HEADS` and `LOCAL_ATTENTION_WINDOW`. **Not** rollout dials, so
+  **not** in `_TUNING_KEYS` — nothing at sim time reads them and `set_dial` must keep rejecting
+  them.
+- `models/manifest.py:38` — but they **do** belong in `ARCH_KEYS`. See correction K: the
+  local/global split changes no weight shapes, so weights trained with local heads would reload
+  into an all-global graph *silently*.
+- `LOCAL_ATTENTION_HEADS = 0` must emit today's `KeyPaddingMask` unchanged, so the A/B switch is a
+  genuine no-op when off and the existing graph is bit-identical.
+
+**Memory to watch.** A per-head mask is `(B, H, SEQ, SEQ)` bool — ~176 MB at `SEQ=600`, `H=8`,
+batch 64. Built once outside the block loop and shared across all six blocks, the same lifetime
+today's `attn_mask` already has. The fallback if it bites is two `MultiHeadAttention` layers per
+block (6 global + 2 local, concatenated), which changes layer names and so is not a drop-in.
+
+**Verify**
+```bash
+python -m pytest tests/ -q
+```
+`test_model_persistence.py` and `test_backbone.py` are the ones that matter: with the switch off,
+the graph must be identical to today's.
 
 **Result:**
 
 **Notes:**
 
-### 10. `feature/local-context` — §9
+### 10b. `feature/possession-clock` — §9, the shot-clock proxy
 
-**Scope.** Two of the eight attention heads in every block restricted to the last eight rows by a
-banded mask — the same mechanism as the padding mask — behind a `LOCAL_ATTENTION_HEADS` config
-switch so it is A/B-able without a re-preprocess. Six heads stay global. No new inputs, no custom
-kernel.
+**Scope.** One new per-row number: seconds since the current possession started, scaled to the
+24-second clock. Derived inside `GameStateScan` (`models/game_state_features.py:103`) so training
+and the simulator compute it identically by construction. `GAME_STATE_KEYS` (`:49`) and `_NORM`
+(`:56`) gain the key.
 
-Plus a shot-clock proxy: one new per-row number, seconds since the current possession started, reset
-on a change of possession or an offensive rebound, scaled to the 24-second clock. Derived inside
-`GameStateScan` (`models/game_state_features.py:101`) so training and the simulator compute it
-identically by construction; `GAME_STATE_KEYS` (`:47`) and `_NORM` (`:54`) gain the key, and
-`simulation/input_cache.py:178` picks it up for free through the incremental path.
+**Everything downstream is free** — confirmed, no edit needed: `simulation/input_cache.py:178`
+zips over `GAME_STATE_KEYS`; `make_game_state_inputs` / `game_state_projections` iterate the
+tuple; each head's `INPUT_KEYS` splats `*GAME_STATE_INPUT_KEYS`.
 
-If diagnostics say the proxy does nothing, it is one key to remove.
+**The reset rule reads the cleaned row semantics**, which are the authority now that §7 removed
+the `possession` column — no `POSSESSION_FLIP_RESULTS` survives anywhere in the repo. A possession
+ends on `result == "cop"` (turnover, defensive or team-defensive rebound, made last free throw, a
+foul that flips the ball) and on a made field goal; the clock also resets on an offensive rebound
+(the real 14-second reset, offense unchanged) and at a period boundary.
+
+**Blocked on Gate B, to measure only.** The rule reads cleaned rows and the ones on disk are still
+v1.0 shaped — steals are two rows there, and the `result` semantics differ. Build it any time;
+measure it against the re-clean.
+
+**Consequence.** The fusion concat widens by 16, so `fusion_projection`'s kernel changes shape and
+every existing weight file stops loading. Already true after Gate B, but from this merge on there
+is no local artifact any smoke run can reload.
 
 **Verify**
 ```bash
-pytest tests/test_game_state_features.py tests/test_game_state_wiring.py tests/test_input_cache.py -q
+python -m pytest tests/test_game_state_features.py tests/test_game_state_wiring.py tests/test_input_cache.py -q
+python -m game_state_features --seasons 2003,2013,2023
+python -m pytest tests/ -q
 ```
+The measurement entry point follows the `python -m zones` pattern — a cheap TF-free CPU pass.
+**Possessions per game not near ~95–105 means the reset rule is wrong**, and it is the only
+independent check this feature has before the train.
 
 **Result:**
 
@@ -751,8 +843,11 @@ the offense. Found and fixed on `feature/side-aware-fouls`.
 isolates `processed_dir` via `tmp_path`. On this machine that file is real (untracked, 100
 holdout ids, from the Aug 23 train), so `resolve_holdout` returns at `:153` instead of raising
 and the test fails. It is a test-isolation bug, not a product bug, and it is **not** caused by any
-2.0 work - it fails identically on `main`. It does block Gate C's "pytest tests/ green", so fix it
-before then: the test needs to isolate the training-state path too.
+2.0 work - it fails identically on `main`. It does block Gate C's "pytest tests/ green", so it was
+fixed on `feature/shared-backbone` (commit 5674516): `monkeypatch.chdir(tmp_path)` isolates both
+CWD-relative fallbacks at once - the train state and `./results/<model>/`. The fallback chain
+itself is deliberate (a machine that only loads someone else's weights has no train state), so
+the fix belongs in the test, not the product. **Closed.**
 
 **H. The spec's fold is wrong for exactly the shots `heave` exists to catch.** Section 3 decides
 which basket is being attacked by which half the shot came from (`end_a = y < 47`). That is right
@@ -791,6 +886,14 @@ section 7's "period-end rows are not kept"; leaving **909** real, decidable team
 are now recovered. Emitting the 6,336 would have injected phantom boards into the head whose
 entire job is the offensive/defensive split.
 
+**K. §9 calls the local-attention switch "a config switch" without saying it is an architecture
+key.** Restricting two heads to a banded mask changes no weight shapes, so a model trained with
+local heads reloads into an all-global graph **silently** — no error, no shape mismatch, just
+quietly wrong attention in every rollout. `models/manifest.py:38 ARCH_KEYS` is the existing
+mechanism for exactly this ("a mismatch means the weights will not load") and does not cover it
+today, so `LOCAL_ATTENTION_HEADS` and `LOCAL_ATTENTION_WINDOW` go in it. They stay out of
+`_TUNING_KEYS`: nothing at sim time reads them, and they are not A/B-able without a retrain.
+
 ---
 
 ## Log
@@ -807,3 +910,4 @@ Append one line per merge. Newest last.
 | 2026-09-07 | `feature/fouled-player` | 715cedb | 144 green; opponent 100% populated except technicals |
 | 2026-09-07 | `feature/timeouts-team-rebounds` | b54685f | 628 green; team-rebound side recovered at 99.8% (correction J) |
 | 2026-09-07 | `feature/schema-cleanup` | 0605a35 | merged on instruction, verified after: 634 green; Phase 2 complete |
+| 2026-09-07 | `feature/shared-backbone` | b9ff4ea | layer-name diff clean; correction G closed; workstream 10 split into 10a/10b |

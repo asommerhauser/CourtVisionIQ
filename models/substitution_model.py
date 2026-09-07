@@ -46,10 +46,9 @@ from data_loading import load_all_cleaned, resolve_partition
 from models.norm_stats_io import load_norm_stats, save_norm_stats
 from encoder.encoder import Encoder
 from models.artifacts import ModelArtifacts, DEFAULT_ARTIFACTS_ROOT, warm_start_weights
+from models.backbone import build_backbone
 from models.event_time_model import (
     _norm_stats_path,
-    AddPositionalEmbedding,
-    KeyPaddingMask,
     OnCourtCandidateMask,
     EMBED_DIMS,
     ROSTER_DIM,
@@ -514,36 +513,12 @@ class SubstitutionModel:
         t_team = season_team_projections(team_inputs)  # games-played + team rest per side
         t_gs = game_state_projections(game_state_inputs)  # score / period-clock / team fouls
 
-        # ---- Fusion ----
-        x = layers.Concatenate(axis=-1, name="fusion_concat")(
-            [*embs, *cond_vecs, home_vec, away_vec, t_abs, t_delta, t_next_delta, *t_team, *t_gs]
+        # ---- Fusion + the shared causal backbone (models/backbone.py) ----
+        x = build_backbone(
+            [*embs, *cond_vecs, home_vec, away_vec, t_abs, t_delta, t_next_delta, *t_team, *t_gs],
+            pad_mask, seq_len=SEQ, d_model=D,
+            num_layers=num_layers, num_heads=num_heads, ff_dim=ff_dim, dropout=dropout,
         )
-        x = layers.Dense(D, name="fusion_projection")(x)
-        x = layers.LayerNormalization(epsilon=1e-6, name="fusion_ln")(x)
-
-        # ---- Positional encoding (learned) ----
-        x = AddPositionalEmbedding(SEQ, D, name="positional_embedding")(x)
-        x = layers.Dropout(dropout, name="emb_dropout")(x)
-
-        # ---- Attention mask: (B, 1, SEQ) boolean key-padding mask ----
-        attn_mask = KeyPaddingMask(name="attn_pad_mask")(pad_mask)
-
-        # ---- Causal transformer encoder ----
-        for i in range(num_layers):
-            h = layers.LayerNormalization(epsilon=1e-6, name=f"block{i}_ln1")(x)
-            attn = layers.MultiHeadAttention(
-                num_heads=num_heads, key_dim=D // num_heads, dropout=dropout,
-                name=f"block{i}_mha",
-            )(h, h, attention_mask=attn_mask, use_causal_mask=True)
-            x = layers.Add(name=f"block{i}_res1")([x, attn])
-
-            h = layers.LayerNormalization(epsilon=1e-6, name=f"block{i}_ln2")(x)
-            f1 = layers.Dense(ff_dim, activation="gelu", name=f"block{i}_ff1")(h)
-            f1 = layers.Dropout(dropout, name=f"block{i}_ffdrop")(f1)
-            f2 = layers.Dense(D, name=f"block{i}_ff2")(f1)
-            x = layers.Add(name=f"block{i}_res2")([x, f2])
-
-        x = layers.LayerNormalization(epsilon=1e-6, name="final_ln")(x)
 
         # ---- Output head (float32 keeps logits stable under mixed_float16) ----
         logits = layers.Dense(target_vocab_size, dtype="float32", name="secondary_player_logits")(x)
