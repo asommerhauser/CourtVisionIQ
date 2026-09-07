@@ -36,7 +36,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged
 | 2 | `feature/dead-ball-state` | 1 | §2 | [x] | 5ea3afd |
 | — | **Gate A — Phase 1 short eval** | 1 | | skipped | - |
 | 3 | `feature/shot-zone-geometry` | 2 | §3 | [x] | 8434786 |
-| 4 | `feature/shot-zones` | 2 | §3 | [ ] | |
+| 4 | `feature/shot-zones` | 2 | §3 | [x] | 27a3327 |
 | 5 | `feature/ft-count-tokens` | 2 | §4 | [ ] | |
 | 6 | `feature/fouled-player` | 2 | §5 | [ ] | |
 | 7 | `feature/timeouts-team-rebounds` | 2 | §6 | [ ] | |
@@ -232,9 +232,28 @@ pytest tests/ -q
 ```
 This one touches enough surface that the full suite is the right check.
 
-**Result:**
+**Result:** Full suite run and reported green by Alec (verbal, not a pasted
+transcript). encoder/vocabs/ clean afterwards.
 
-**Notes:**
+**Notes:** Thirteen test files carried the old literals, not the six the spec predicted -
+every fixture with a made `"2pt"` row now reaches the strict `points_for_shot`. They map to
+`paint` and `top3`, which keeps every score assertion numerically identical.
+
+`zones.points_for_shot` **raises** on an unrecognized token rather than defaulting to 2, per
+the spec's "an unknown token must not quietly score 2". Both scoring scans call it, so the
+box score and the trained score feature are bit-identical by construction rather than by
+convention. The trade: one malformed row aborts a 21-season preprocess instead of silently
+training the model on a running score that never happened. **Watch for this at Gate B** -
+it is the most likely way the re-clean fails loudly.
+
+Verified locally before handoff (box_score and game_state_features import without a TF
+session): all fifteen zones score identically in both scans, free throws score 1, and
+`"2pt"`/`"3pt"`/garbage all raise. The cleaner was also run end to end on synthetic raw
+rows. The training path - preprocessing, the `target_tokens` loss mask, model persistence -
+could only be covered by the suite.
+
+New dial `SHOT_RESULT_BIAS_BY_ZONE` (in `_TUNING_KEYS`); `TYPE_BIAS["assist_type"]` emptied
+because `"3pt"` can no longer match a token. Both need fitting from zero post-train.
 
 ### 5. `feature/ft-count-tokens` — §4
 
@@ -633,3 +652,4 @@ Append one line per merge. Newest last.
 | 2026-09-06 | `feature/side-aware-fouls` | f55758d | 61 tests green; and-1 fix beyond spec (correction F) |
 | 2026-09-06 | `feature/dead-ball-state` | 5ea3afd | 76 green; found pre-existing test-isolation bug (correction G) |
 | 2026-09-06 | `feature/shot-zone-geometry` | 8434786 | 42 green; zone validation table passes all gates (correction H) |
+| 2026-09-07 | `feature/shot-zones` | 27a3327 | full suite green; 13 test files re-tokenized, not 6 |
