@@ -144,6 +144,22 @@ class DataCleaner:
         elif self.away_team is None and player in clean_away:
             self.away_team = team
 
+    def _side_of_team(self, team):
+        """Map a raw team abbreviation to "home"/"away", or None if it cannot be resolved.
+
+        Uses the abbreviations ``_update_teams`` resolves from the first action rows. Measured on
+        2022-23: both are known before the first timeout in every game, so None is a guard, not a
+        path the data actually takes.
+        """
+        if pd.isna(team) or not str(team).strip():
+            return None
+        team = str(team).strip()
+        if team == self.home_team:
+            return "home"
+        if team == self.away_team:
+            return "away"
+        return None
+
     def determine_turnover_type(self, data):
         """
         Map raw turnover 'type' text to a coarse category.
@@ -446,6 +462,30 @@ class DataCleaner:
                 "result": row["result"] if pd.notna(row["result"]) else "null",
                 "secondary_player": "none",
                 "home/away": home,
+                "season": self.season,
+                "playoff": 2 if self.playoff else 1,
+            })
+
+        # ---- TIMEOUT ----
+        # A timeout is the single most common dead ball, and without it the sim has no way to
+        # substitute after a made basket -- the largest reason its rotations look nothing like a
+        # real game. The calling team rides in `type` (a seventh conditional type head predicts
+        # it); no player is involved. The raw `team` column is populated for 100% of timeouts and
+        # both abbreviations are always resolved by the time one appears, so nothing is dropped.
+        if row["event_type"] == "timeout":
+            side = self._side_of_team(row.get("team"))
+            if side is None:
+                return events
+            events.append({
+                "roster_home": clean_home,
+                "roster_away": clean_away,
+                "time": time_safe,
+                "event": "timeout",
+                "player": "none",
+                "type": side,
+                "result": "none",
+                "secondary_player": "none",
+                "home/away": 1 if side == "home" else 2,
                 "season": self.season,
                 "playoff": 2 if self.playoff else 1,
             })

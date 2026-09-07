@@ -377,6 +377,41 @@ def test_non_shot_rows_never_get_a_zone(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Timeouts
+# ---------------------------------------------------------------------------
+
+def _teamed(rows):
+    """Prepend action rows so the cleaner can resolve both team abbreviations."""
+    return [
+        {"event_type": "shot", "player": "Alice", "team": "LAL", "result": "made"},
+        {"event_type": "shot", "player": "Frank", "team": "BOS", "result": "missed"},
+        *rows,
+    ]
+
+
+def test_a_timeout_becomes_a_row_naming_the_calling_side(tmp_path):
+    cleaned = _parse(tmp_path, _teamed([
+        {"event_type": "timeout", "player": None, "team": "LAL", "type": "timeout: regular",
+         "result": None},
+        {"event_type": "timeout", "player": None, "team": "BOS", "type": "timeout: regular",
+         "result": None},
+    ]))
+    tos = cleaned[cleaned["event"] == "timeout"]
+    assert list(tos["type"]) == ["home", "away"]
+    assert list(tos["player"]) == ["none", "none"]
+    assert list(tos["home/away"]) == [1, 2]
+
+
+def test_a_timeout_from_an_unknown_team_is_dropped(tmp_path):
+    """A guard, not a path the data takes: both abbreviations resolve before any timeout."""
+    cleaned = _parse(tmp_path, _teamed([
+        {"event_type": "timeout", "player": None, "team": "XXX", "type": "timeout: regular",
+         "result": None},
+    ]))
+    assert cleaned[cleaned["event"] == "timeout"].empty
+
+
+# ---------------------------------------------------------------------------
 # Team rebounds
 # ---------------------------------------------------------------------------
 
