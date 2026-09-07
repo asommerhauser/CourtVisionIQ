@@ -224,16 +224,14 @@ def test_rebound_type_head_decides_split_before_player():
 # Turnovers / steals
 # ===================================================================== #
 
-def test_steal_emits_two_rows_and_flips_possession():
+def test_a_steal_is_one_row_naming_the_stealer():
     ctrl = make_controller(HOME)
     ctrl.sim.script(player=["A", "F"], type=["steal"])  # committer A (home), stealer F (away)
     ctrl._do_turnover(delta=5.0)
 
-    stealer_row, loser_row = rows(ctrl)
-    assert (stealer_row["player"], stealer_row["type"], stealer_row["result"]) == \
-        ("F", "steal", "steal")
-    assert (loser_row["player"], loser_row["type"], loser_row["result"]) == \
-        ("A", "steal", "cop")
+    (row,) = rows(ctrl)
+    assert (row["player"], row["type"], row["result"]) == ("A", "steal", "cop")
+    assert row["secondary_player"] == "F"
     assert ctrl.possession == AWAY
 
 

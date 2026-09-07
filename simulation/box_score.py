@@ -18,9 +18,11 @@ It deliberately accepts the *same* row shape produced by both the cleaned data a
 Decoding follows the cleaned-data semantics in ``data_cleaner.py`` (not a 1:1 copy of the
 legacy notebook). The two semantics that bite:
 
-  * **Steals** are emitted as *two* turnover rows — one for the stealer
-    (``type="steal", result="steal"``) and one for the player who lost the ball
-    (``result="cop"``). Only the latter is a turnover; the former is a steal.
+  * **Steals** are ONE turnover row: the player who lost the ball acts, and the defender who
+    took it rides in ``secondary_player`` (``type="steal", result="cop"``). The turnover is
+    the actor's, the steal is the secondary player's. Before 2.0 this was a two-row pair.
+  * **Offensive fouls** emit no trailing turnover row — the turnover is counted from the
+    foul row itself.
   * **Blocked shots** carry ``result="blocked"`` on the shooter's shot row (a missed
     attempt) plus a separate ``block`` event for the blocker.
 """
@@ -296,15 +298,20 @@ def generate_box_score(events, *, home_team: str = "HOME",
         elif event == "block":
             pl.blk += 1
         elif event == "turnover":
-            # Steal pair: the stealer's row (result="steal") is a steal; the other row
-            # (result="cop") is the turnover. Non-steal turnovers also carry "cop".
-            if result == "steal":
-                pl.stl += 1
-            else:
-                pl.tov += 1
+            # One row per turnover. The acting player lost the ball; on a steal the defender who
+            # took it rides in secondary_player, the way a block row carries the blocked shooter.
+            pl.tov += 1
+            if etype == "steal":
+                stealer = _norm(row.get("secondary_player"))
+                if stealer and stealer not in ("null", "none", "PAD", "UNK"):
+                    line(stealer).stl += 1
         elif event == "foul":
             if etype not in NON_PERSONAL_FOUL_TYPES:
                 pl.pf += 1
+            if etype == "offensive":
+                # An offensive foul IS a turnover; the cleaner no longer emits a paired
+                # turnover row, so the box score counts it from the foul.
+                pl.tov += 1
         # substitution: roster mutation only (already reflected in row snapshots) — no stat.
 
     home = [lines[p] for p in sorted(home_players) if p in lines]

@@ -52,18 +52,27 @@ def test_scoring_and_shooting_splits():
     assert box.away_score == sum(pl.pts for pl in box.away)
 
 
-def test_steal_double_event():
-    # Cleaning emits two turnover rows for a steal: the stealer (result="steal") and the
-    # player who lost the ball (result="cop"). Only the latter is a turnover.
+def test_a_steal_is_one_row_crediting_both_players():
+    # One turnover row: A lost the ball, F took it. The stealer rides in secondary_player.
     events = [
         _row(0, "start", "start", "start", "start"),
-        _row(10, "turnover", "F", "steal", "steal"),  # F steals
-        _row(10, "turnover", "A", "steal", "cop"),    # A loses the ball
+        _row(10, "turnover", "A", "steal", "cop", secondary="F"),
         _row(20, "end", "end", "end", "end"),
     ]
     p = _by_name(generate_box_score(events))
-    assert (p["F"].stl, p["F"].tov) == (1, 0)
     assert (p["A"].tov, p["A"].stl) == (1, 0)
+    assert (p["F"].stl, p["F"].tov) == (1, 0)
+
+
+def test_an_offensive_foul_counts_as_a_turnover():
+    # No trailing turnover row is emitted, so the box score counts it from the foul.
+    events = [
+        _row(0, "start", "start", "start", "start"),
+        _row(10, "foul", "A", "offensive", "cop"),
+        _row(20, "end", "end", "end", "end"),
+    ]
+    p = _by_name(generate_box_score(events))
+    assert (p["A"].tov, p["A"].pf) == (1, 1)
 
 
 def test_non_steal_turnover_counts():

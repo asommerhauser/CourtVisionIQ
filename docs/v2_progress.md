@@ -17,6 +17,50 @@
    **Gate A is the last point where an end-to-end sim run against existing weights says anything.**
    After it, verification is pytest plus inspection of cleaner output until the 2.0 train.
 
+## START HERE (as of 2026-09-07)
+
+**Phase 1 and Phase 2 are code-complete and merged into `feature/version2`. The next thing to
+do is Gate B — the re-clean and vocab rebuild.** Nothing has been re-cleaned yet, so no 2.0
+cleaned data exists on disk: `data/season*.csv` is still the v1.0 output and `encoder/vocabs/`
+is still the v1.0 frozen vocab.
+
+One caveat before trusting anything: **workstream 8 was merged without its test run** (see its
+Result). If Gate B fails in a way that does not obviously match the checklist below, run the
+full suite first.
+
+### What Gate B is actually testing
+
+Five branches changed the cleaned-data schema and the token vocabulary before a single clean
+was run. Gate B is the first end-to-end exercise of all of it at once:
+
+| Change | From | To |
+|---|---|---|
+| Shot / assist / block `type` | `2pt` / `3pt` | fifteen zone tokens (`rim` … `heave`) |
+| Shooting foul `type` | `shooting` | `shooting 2pt` / `shooting 3pt` |
+| Foul `secondary_player` | always `none` | the fouled player (raw `opponent`) |
+| Rebound `type` | `offensive` / `defensive` | plus `team offensive` / `team defensive` |
+| Steal | two turnover rows | one row, stealer in `secondary_player` |
+| Offensive foul | foul row + turnover row | foul row only |
+| Standalone technicals | dropped entirely | emitted as technical foul rows |
+| New event | — | `timeout`, with `type` = `home` / `away` |
+| Result token `steal` | existed | **gone** (survives only as a type) |
+| Kept raw columns | — | `outof`, `opponent`, `converted_x/y`, `shot_distance` |
+
+### The two guards that will fire loudly if something is wrong
+
+Both are deliberate, and a failure from either is the system working, not a bug to route around:
+
+1. **`zones.points_for_shot` raises** on any shot `type` that is neither a zone nor
+   `free throw`. A stray token aborts the preprocess instead of silently scoring it as two.
+2. **`DataCleaner._check_schema` raises** if any emitted event's keys differ from
+   `OUTPUT_COLUMNS`. A missing key would otherwise become a silent all-NaN column.
+
+### After Gate B
+
+`artifacts/v1.0` becomes unusable for any meaningful sim — those heads have never seen a zone
+token, a split shooting foul, or a timeout. Do not read a v1.0 eval after this point as
+evidence of anything. Workstreams 9-13 and Gate C remain; none of them touch the cleaner.
+
 ## Working pattern, per feature
 
 1. `git checkout feature/version2 && git checkout -b feature/<name>`
@@ -28,7 +72,7 @@
 
 ## Status
 
-Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged
+Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` merged WITHOUT a test run
 
 | # | Branch / gate | Phase | Spec | Status | Merge |
 |---|---|---|---|---|---|
@@ -40,7 +84,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged
 | 5 | `feature/ft-count-tokens` | 2 | §4 | [x] | 4b0dd09 |
 | 6 | `feature/fouled-player` | 2 | §5 | [x] | 715cedb |
 | 7 | `feature/timeouts-team-rebounds` | 2 | §6 | [x] | b54685f |
-| 8 | `feature/schema-cleanup` | 2 | §7 | [ ] | |
+| 8 | `feature/schema-cleanup` | 2 | §7 | [x]* | 0605a35 |
 | — | **Gate B — the re-clean + vocab rebuild** | 2 | | [ ] | |
 | 9 | `feature/shared-backbone` | 3 | §9 pre | [ ] | |
 | 10 | `feature/local-context` | 3 | §9 | [ ] | |
@@ -403,15 +447,31 @@ The repo has no pytest config at all; a `filterwarnings` entry would silence it.
 pytest tests/test_data_cleaner.py tests/test_chronology.py tests/test_preprocess.py -q
 ```
 
-**Result:**
+**Result:** *** NOT RUN.** Merged on Alec's instruction to assume it passes while
+moving to a fresh chat for Gate B. Everything else in this file was verified by a
+real pytest run; this one was not. **If Gate B fails oddly, suspect this branch
+first** and run `python -m pytest tests/ -q` before debugging anything else.
 
-**Notes:**
+**Notes:** Verified locally without pytest (the cleaner and box score import without a TF
+session): steal -> one row with the stealer in `secondary_player`; plain turnover -> `none`;
+offensive-foul pair -> one foul row, no turnover; defensive three seconds -> a technical
+foul row; coach technical -> dropped; emitted columns matched the contract exactly. Box
+score: ball-loser gets the TOV, stealer gets the STL, offensive foul gives `tov=1, pf=1`.
+
+**Standalone technicals were never being cleaned at all** - 632 rows a season file under
+`event_type="technical foul"`, which the cleaner did not look at. Listed in the spec as
+tidy-up; it is actually data recovery.
+
+**`"steal"` is no longer a result token anywhere** - it survives only as a type. A
+vocabulary change that only lands because Gate B deletes the old vocabs.
+
+`OUTPUT_COLUMNS` is now enforced: `parse_file` raises if any emitted event's keys differ.
+That check exists precisely for Gate B.
 
 ### Gate B — the re-clean + vocab rebuild
 
-**Delete the vocabs first.** They are append-only and frozen (`event_vocab.json` has 12 tokens,
-`next_token: 12`), so rebuilding without deleting keeps every dead token — `shooting`, the bare
-`2pt`/`3pt`, and the rest.
+**Delete the vocabs first.** They are append-only and frozen, so a rebuild without deleting keeps
+every dead token — `2pt`, `3pt`, the bare `shooting`, and `steal` as a result.
 
 ```bash
 rm encoder/vocabs/*.json
@@ -419,20 +479,31 @@ python main.py --clean --rebuild-vocabs --model event_time
 python -m zones --seasons 2003,2013,2023
 ```
 
-The zone table must match §3 in all three eras: rim make rate climbing, `corner3 > wing3 > top3` in
-every era, 3PA share rising 18.1% to 38.4%, the deep corner two dying off, left/right volumes
-near-symmetric. A missing zone or a broken make-rate ordering means the geometry is wrong — stop and
-fix it rather than training on it.
+The clean is CPU-only and takes a while over 21 seasons. `python -m zones` is ~6s per season and
+reads the RAW files, so it validates the geometry independently of whatever the clean produced.
 
-Send back the printed table. Commit `encoder/vocabs/*.json` after this so a cloud clone matches.
+**Checks, in order:**
 
-**From here on, `v1.0` weights cannot produce a meaningful sim.**
+1. **The clean completes.** If it aborts, read the traceback against the two guards above — that
+   is most likely the system catching a real problem, not an incidental crash.
+2. **The zone table still passes.** It did on 2026-09-07 (all gates, all three eras — see
+   workstream 3). It reads raw files, so a change here means the geometry moved, not the cleaner.
+3. **The rebuilt vocabs contain the new tokens and none of the dead ones.** This is the check
+   that has no existing tooling, and the one most worth writing:
+   - `type_vocab.json` should contain the fifteen zone tokens, `shooting 2pt`, `shooting 3pt`,
+     `team offensive`, `team defensive`, `home`, `away` — and should **not** contain `2pt`,
+     `3pt`, or a bare `shooting`.
+   - `event_vocab.json` should contain `timeout`.
+   - `result_vocab.json` should **not** contain `steal`.
+4. **Spot-check the cleaned output** against the per-season expectations measured from the raw
+   files during the build (2022-23): ~27.7k shooting fouls split 96.4% / 3.6% two-shot vs
+   three-shot; ~14.5k timeouts; ~11.9k typed team rebounds plus ~909 recovered bare ones; foul
+   rows carrying a fouled player for every non-technical.
+5. **`encoder/vocabs/*.json` gets committed** after the clean, so a cloud clone matches.
 
 **Result:**
 
 **Notes:**
-
----
 
 ## Phase 3 — Model
 
@@ -735,3 +806,4 @@ Append one line per merge. Newest last.
 | 2026-09-07 | `feature/ft-count-tokens` | 4b0dd09 | phantom shot_type sample deleted; and-1 rule added (correction I) |
 | 2026-09-07 | `feature/fouled-player` | 715cedb | 144 green; opponent 100% populated except technicals |
 | 2026-09-07 | `feature/timeouts-team-rebounds` | b54685f | 628 green; team-rebound side recovered at 99.8% (correction J) |
+| 2026-09-07 | `feature/schema-cleanup` | 0605a35 | **tests not run** - merged on instruction; Phase 2 complete |

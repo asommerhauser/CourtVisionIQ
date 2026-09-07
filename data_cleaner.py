@@ -31,6 +31,16 @@ _TEAM_REBOUND_LABEL_COL = "_team_rebound_side"
 # Raw rows that end a possession sequence — never scan a lookahead/lookbehind across one.
 _BOUNDARY_EVENTS = {"start of period", "end of period"}
 
+# The cleaned-data schema, and the ENFORCED contract: parse_file checks every emitted event
+# against it and raises on a mismatch. This used to be a per-instance ``self.output_columns``
+# that nothing ever read, so it drifted out of date silently -- and a stale third copy of the
+# schema is worse than none. Ordering matters: it is the column order of data/season<YYYY>.csv.
+OUTPUT_COLUMNS = (
+    "game_id", "roster_home", "roster_away", "time", "event",
+    "player", "type", "result", "secondary_player", "home/away", "season", "playoff",
+    "game_date", "home_team", "away_team",
+)
+
 
 class DataCleaner:
     """
@@ -82,11 +92,6 @@ class DataCleaner:
         self.last_time = 0
 
         self.events = []
-        self.output_columns = [
-            "game_id", "roster_home", "roster_away", "time", "event",
-            "player", "type", "result", "secondary_player", "home/away", "season", "playoff",
-            "game_date", "home_team", "away_team",
-        ]
 
     # ------------------- HELPER METHODS -------------------
 
@@ -178,7 +183,7 @@ class DataCleaner:
             '3-second violation', 'shot clock', '8-second violation', 'lane violation',
             'offensive goaltending', 'palming', 'backcourt', '5-second violation',
             'double dribble', 'discontinue dribble', 'illegal assist',
-            'jump ball violation', 'offensive foul', 'illegal screen',
+            'jump ball violation', 'illegal screen',
             'basket from below', 'punched ball', 'too many players', 'traveling',
             'kicked ball',
         }
@@ -192,6 +197,11 @@ class DataCleaner:
         if data in ('', 'null'):
             return 'null'
         if data == 'no turnover':
+            return None
+        if data == 'offensive foul':
+            # An offensive foul already emits a foul row (type "offensive", result "cop"), and
+            # the raw data pairs the two for 100% of the 5,063 in 2022-23. Emitting both made the
+            # sim reproduce a two-row grammar; the box score counts the turnover from the foul.
             return None
         if data in check_vio:
             return 'violation'
@@ -622,21 +632,10 @@ class DataCleaner:
             has_steal = pd.notna(steal_player) and str(steal_player).strip()
 
             if has_steal:
-                steal_player = str(steal_player).strip()
-                steal_home = self.home_indicator(clean_home, steal_player)
-                events.append({
-                    "roster_home": clean_home,
-                    "roster_away": clean_away,
-                    "time": time_safe,
-                    "event": "turnover",
-                    "player": steal_player,
-                    "type": "steal",
-                    "result": "steal",
-                    "secondary_player": "none",
-                    "home/away": steal_home,
-                    "season": self.season,
-                    "playoff": 2 if self.playoff else 1,
-                })
+                # ONE row, not two. The stealer rides in secondary_player exactly as a block row
+                # carries the blocked shooter. The pair encoding made the event head learn a
+                # two-row grammar the controller then had to reproduce exactly -- a whole class
+                # of drift between cleaner and sim, for 19,167 duplicated rows a season.
                 events.append({
                     "roster_home": clean_home,
                     "roster_away": clean_away,
@@ -645,7 +644,7 @@ class DataCleaner:
                     "player": turnover_player,
                     "type": "steal",
                     "result": "cop",
-                    "secondary_player": "none",
+                    "secondary_player": str(steal_player).strip(),
                     "home/away": home,
                     "season": self.season,
                     "playoff": 2 if self.playoff else 1,
@@ -693,6 +692,28 @@ class DataCleaner:
                 "type": foul_type,
                 "result": foul_result,
                 "secondary_player": fouled,
+                "home/away": home,
+                "season": self.season,
+                "playoff": 2 if self.playoff else 1,
+            })
+
+        # ---- STANDALONE TECHNICAL ----
+        # The raw data files defensive three seconds, double technicals and coach technicals
+        # under their own event_type, so the cleaner never saw them at all. They are ordinary
+        # technical fouls; the 21% with no player named (mostly coach technicals) have no actor
+        # to attribute and stay dropped.
+        if row["event_type"] == "technical foul":
+            if pd.isna(row["player"]) or not str(row["player"]).strip():
+                return events
+            events.append({
+                "roster_home": clean_home,
+                "roster_away": clean_away,
+                "time": time_safe,
+                "event": "foul",
+                "player": str(row["player"]).strip(),
+                "type": "technical",
+                "result": self.determine_foul_result("technical"),
+                "secondary_player": "none",
                 "home/away": home,
                 "season": self.season,
                 "playoff": 2 if self.playoff else 1,
@@ -765,7 +786,26 @@ class DataCleaner:
         # Synthetic end event for the last game in this file.
         self.events.append(self._end_event())
 
-        return df, pd.DataFrame(self.events)
+        self._check_schema(self.events)
+        return df, pd.DataFrame(self.events, columns=list(OUTPUT_COLUMNS))
+
+    @staticmethod
+    def _check_schema(events):
+        """Every emitted event must carry exactly OUTPUT_COLUMNS — no more, no less.
+
+        Cheap insurance at exactly the moment it matters: 2.0 changes the emitted schema in five
+        separate branches before a single re-clean, and a missing key would otherwise surface as
+        a silent all-NaN column in data/season<YYYY>.csv.
+        """
+        expected = set(OUTPUT_COLUMNS)
+        for event in events:
+            keys = set(event)
+            if keys != expected:
+                raise ValueError(
+                    f"emitted event does not match the cleaned schema: "
+                    f"missing={sorted(expected - keys)} unexpected={sorted(keys - expected)} "
+                    f"in {event!r}"
+                )
 
     def _input_files(self):
         """Resolved raw files to process: *.csv, ignore-filtered, sorted, sliced.

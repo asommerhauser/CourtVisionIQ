@@ -423,8 +423,8 @@ class GameController:
             stealer = self.sim.predict_player("turnover", self._defense_five(),
                                               delta_seconds=0.0, greedy=self.greedy,
                                               temperature=self.player_temp)
-            self._append("turnover", stealer, "steal", "steal")   # the stealer (defender)
-            self._append("turnover", committer, "steal", "cop")   # the ball-loser (offense)
+            # ONE row: the ball-loser acts, the stealer rides in secondary_player (data_cleaner).
+            self._append("turnover", committer, "steal", "cop", secondary=stealer)
             self.ball_dead = False       # a steal is live — the defense is already going
         else:
             self._append("turnover", committer, ttype, "cop")
