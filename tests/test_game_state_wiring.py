@@ -2,7 +2,7 @@
 Build-smoke for the game-state feature wiring across every head + the inference path.
 
 Training-free: builds each head's Keras graph at tiny dims (model_dim=32, 1 layer) and runs
-ONE forward pass over its own preprocessed split, asserting the six game-state inputs are
+ONE forward pass over its own preprocessed split, asserting every game-state input is
 consumed and the head produces finite output. This catches fusion / INPUT_KEYS / preprocess
 mismatches introduced by the game-state features without any ``.fit`` (the persistence suite
 on the training box covers real training).
