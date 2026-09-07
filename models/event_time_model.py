@@ -15,6 +15,7 @@ from config import (
 from data_loading import load_all_cleaned, resolve_partition
 from encoder.encoder import Encoder
 from models.artifacts import ModelArtifacts, DEFAULT_ARTIFACTS_ROOT, warm_start_weights
+from models.backbone import build_backbone
 from models.norm_stats_io import load_norm_stats, save_norm_stats
 from models.roster_set_encoder import (
     RosterSetEncoder,
@@ -45,52 +46,6 @@ from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
 # secondary_player); other fields are low-cardinality and stay put.
 EMBED_DIMS = {"event": 32, "player": 192, "type": 32, "result": 16, "season": 16}
 ROSTER_DIM = 128
-
-
-@keras.saving.register_keras_serializable(package="cviq")
-class AddPositionalEmbedding(layers.Layer):
-    """Add a learned position embedding over [0, seq_len) to a (B, SEQ, D) tensor."""
-
-    def __init__(self, seq_len: int, d_model: int, **kwargs):
-        super().__init__(**kwargs)
-        self.seq_len = seq_len
-        self.d_model = d_model
-
-    def build(self, input_shape):
-        # Own variable (created in build, not a nested Embedding) so it serializes
-        # and reloads cleanly. Shape (SEQ, D) broadcasts over the batch axis.
-        self.pos = self.add_weight(
-            name="pos_table",
-            shape=(self.seq_len, self.d_model),
-            initializer="uniform",
-            trainable=True,
-        )
-        super().build(input_shape)
-
-    def call(self, x):
-        return x + self.pos                         # (SEQ, D) broadcasts over (B, SEQ, D)
-
-    def compute_output_shape(self, input_shape):
-        return input_shape
-
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({"seq_len": self.seq_len, "d_model": self.d_model})
-        return cfg
-
-@keras.saving.register_keras_serializable(package="cviq")
-class KeyPaddingMask(layers.Layer):
-    """Turn a (B, SEQ) float pad-mask into a (B, 1, SEQ) boolean key-padding mask.
-
-    A registered layer (rather than a Lambda) so the full .keras model reloads
-    under Keras 3 safe mode without custom code execution.
-    """
-
-    def call(self, m):
-        return tf.cast(m, "bool")[:, tf.newaxis, :]
-
-    def compute_output_shape(self, input_shape):
-        return (input_shape[0], 1, input_shape[1])
 
 
 @keras.saving.register_keras_serializable(package="cviq")
@@ -601,36 +556,12 @@ class EventTimeModel:
         t_team = season_team_projections(team_inputs)  # games-played + team rest per side
         t_gs = game_state_projections(game_state_inputs)  # score / period-clock / team fouls
 
-        # ---- Fusion ----
-        x = layers.Concatenate(axis=-1, name="fusion_concat")(
-            [*embs, home_vec, away_vec, t_abs, t_delta, *t_team, *t_gs]
+        # ---- Fusion + the shared causal backbone (models/backbone.py) ----
+        x = build_backbone(
+            [*embs, home_vec, away_vec, t_abs, t_delta, *t_team, *t_gs],
+            pad_mask, seq_len=SEQ, d_model=D,
+            num_layers=num_layers, num_heads=num_heads, ff_dim=ff_dim, dropout=dropout,
         )
-        x = layers.Dense(D, name="fusion_projection")(x)
-        x = layers.LayerNormalization(epsilon=1e-6, name="fusion_ln")(x)
-
-        # ---- Positional encoding (learned) ----
-        x = AddPositionalEmbedding(SEQ, D, name="positional_embedding")(x)
-        x = layers.Dropout(dropout, name="emb_dropout")(x)
-
-        # ---- Attention mask: (B, 1, SEQ) boolean key-padding mask ----
-        attn_mask = KeyPaddingMask(name="attn_pad_mask")(pad_mask)
-
-        # ---- Causal transformer encoder ----
-        for i in range(num_layers):
-            h = layers.LayerNormalization(epsilon=1e-6, name=f"block{i}_ln1")(x)
-            attn = layers.MultiHeadAttention(
-                num_heads=num_heads, key_dim=D // num_heads, dropout=dropout,
-                name=f"block{i}_mha",
-            )(h, h, attention_mask=attn_mask, use_causal_mask=True)
-            x = layers.Add(name=f"block{i}_res1")([x, attn])
-
-            h = layers.LayerNormalization(epsilon=1e-6, name=f"block{i}_ln2")(x)
-            f1 = layers.Dense(ff_dim, activation="gelu", name=f"block{i}_ff1")(h)
-            f1 = layers.Dropout(dropout, name=f"block{i}_ffdrop")(f1)
-            f2 = layers.Dense(D, name=f"block{i}_ff2")(f1)
-            x = layers.Add(name=f"block{i}_res2")([x, f2])
-
-        x = layers.LayerNormalization(epsilon=1e-6, name="final_ln")(x)
 
         # ---- Output heads (names must not collide with input field names) ----
         # dtype float32 keeps logits/regression stable under mixed_float16.
