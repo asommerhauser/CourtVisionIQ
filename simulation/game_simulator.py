@@ -12,8 +12,8 @@ What it does (this step — see docs/technical_specs.md → "Sampling-rollout �
 
   * holds the model(s) and loads them by key (``GameSimulator.load``), via ``ModelBundle``
     so future downstream heads come online for free;
-  * tracks **roster + possession** state *outside* the model (the model consumes rosters
-    per timestep but does not see possession — we keep that book ourselves);
+  * tracks **roster** state *outside* the model (the model consumes rosters per timestep).
+    Possession is *not* tracked here — GameController owns that book, alone;
   * **seeds** the opening input in the exact shape the model trained on (a ``start`` row);
   * shapes the growing event ``history`` into the model's fixed ``(1, SEQ, …)`` tensors
     (``build_model_inputs``) and runs a forward pass that returns the **raw** next-step
@@ -66,13 +66,6 @@ from simulation.input_cache import HistoryEncoder
 # Neutral default for a hand-built matchup with no schedule given: treat both teams as
 # mid-season (real-game predictions read the actual value from the GameInput).
 DEFAULT_GAMES_PLAYED = 0.5
-
-# result outcomes that hand the ball to the other team. The model does not consume
-# possession; we track it for downstream use (and the future Controller will own the
-# richer clock/score/foul bookkeeping). A made field goal also flips possession, but in
-# the data that is realized through the *following* inbound/rebound events, so we key off
-# the explicit change-of-possession outcomes here and leave the rest to the Controller.
-POSSESSION_FLIP_RESULTS = {"cop", "steal"}
 
 HOME, AWAY = "home", "away"
 
@@ -171,7 +164,10 @@ class GameSimulator:
         # candidates to the bench. Set when seeding from a GameInput spec.
         self.home_full: list[str] = []
         self.away_full: list[str] = []
-        self.possession: str = HOME
+        # NOTE: possession is deliberately NOT tracked here. GameController owns it. There used
+        # to be a second copy on the simulator, flipped off result tokens, and the two disagreed
+        # routinely — a made FG flips the controller's but was not a flip result here, and a
+        # steal emits two flip-triggering rows where the controller flips once.
         self.season: str = ""
         # --- Season context (pre-game givens; constant across the game) ---
         # Per-team season progress (games played / 82) and days of rest, plus per-player
@@ -229,10 +225,9 @@ class GameSimulator:
     # ===================================================================== #
 
     def reset(self) -> None:
-        """Clear all per-game state (rosters, possession, season context, history)."""
+        """Clear all per-game state (rosters, season context, history)."""
         self.home_roster, self.away_roster = [], []
         self.home_full, self.away_full = [], []
-        self.possession = HOME
         self.season = ""
         self.home_games_played = DEFAULT_GAMES_PLAYED
         self.away_games_played = DEFAULT_GAMES_PLAYED
@@ -263,7 +258,7 @@ class GameSimulator:
         self._cache.on_context_change()
 
     def start_game(self, home_roster: list[str], away_roster: list[str],
-                   possession: str = HOME, season: str = "2003",
+                   season: str = "2003",
                    seed_event: dict | None = None, tipoff_time: float = 0.0,
                    season_context: dict | None = None) -> "GameSimulator":
         """
@@ -279,7 +274,6 @@ class GameSimulator:
         self.reset()
         self.home_roster = list(home_roster)
         self.away_roster = list(away_roster)
-        self.possession = possession
         self.season = str(season)
         self._set_season_context(season_context)
 
@@ -298,9 +292,9 @@ class GameSimulator:
         Append one event to the history, applying the concrete state rules first.
 
         Order matters: substitutions mutate the roster and the event row must then carry
-        the **post**-substitution lineup (matching how the cleaned data is laid out);
-        possession is flipped on change-of-possession outcomes. The post-update rosters +
-        possession are snapshotted into the returned/stored row.
+        the **post**-substitution lineup (matching how the cleaned data is laid out). The
+        post-update rosters are snapshotted into the returned/stored row. Possession is not
+        tracked or snapshotted here — GameController owns it (see __init__).
 
         ``time`` is the absolute game clock (seconds). If omitted it carries the previous
         row's time (a zero-Δt event), keeping the sequence monotonic.
@@ -315,9 +309,6 @@ class GameSimulator:
         # incoming player (off the bench).
         if event == "substitution":
             self._apply_substitution(incoming=secondary_player, outgoing=player)
-        # 2) Possession bookkeeping (not a model input; tracked for downstream use).
-        if result in POSSESSION_FLIP_RESULTS:
-            self._flip_possession()
 
         row = self._make_row(event=event, player=player, type=type, result=result,
                              secondary_player=secondary_player, time=float(time))
@@ -340,11 +331,7 @@ class GameSimulator:
             "event": event, "player": player, "type": type, "result": result,
             "secondary_player": secondary_player, "season": self.season, "time": time,
             "roster_home": list(self.home_roster), "roster_away": list(self.away_roster),
-            "possession": self.possession,
         }
-
-    def _flip_possession(self) -> None:
-        self.possession = AWAY if self.possession == HOME else HOME
 
     def _team_of(self, player: str) -> str | None:
         if player in self.home_roster:
@@ -697,7 +684,7 @@ class GameSimulator:
     # ===================================================================== #
 
     def start_from_full_rosters(self, home_full: list[str], away_full: list[str],
-                                possession: str = HOME, season: str = "2003",
+                                season: str = "2003",
                                 tipoff_time: float = 0.0, greedy: bool = False,
                                 greedy_starters: bool = True,
                                 season_context: dict | None = None) -> "GameSimulator":
@@ -715,7 +702,6 @@ class GameSimulator:
         self.reset()
         self.home_full = list(home_full)
         self.away_full = list(away_full)
-        self.possession = possession
         self.season = str(season)
         # Empty start frame — the lineup is not yet built (mirrors preprocessing).
         self._append_row(self._make_row(
@@ -727,7 +713,7 @@ class GameSimulator:
         return self
 
     def start_alternating(self, home_full: list[str], away_full: list[str],
-                          possession: str = HOME, season: str = "2003",
+                          season: str = "2003",
                           tipoff_time: float = 0.0, greedy: bool = False,
                           greedy_starters: bool = True,
                           season_context: dict | None = None) -> "GameSimulator":
@@ -744,7 +730,6 @@ class GameSimulator:
         self.reset()
         self.home_full = list(home_full)
         self.away_full = list(away_full)
-        self.possession = possession
         self.season = str(season)
         # Set before building the opening five — the substitution head now consumes rest.
         self._set_season_context(season_context)
@@ -761,7 +746,7 @@ class GameSimulator:
 
     def start_with_starters(self, home_full: list[str], away_full: list[str],
                             home_starters: list[str], away_starters: list[str],
-                            possession: str = HOME, season: str = "2003",
+                            season: str = "2003",
                             tipoff_time: float = 0.0,
                             season_context: dict | None = None) -> "GameSimulator":
         """Seed an empty ``start`` frame and place the **given** starting fives, no model calls.
@@ -776,7 +761,6 @@ class GameSimulator:
         self.reset()
         self.home_full = list(home_full)
         self.away_full = list(away_full)
-        self.possession = possession
         self.season = str(season)
         # Set before building the opening five — the substitution head now consumes rest.
         self._set_season_context(season_context)

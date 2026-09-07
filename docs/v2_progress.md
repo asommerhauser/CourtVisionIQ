@@ -33,7 +33,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged
 | # | Branch / gate | Phase | Spec | Status | Merge |
 |---|---|---|---|---|---|
 | 1 | `feature/side-aware-fouls` | 1 | §1 | [x] | f55758d |
-| 2 | `feature/dead-ball-state` | 1 | §2 | [ ] | |
+| 2 | `feature/dead-ball-state` | 1 | §2 | [x] | 5ea3afd |
 | — | **Gate A — Phase 1 short eval** | 1 | | [ ] | |
 | 3 | `feature/shot-zone-geometry` | 2 | §3 | [ ] | |
 | 4 | `feature/shot-zones` | 2 | §3 | [ ] | |
@@ -119,9 +119,19 @@ pytest tests/test_controller.py tests/test_game_simulator.py tests/test_chronolo
 ```
 New case required: a play sampled across a buzzer does not straddle it.
 
-**Result:**
+**Result:** 76 passed (controller + game_simulator + chronology). Full suite: 534 passed,
+1 failed - `test_model_naming.py::test_holdout_skips_an_empty_processed_manifest`, pre-existing and
+unrelated (see correction G). encoder/vocabs/ clean after both runs.
 
-**Notes:**
+**Notes:** The boundary clamp resolves the play AT the buzzer rather than discarding it and
+re-sampling, which is what the spec's wording asks for. Discarding would mean throwing away an
+already-sampled actor and delta and restructuring every handler; clamping gets the stated
+invariant (no event straddles a boundary) and the next step samples in the new period anyway.
+A play landing exactly at 0.0 is a legal buzzer-beater. Revisit only if diagnostics show
+something odd at period ends. Also: `start()` now puts the ball live, so no substitution is
+possible until the first whistle - three scheduler tests had to state the dead ball they were
+implicitly relying on the old `pending_rebound` proxy to provide. Timeouts and team rebounds
+are dead-ball sources that do not exist yet; their hooks land in section 6.
 
 ### Gate A — Phase 1 short eval
 
@@ -568,6 +578,14 @@ branches later. `GameController._foul_offense()` resolves it: while the previous
 field goal, the possession that just ended is the one the foul belongs to, so the scoring team is
 the offense. Found and fixed on `feature/side-aware-fouls`.
 
+**G. `test_holdout_skips_an_empty_processed_manifest` fails on a machine that has trained.**
+`shell/session.py:149` reads `./training/full_run_state.json` from the CWD, but the test only
+isolates `processed_dir` via `tmp_path`. On this machine that file is real (untracked, 100
+holdout ids, from the Aug 23 train), so `resolve_holdout` returns at `:153` instead of raising
+and the test fails. It is a test-isolation bug, not a product bug, and it is **not** caused by any
+2.0 work - it fails identically on `main`. It does block Gate C's "pytest tests/ green", so fix it
+before then: the test needs to isolate the training-state path too.
+
 ---
 
 ## Log
@@ -577,3 +595,4 @@ Append one line per merge. Newest last.
 | Date | Branch | Commit | Note |
 |---|---|---|---|
 | 2026-09-06 | `feature/side-aware-fouls` | f55758d | 61 tests green; and-1 fix beyond spec (correction F) |
+| 2026-09-06 | `feature/dead-ball-state` | 5ea3afd | 76 green; found pre-existing test-isolation bug (correction G) |
