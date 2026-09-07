@@ -88,9 +88,29 @@ def test_padding_is_masked_out_for_every_head():
     assert m[0, SEQ - 4, SEQ - 4]
 
 
-def test_window_of_one_is_the_diagonal():
-    m = _mask(local_heads=1, window=1)[0]
-    assert (m[0] == np.eye(SEQ, dtype=bool)).all()
+@pytest.mark.parametrize("window", [1, 4, SEQ])
+def test_the_band_and_causality_together_give_the_trailing_window(window):
+    """What a local head actually sees is the band ANDed with MHA's causal mask.
+
+    The layer emits the lower edge only -- ``(i - j) < window`` -- because
+    ``use_causal_mask=True`` already forbids attending forward, so an upper edge would be
+    redundant work on a (B, H, SEQ, SEQ) tensor. Taken alone the band is therefore *not* the
+    window: at window=1 it is the whole upper triangle. Only the conjunction is meaningful, and
+    that is what this asserts -- at window=1, exactly the diagonal.
+    """
+    band = _mask(local_heads=1, window=window)[0][0]
+    i, j = np.indices((SEQ, SEQ))
+    causal = j <= i
+    effective = band & causal
+    expected = causal & (i - j < window)
+    assert (effective == expected).all()
+    assert effective.sum(axis=1).tolist() == [min(r + 1, window) for r in range(SEQ)]
+
+
+def test_window_of_one_leaves_a_head_seeing_only_its_own_row():
+    band = _mask(local_heads=1, window=1)[0][0]
+    i, j = np.indices((SEQ, SEQ))
+    assert (band & (j <= i) == np.eye(SEQ, dtype=bool)).all()
 
 
 def test_a_local_head_count_outside_the_head_count_is_rejected():
