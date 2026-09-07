@@ -39,7 +39,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged
 | 4 | `feature/shot-zones` | 2 | §3 | [x] | 27a3327 |
 | 5 | `feature/ft-count-tokens` | 2 | §4 | [x] | 4b0dd09 |
 | 6 | `feature/fouled-player` | 2 | §5 | [x] | 715cedb |
-| 7 | `feature/timeouts-team-rebounds` | 2 | §6 | [ ] | |
+| 7 | `feature/timeouts-team-rebounds` | 2 | §6 | [x] | b54685f |
 | 8 | `feature/schema-cleanup` | 2 | §7 | [ ] | |
 | — | **Gate B — the re-clean + vocab rebuild** | 2 | | [ ] | |
 | 9 | `feature/shared-backbone` | 3 | §9 pre | [ ] | |
@@ -360,9 +360,28 @@ pytest tests/test_controller.py tests/test_box_score.py tests/test_dials.py -q
 ```
 `test_dials.py` matters here: removing a `_TUNING_KEYS` entry is exactly what it guards.
 
-**Result:**
+**Result:** Full suite: 628 passed, 1 failed - the pre-existing correction G failure,
+unrelated. Three commits: 7eccf81 team rebounds, 6e13d81 timeouts, b54685f the
+bare-team-rebound side recovery.
 
-**Notes:**
+**Notes:** See correction J for the team-rebound population analysis - the short version is
+that the side IS recoverable at 99.8% accuracy, but two thirds of the bare rows are not
+rebounds at all.
+
+Timeouts are gated on `timeout_team` being loaded, which the spec does not mention. Alec
+confirmed old weights will never meet 2.0 data, so this is now a cheap safety net rather
+than a compatibility requirement; the FakeSim tests use it to exercise the off path.
+
+Timeout volume: 14,477 in 2022-23, ~12 a game, `team` populated on 100% and both
+abbreviations always resolved before the first one - nothing is dropped in practice.
+
+`_event_menu` extracted from `_step` so the dead-ball + budget + head-loaded gate is one
+readable function, testable without a live event head.
+
+**Suite noise:** the full run emits ~18.5k warnings, 99.9% of them one Keras/numpy-2
+`__array__ copy keyword` DeprecationWarning fired per array conversion in
+test_model_persistence (14,169) and test_game_simulator (4,353). Library-level, not ours.
+The repo has no pytest config at all; a `filterwarnings` entry would silence it.
 
 ### 8. `feature/schema-cleanup` — §7
 
@@ -684,6 +703,23 @@ basket they follow (98.6% have one within five rows). The controller still overr
 structurally - an and-1 is one attempt whatever the token says - so the token is only ever read
 as 'the fouled attempt was a 2 or a 3', which is exactly what it means in every other case.
 
+**J. A bare team rebound's side IS recoverable - but most of those rows are not rebounds.**
+I first claimed the side could not be inferred. That was wrong: the heuristic was bad, not the
+data. Counting "the next event that names a team" includes fouls, which are usually committed by
+the team WITHOUT the ball, so it inverted the answer and gave an implausible 65/12 split.
+Restricting the lookahead to events that actually indicate possession (shot, free throw,
+turnover) is **99.8% accurate**, validated against the 11,884 playerless rebounds whose side is
+recorded, in the same structural position. The raw `possession` column is no help - it is a
+jump-ball arrow, blank on 99.6% of rows and on all 9,374 of these.
+
+The population, though, is mostly not boards. Of 9,374 bare rows in 2022-23: **6,336** follow a
+missed free throw that was not the last of its trip (6,078 are literally "missed 1 of 2") - the
+ball is dead and the shooter shoots again; **13** follow a made free throw; **2,116** are
+end-of-period boards with no following possession, genuinely undecidable and already excluded by
+section 7's "period-end rows are not kept"; leaving **909** real, decidable team rebounds, which
+are now recovered. Emitting the 6,336 would have injected phantom boards into the head whose
+entire job is the offensive/defensive split.
+
 ---
 
 ## Log
@@ -698,3 +734,4 @@ Append one line per merge. Newest last.
 | 2026-09-07 | `feature/shot-zones` | 27a3327 | full suite green; 13 test files re-tokenized, not 6 |
 | 2026-09-07 | `feature/ft-count-tokens` | 4b0dd09 | phantom shot_type sample deleted; and-1 rule added (correction I) |
 | 2026-09-07 | `feature/fouled-player` | 715cedb | 144 green; opponent 100% populated except technicals |
+| 2026-09-07 | `feature/timeouts-team-rebounds` | b54685f | 628 green; team-rebound side recovered at 99.8% (correction J) |
