@@ -67,8 +67,12 @@ def test_get_dials_round_trips_through_apply_dials():
 def test_get_dials_returns_deep_copies():
     """A caller mutating a nested dict from get_dials() must not reach into module state."""
     snap = config.get_dials()
-    snap["TYPE_BIAS"]["foul_type"]["shooting"] = 99.0
-    assert config.TYPE_BIAS["foul_type"]["shooting"] != 99.0
+    # Named off the live dict rather than hard-coded: 2.0 split the "shooting" foul token into
+    # "shooting 2pt"/"shooting 3pt" and this assertion became a KeyError instead of a check.
+    token = next(iter(config.TYPE_BIAS["foul_type"]))
+    before = config.TYPE_BIAS["foul_type"][token]
+    snap["TYPE_BIAS"]["foul_type"][token] = 99.0
+    assert config.TYPE_BIAS["foul_type"][token] == before
 
 
 # --------------------------------------------------------------------------- #
