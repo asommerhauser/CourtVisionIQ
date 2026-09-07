@@ -214,7 +214,7 @@ def test_rebound_type_head_decides_split_before_player():
     # The off/def split comes from the rebound_type head, masked to the two live types.
     type_call = [c for c in ctrl.sim.calls if c[0] == "type"][0]
     assert type_call[1] == "rebound_type"
-    assert type_call[3] == ["offensive", "defensive"]
+    assert type_call[3] == ["offensive", "defensive", "team offensive", "team defensive"]
 
 
 # ===================================================================== #
@@ -501,6 +501,47 @@ def test_fouls_before_the_window_do_not_count_toward_it():
 
 
 # ===================================================================== #
+# Team rebounds
+# ===================================================================== #
+
+def test_a_team_rebound_emits_a_row_and_picks_no_rebounder():
+    """DEADBALL_REBOUND_PROB flipped possession silently and emitted NO row at all."""
+    ctrl = make_controller(HOME)
+    ctrl.sim.script(type=["team defensive"])
+    ctrl._do_rebound(delta=2.0)
+
+    (reb,) = rows(ctrl)
+    assert (reb["event"], reb["player"], reb["type"]) == ("rebound", "none", "team defensive")
+    assert not [c for c in ctrl.sim.calls if c[0] == "player"]   # nobody is credited
+    assert ctrl.possession == AWAY                                # defensive board flips it
+
+
+def test_a_team_offensive_rebound_keeps_possession():
+    ctrl = make_controller(HOME)
+    ctrl.sim.script(type=["team offensive"])
+    ctrl._do_rebound(delta=2.0)
+
+    (reb,) = rows(ctrl)
+    assert (reb["type"], reb["result"]) == ("team offensive", "null")
+    assert ctrl.possession == HOME
+    assert ctrl.ball_dead is True          # out of bounds: inbounded, not live off the rim
+
+
+def test_the_rebound_head_sees_all_four_tokens():
+    ctrl = make_controller(HOME)
+    ctrl.sim.script(type=["offensive"], player=["B"])
+    ctrl._do_rebound(delta=2.0)
+    allowed = [c for c in ctrl.sim.calls if c[0] == "type"][0][3]
+    assert allowed == ["offensive", "defensive", "team offensive", "team defensive"]
+
+
+def test_the_deadball_rebound_dial_is_gone():
+    """It was a coin flip standing in for a distribution the head can now learn."""
+    assert not hasattr(config, "DEADBALL_REBOUND_PROB")
+    assert "DEADBALL_REBOUND_PROB" not in config._TUNING_KEYS
+
+
+# ===================================================================== #
 # The fouled player
 # ===================================================================== #
 
@@ -676,7 +717,6 @@ def test_a_steal_stays_live_but_a_plain_turnover_kills_the_ball():
 
 def test_a_live_rebound_keeps_the_ball_live():
     ctrl = make_controller(HOME)
-    config.DEADBALL_REBOUND_PROB = 0.0          # force the individual-rebound path
     ctrl.ball_dead = True
     ctrl.sim.script(type=["defensive"], player=["F"])
     ctrl._do_rebound(delta=2.0)
@@ -685,8 +725,8 @@ def test_a_live_rebound_keeps_the_ball_live():
 
 def test_a_team_rebound_kills_the_ball():
     ctrl = make_controller(HOME)
-    config.DEADBALL_REBOUND_PROB = 1.0          # force the dead-ball rebound path
     ctrl.ball_dead = False
+    ctrl.sim.script(type=["team defensive"])   # no player pick on a team board
     ctrl._do_rebound(delta=2.0)
     assert ctrl.ball_dead is True
 

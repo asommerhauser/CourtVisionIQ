@@ -104,6 +104,11 @@ class BoxScore:
     away_score: int = 0
     home_team: str = "HOME"
     away_team: str = "AWAY"
+    # Team rebounds -- nobody is credited, so they belong on the TEAM line, not a player's.
+    home_team_oreb: int = 0
+    home_team_dreb: int = 0
+    away_team_oreb: int = 0
+    away_team_dreb: int = 0
 
     def to_frame(self, side: str, *, totals: bool = True) -> pd.DataFrame:
         """DataFrame of one side's stat lines, sorted by points descending.
@@ -114,7 +119,9 @@ class BoxScore:
         lines = self.home if side == "home" else self.away
         rows = [pl.as_row() for pl in sorted(lines, key=lambda p: p.pts, reverse=True)]
         if totals and lines:
-            rows.append(_totals_row(lines))
+            team_oreb = self.home_team_oreb if side == "home" else self.away_team_oreb
+            team_dreb = self.home_team_dreb if side == "home" else self.away_team_dreb
+            rows.append(_totals_row(lines, team_oreb=team_oreb, team_dreb=team_dreb))
         return pd.DataFrame(rows, columns=list(_DISPLAY_COLUMNS))
 
     def render(self) -> str:
@@ -143,8 +150,16 @@ def _pct(made: int, att: int) -> str:
     return f"{100.0 * made / att:.1f}" if att else ""
 
 
-def _totals_row(lines: list[PlayerLine]) -> dict:
-    """A ``TEAM`` totals row: summed counting stats (no +/- — not meaningful as a sum)."""
+def _other_side(side: str) -> str:
+    return "away" if side == "home" else "home"
+
+
+def _totals_row(lines: list[PlayerLine], *, team_oreb: int = 0, team_dreb: int = 0) -> dict:
+    """A ``TEAM`` totals row: summed counting stats (no +/- — not meaningful as a sum).
+
+    Team rebounds are added here and nowhere else: no player earned one, so they appear only on
+    the bottom line, exactly as a real box score prints them.
+    """
     s = lambda attr: sum(getattr(pl, attr) for pl in lines)  # noqa: E731
     fgm, fga = s("fgm"), s("fga")
     tpm, tpa = s("tpm"), s("tpa")
@@ -154,7 +169,8 @@ def _totals_row(lines: list[PlayerLine]) -> dict:
         "FG": f"{fgm}-{fga}", "FG%": _pct(fgm, fga),
         "3PT": f"{tpm}-{tpa}", "3P%": _pct(tpm, tpa),
         "FT": f"{ftm}-{fta}", "FT%": _pct(ftm, fta),
-        "OREB": s("oreb"), "DREB": s("dreb"), "REB": s("oreb") + s("dreb"),
+        "OREB": s("oreb") + team_oreb, "DREB": s("dreb") + team_dreb,
+        "REB": s("oreb") + s("dreb") + team_oreb + team_dreb,
         "AST": s("ast"), "STL": s("stl"), "BLK": s("blk"), "TO": s("tov"),
         "PF": s("pf"), "+/-": "", "PTS": s("pts"),
     }
@@ -178,6 +194,12 @@ def generate_box_score(events, *, home_team: str = "HOME",
     home_players: set[str] = set()
     away_players: set[str] = set()
     home_score = away_score = 0
+    # Team rebounds carry no player, so they are attributed by side: "team offensive" belongs to
+    # whoever last shot, "team defensive" to the other team. Tracking the last shooter's team is
+    # enough, and works identically on cleaned rows and on simulator rows (neither of which
+    # carries possession).
+    team_reb = {"home": [0, 0], "away": [0, 0]}     # [oreb, dreb]
+    last_shot_team = None
 
     def line(name: str) -> PlayerLine:
         if name not in lines:
@@ -209,6 +231,13 @@ def generate_box_score(events, *, home_team: str = "HOME",
             continue
         player = _norm(row.get("player"))
         if not player or player in ("null", "none", "PAD", "UNK"):
+            # Playerless rows are otherwise ignored, but a team rebound is a real stat with no
+            # owner — the only row type that has to be counted before this guard.
+            etype = _norm(row.get("type"))
+            if event == "rebound" and etype in ("team offensive", "team defensive")                     and last_shot_team is not None:
+                offensive = etype.endswith("offensive")
+                side = last_shot_team if offensive else _other_side(last_shot_team)
+                team_reb[side][0 if offensive else 1] += 1
             continue
         etype = _norm(row.get("type"))
         result = _norm(row.get("result"))
@@ -216,6 +245,8 @@ def generate_box_score(events, *, home_team: str = "HOME",
         pl = line(player)
 
         if event == "shot":
+            if team is not None:
+                last_shot_team = team
             made = result == "made"
             # A shot row is either a free throw or one of the fifteen zones — points_for_shot
             # raises on anything else rather than silently scoring it as a two, which is what
@@ -279,6 +310,8 @@ def generate_box_score(events, *, home_team: str = "HOME",
     home = [lines[p] for p in sorted(home_players) if p in lines]
     away = [lines[p] for p in sorted(away_players) if p in lines]
     return BoxScore(home=home, away=away, home_score=home_score, away_score=away_score,
+                    home_team_oreb=team_reb["home"][0], home_team_dreb=team_reb["home"][1],
+                    away_team_oreb=team_reb["away"][0], away_team_dreb=team_reb["away"][1],
                     home_team=home_team, away_team=away_team)
 
 

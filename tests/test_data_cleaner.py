@@ -377,6 +377,38 @@ def test_non_shot_rows_never_get_a_zone(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Team rebounds
+# ---------------------------------------------------------------------------
+
+def test_a_playerless_rebound_becomes_a_team_rebound_token(tmp_path):
+    """It used to be emitted as a player row literally named "null", ~11.9k times a season."""
+    cleaned = _parse(tmp_path, [
+        {"event_type": "rebound", "player": None, "type": "rebound offensive", "result": None},
+        {"event_type": "rebound", "player": None, "type": "rebound defensive", "result": None},
+    ])
+    reb = cleaned[cleaned["event"] == "rebound"]
+    assert list(reb["type"]) == ["team offensive", "team defensive"]
+    assert list(reb["player"]) == ["none", "none"]
+    assert list(reb["result"]) == ["null", "cop"]
+
+
+def test_a_credited_rebound_is_unchanged(tmp_path):
+    cleaned = _parse(tmp_path, [
+        {"event_type": "rebound", "player": "Alice", "type": "rebound offensive", "result": None},
+    ])
+    reb = cleaned[cleaned["event"] == "rebound"].iloc[0]
+    assert (reb["type"], reb["player"]) == ("offensive", "Alice")
+
+
+def test_a_bare_team_rebound_is_still_dropped(tmp_path):
+    """It carries no side, and 22.6% sit at a period boundary — bookkeeping, not a board."""
+    cleaned = _parse(tmp_path, [
+        {"event_type": "rebound", "player": None, "type": "team rebound", "result": None},
+    ])
+    assert cleaned[cleaned["event"] == "rebound"].empty
+
+
+# ---------------------------------------------------------------------------
 # The fouled player — foul rows name who drew the foul
 # ---------------------------------------------------------------------------
 

@@ -70,10 +70,12 @@ FOUL_TYPES = ["personal", SHOOTING_2PT, SHOOTING_3PT, "offensive", "loose ball",
 # keeps us from double-counting a real missed FGA *and* awarding shooting-foul free throws.
 REBOUNDING_FOUL_TYPES = ["personal", "loose ball", "away from play"]
 FIELD_GOAL_TYPES = ZONE_TOKENS
-# A live rebound is offensive (shooting team keeps the ball) or defensive (possession flips).
-# The rebound-type head is masked to these two; the rare "null"/team rebound is modeled
-# separately by DEADBALL_REBOUND_PROB below (the ball just changes hands with no row).
-REBOUND_TYPES = ["offensive", "defensive"]
+# A rebound is offensive (shooting team keeps the ball) or defensive (possession flips), and
+# either can be a TEAM rebound -- nobody credited, the ball out of bounds off someone. The head
+# learns the team share from ~11.9k real examples a season instead of it being a coin flip on
+# DEADBALL_REBOUND_PROB, which emitted no row at all and so taught the model nothing.
+TEAM_REBOUND_TYPES = ("team offensive", "team defensive")
+REBOUND_TYPES = ["offensive", "defensive", *TEAM_REBOUND_TYPES]
 
 # Common fouls that can trigger bonus free throws when the defense is in the penalty.
 COMMON_FOULS = {"personal", "loose ball", "away from play"}
@@ -411,25 +413,28 @@ class GameController:
         team rebound / out-of-bounds — and the ball simply changes hands with no row.
         """
         offense = self.possession  # team that just missed
-        if self.rng.random() < config.DEADBALL_REBOUND_PROB:
-            self._advance_clock(delta)                 # no rebounder to time on → marginal gap
-            self.possession = self._other(offense)     # out of bounds → other team
-            self.ball_dead = True                      # a team rebound is a dead ball
-            return
-        # Off/def type then the rebounder are sampled on the marginal Δt; the authoritative Δt for the
-        # clock is then conditioned on the decided rebounder.
+        # Off/def and team-or-not both come from the type head on the marginal Δt; the
+        # authoritative Δt is then conditioned on the decided rebounder (a team rebound has
+        # none, so it times on the marginal gap).
         rtype = self.sim.predict_type("rebound_type", "rebound", None, REBOUND_TYPES,
                                       delta_seconds=delta, greedy=self.greedy)
-        five = self._offense_five() if rtype == "offensive" else self._defense_five()
-        rebounder = self.sim.predict_player("rebound", five,
-                                            delta_seconds=delta, greedy=self.greedy,
-                                            temperature=self.player_temp)
-        self._advance_for("rebound", rebounder, delta)
-        self.ball_dead = False                         # a live rebound: play continues
-        if rtype == "offensive":                       # offensive rebound — offense retains
-            self._append("rebound", rebounder, "offensive", "null")
-        else:                                          # defensive rebound — possession flips
-            self._append("rebound", rebounder, "defensive", "cop")
+        offensive = rtype.endswith("offensive")
+        team_rebound = rtype in TEAM_REBOUND_TYPES
+
+        if team_rebound:
+            rebounder = "none"                         # nobody is credited; skip the pick
+            self._advance_clock(delta)
+            self.ball_dead = True                      # out of bounds: the ball is inbounded
+        else:
+            five = self._offense_five() if offensive else self._defense_five()
+            rebounder = self.sim.predict_player("rebound", five,
+                                                delta_seconds=delta, greedy=self.greedy,
+                                                temperature=self.player_temp)
+            self._advance_for("rebound", rebounder, delta)
+            self.ball_dead = False                     # a live rebound: play continues
+
+        self._append("rebound", rebounder, rtype, "null" if offensive else "cop")
+        if not offensive:                              # defensive board — possession flips
             self.possession = self._other(offense)
 
     def _do_substitution(self, delta: float) -> None:

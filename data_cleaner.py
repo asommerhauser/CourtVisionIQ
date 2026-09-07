@@ -452,6 +452,11 @@ class DataCleaner:
 
         # ---- REBOUND ----
         if row["event_type"] == "rebound":
+            # A bare "team rebound" carries no side at all. 22.6% of them sit at a period
+            # boundary and 71% follow a free throw, so they are mostly bookkeeping rather than a
+            # live board, and nothing in the row says which way the ball went -- inferring it
+            # from the next team-bearing event gives an implausible 65/12 offensive split. They
+            # stay dropped, as before. The playerless *typed* rebounds below do carry a side.
             if row["type"] == "team rebound":
                 return events
 
@@ -460,14 +465,20 @@ class DataCleaner:
                 else "offensive" if row["type"] == "rebound offensive"
                 else "null"
             )
+            # No player credited: a team rebound. The raw type still says which side got the
+            # ball, so it becomes its own token rather than a player row named "null" -- which
+            # is what the player head used to be trained on, ~11.9k times a season.
+            rebounder = row["player"] if pd.notna(row["player"]) else None
+            if rebounder is None and rebound_type in ("offensive", "defensive"):
+                rebound_type = f"team {rebound_type}"
             events.append({
                 "roster_home": clean_home,
                 "roster_away": clean_away,
                 "time": time_safe,
                 "event": "rebound",
-                "player": row["player"] if pd.notna(row["player"]) else "null",
+                "player": rebounder if rebounder is not None else "none",
                 "type": rebound_type,
-                "result": "cop" if rebound_type == "defensive" else "null",
+                "result": "cop" if rebound_type.endswith("defensive") else "null",
                 "secondary_player": "none",
                 "home/away": home,
                 "season": self.season,
