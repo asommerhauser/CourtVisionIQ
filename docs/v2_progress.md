@@ -35,7 +35,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged
 | 1 | `feature/side-aware-fouls` | 1 | §1 | [x] | f55758d |
 | 2 | `feature/dead-ball-state` | 1 | §2 | [x] | 5ea3afd |
 | — | **Gate A — Phase 1 short eval** | 1 | | skipped | - |
-| 3 | `feature/shot-zone-geometry` | 2 | §3 | [ ] | |
+| 3 | `feature/shot-zone-geometry` | 2 | §3 | [x] | 8434786 |
 | 4 | `feature/shot-zones` | 2 | §3 | [ ] | |
 | 5 | `feature/ft-count-tokens` | 2 | §4 | [ ] | |
 | 6 | `feature/fouled-player` | 2 | §5 | [ ] | |
@@ -179,9 +179,28 @@ pytest tests/test_zones.py -q
 Cases: both baskets map to the same token, every boundary, the raw `type` marker wins over geometry
 on the 2pt/3pt call.
 
-**Result:**
+**Result:** 42 passed. `python -m zones --seasons 2003,2013,2023` run and **all gates
+pass** - the section 3 validation table is already satisfied, ahead of Gate B.
 
-**Notes:**
+**Notes:** Measured table, matching the spec's independently measured numbers to a rounding
+step:
+
+| | 2003 | 2013 | 2023 |
+|---|---|---|---|
+| `rim` | 30.5% @ 58.9% | 33.1% @ 60.1% | 30.3% @ 66.1% |
+| `paint` | 14.7% @ 39.1% | 14.3% @ 38.6% | 19.3% @ 44.4% |
+| `mid_corner_l` | 5.4% @ 38.9% | 3.3% @ 40.0% | 0.6% @ 40.4% |
+| `corner3_l` | 2.5% @ 36.7% | 3.5% @ 38.5% | 5.1% @ 38.5% |
+| `wing3_l` | 4.6% @ 35.2% | 5.9% @ 35.0% | 9.8% @ 35.8% |
+| `top3` | 3.9% @ 34.9% | 5.4% @ 34.5% | 10.2% @ 34.9% |
+| `heave` | 0.4% @ 4.7% | 0.4% @ 3.8% | 0.4% @ 12.8% |
+| 3PA share | 18.4% | 24.4% | 38.8% |
+| marker disagreement | 0.39% | 0.23% | 0.11% |
+| coord coverage | 100.0% | 100.0% | 99.4% |
+
+One departure from the spec's geometry - see correction H. `python -m zones` is a ~6s CPU
+pass per season over the raw files (no TF, no CUDA), so it is cheap to re-run any time the
+geometry is touched. Re-run it at Gate B against the re-clean.
 
 ### 4. `feature/shot-zones` — §3, consumers
 
@@ -591,6 +610,18 @@ and the test fails. It is a test-isolation bug, not a product bug, and it is **n
 2.0 work - it fails identically on `main`. It does block Gate C's "pytest tests/ green", so fix it
 before then: the test needs to isolate the training-state path too.
 
+**H. The spec's fold is wrong for exactly the shots `heave` exists to catch.** Section 3 decides
+which basket is being attacked by which half the shot came from (`end_a = y < 47`). That is right
+for every normal attempt and backwards for a genuine backcourt heave, launched from the shooter's
+own end: 2022-23 has real rows like `shot_distance=65` at `(20.3, 24.4)`, which the half-court
+rule folds to the *near* hoop at 19.7 ft and drops into `top3`. A 5-15% prayer would then sit
+inside a real zone dragging its make rate down - precisely what the separate token is meant to
+prevent, so `heave` would have been unreachable for the shots that need it most. `zones.fold()`
+picks the basket by whichever hoop `shot_distance` agrees with, falling back to the half-court
+rule when that column is missing. Impact: the basket changes for 0.193% of 2022-23 coordinate
+rows and the zone for 161 of them. This is why the measured `heave` volumes run slightly above
+the spec's 0.3-0.4%.
+
 ---
 
 ## Log
@@ -601,3 +632,4 @@ Append one line per merge. Newest last.
 |---|---|---|---|
 | 2026-09-06 | `feature/side-aware-fouls` | f55758d | 61 tests green; and-1 fix beyond spec (correction F) |
 | 2026-09-06 | `feature/dead-ball-state` | 5ea3afd | 76 green; found pre-existing test-isolation bug (correction G) |
+| 2026-09-06 | `feature/shot-zone-geometry` | 8434786 | 42 green; zone validation table passes all gates (correction H) |
