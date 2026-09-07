@@ -31,6 +31,7 @@ from models.game_state_features import NON_TEAM_FOUL_TYPES
 from models.stint_length_model import StintLengthModel
 from models.substitution_model import START_TOKEN
 from simulation.game_simulator import GameSimulator, HOME, AWAY
+from zones import ZONE_TOKENS, is_three, points_for_shot
 
 # --- Game structure (NBA) ---
 PERIOD_LENGTH = 720          # 12:00 regulation quarter (seconds)
@@ -51,7 +52,8 @@ OPEN_PLAY_EVENTS = ["shot", "assist", "turnover", "foul"]
 POST_MISS_EVENTS = ["rebound", "foul"]   # a rebound is only legal right after a miss
 
 # Conditional-head token whitelists (intentional sampling / masking).
-SHOT_TYPES = ["2pt", "3pt"]              # a live field goal is a 2 or a 3 (FTs come from fouls)
+SHOT_TYPES = list(ZONE_TOKENS)           # a live field goal is one of the fifteen court zones
+                                         # (FTs never come from this head -- they come from fouls)
 LIVE_SHOT_RESULTS = ["made", "missed", "blocked"]
 FT_RESULTS = ["made", "missed"]
 TURNOVER_TYPES = ["steal", "violation", "error"]
@@ -62,7 +64,7 @@ FOUL_TYPES = ["personal", "shooting", "offensive", "loose ball",
 # never a shooting foul (the shot already happened and was logged) — masking shooting out here
 # keeps us from double-counting a real missed FGA *and* awarding shooting-foul free throws.
 REBOUNDING_FOUL_TYPES = ["personal", "loose ball", "away from play"]
-FIELD_GOAL_TYPES = ("2pt", "3pt")
+FIELD_GOAL_TYPES = ZONE_TOKENS
 # A live rebound is offensive (shooting team keeps the ball) or defensive (possession flips).
 # The rebound-type head is masked to these two; the rare "null"/team rebound is modeled
 # separately by DEADBALL_REBOUND_PROB below (the ball just changes hands with no row).
@@ -308,11 +310,11 @@ class GameController:
                                       delta_seconds=delta, greedy=self.greedy)
         result = self.sim.predict_result(shooter, stype, LIVE_SHOT_RESULTS,
                                          delta_seconds=delta, greedy=self.greedy,
-                                         bias=self._shot_result_bias(offense))
+                                         bias=self._shot_result_bias(offense, stype))
         self._append("shot", shooter, stype, result)
 
         if result == "made":
-            self._score(offense, 3 if stype == "3pt" else 2)
+            self._score(offense, points_for_shot(stype))
             self.possession = self._other(offense)      # made FG → other team inbounds
             self.ball_dead = self._made_basket_stops_clock()
         elif result == "blocked":
@@ -328,14 +330,21 @@ class GameController:
             self.pending_rebound = True
             self.ball_dead = False
 
-    def _shot_result_bias(self, offense: str) -> dict[str, float] | None:
-        """Per-shot result-logit bias: the global SHOT_RESULT_BIAS plus the home-court made nudge.
+    def _shot_result_bias(self, offense: str, zone: str | None = None) -> dict[str, float] | None:
+        """Per-shot result-logit bias: SHOT_RESULT_BIAS, the zone override, and the home nudge.
 
-        The home offense gets ``+home_court_bias`` on "made", the away offense ``-home_court_bias``
-        (symmetric, so the pooled make rate is preserved while the home/away split is tilted). Returns
-        ``None`` when nothing applies so ``predict_result`` takes its raw path.
+        ``SHOT_RESULT_BIAS_BY_ZONE[zone]`` is merged on top of the global, so a zone with no entry
+        just gets the global value. That hook is new in 2.0: with one make-rate dial for every
+        shot, rim finishing and long-mid frequency were competing for a single number.
+
+        The home offense then gets ``+home_court_bias`` on "made", the away offense
+        ``-home_court_bias`` (symmetric, so the pooled make rate is preserved while the home/away
+        split is tilted). Returns ``None`` when nothing applies so ``predict_result`` takes its
+        raw path.
         """
         bias = dict(config.SHOT_RESULT_BIAS)
+        if zone is not None:
+            bias.update(config.SHOT_RESULT_BIAS_BY_ZONE.get(zone, {}))
         if self.home_court_bias:
             nudge = self.home_court_bias if offense == HOME else -self.home_court_bias
             bias["made"] = bias.get("made", 0.0) + nudge
@@ -361,7 +370,7 @@ class GameController:
         shooter = self.sim.predict_player("shot", teammates, delta_seconds=0.0, greedy=self.greedy,
                                           temperature=self.player_temp)
         self._append("shot", shooter, atype, "made")
-        self._score(offense, 3 if atype == "3pt" else 2)
+        self._score(offense, points_for_shot(atype))
         self.possession = self._other(offense)
         self.ball_dead = self._made_basket_stops_clock()
 
@@ -626,7 +635,7 @@ class GameController:
             shooter = self._pick_shooter(shooting_team)
             stype = self.sim.predict_type("shot_type", "shot", shooter, SHOT_TYPES,
                                           delta_seconds=0.0, greedy=self.greedy)
-            n_ft = 3 if stype == "3pt" else 2          # a 3pt shooting foul is three FTs
+            n_ft = 3 if is_three(stype) else 2         # a 3pt shooting foul is three FTs
 
         self._count_team_foul(fouler_team)             # always a defensive team foul
         self._free_throws(shooter, shooting_team, n_ft, live_last=True, retain=False)

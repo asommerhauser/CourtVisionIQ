@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
+from zones import FREE_THROW, is_three, points_for_shot
+
 # Foul types that do NOT count as a personal foul on the box score (technicals are
 # tracked separately in real box scores; everything else — shooting, offensive, loose
 # ball, flagrant, etc. — is a personal foul).
@@ -215,25 +217,27 @@ def generate_box_score(events, *, home_team: str = "HOME",
 
         if event == "shot":
             made = result == "made"
-            if etype == "3pt":
-                pl.tpa += 1
-                pl.fga += 1
-                if made:
-                    pl.tpm += 1
-                    pl.fgm += 1
-                    pl.pts += 3
-            elif etype == "free throw":
+            # A shot row is either a free throw or one of the fifteen zones — points_for_shot
+            # raises on anything else rather than silently scoring it as a two, which is what
+            # the old `else: # 2pt` catch-all did. models/game_state_features.py calls the same
+            # function, so the box score and the trained score feature cannot drift.
+            pts = points_for_shot(etype) if made else 0
+            if etype == FREE_THROW:
                 pl.fta += 1
                 if made:
                     pl.ftm += 1
                     pl.pts += 1
-            else:  # 2pt (or any other field-goal type)
+            else:
                 pl.fga += 1
+                three = is_three(etype)
+                if three:
+                    pl.tpa += 1
                 if made:
                     pl.fgm += 1
-                    pl.pts += 2
+                    if three:
+                        pl.tpm += 1
+                    pl.pts += pts
             if made:
-                pts = 3 if etype == "3pt" else 1 if etype == "free throw" else 2
                 if team == "home":
                     home_score += pts
                 elif team == "away":

@@ -83,6 +83,7 @@ from models.game_state_features import (
 )
 from reporting import ReportCollector, RunConfig
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
+from zones import ZONE_TOKENS
 
 
 @dataclass(frozen=True)
@@ -99,10 +100,12 @@ class TypeGenSpec:
     target_field: str              # "type" or "result" — the field predicted
     condition_fields: tuple        # extra decided fields, e.g. ("player",) or ("player", "type")
     # If non-empty, the loss is further restricted to rows whose *target* token is in this set.
-    # Used by shot_type to learn live field goals only ({2pt, 3pt}): in the cleaned data a free
-    # throw is a shot row (event="shot", type="free throw"), but the simulator never asks shot_type
-    # to choose one (FTs are emitted directly from fouls — controller._free_throws), so training on
-    # them only confuses a binary 2pt-vs-3pt head. Empty = no extra restriction (all other heads).
+    # Used by shot_type and assist_type to learn live field goals only (the fifteen zone tokens):
+    # in the cleaned data a free throw is a shot row (event="shot", type="free throw"), but the
+    # simulator never asks shot_type to choose one (FTs are emitted directly from fouls —
+    # controller._free_throws), so training on them only pollutes a head that must emit a court
+    # location. This is a **loss-mask restriction only** — the head already emits over the whole
+    # shared ``type`` vocab. Empty = no extra restriction (all other heads).
     target_tokens: tuple = ()
 
 
@@ -112,9 +115,9 @@ class TypeGenSpec:
 # picked, so it does not condition on ``next_player`` — the controller samples the type first,
 # then the rebounder from the team that type implies.
 TYPE_GEN_SPECS: dict[str, TypeGenSpec] = {
-    "shot_type":     TypeGenSpec("shot_type",     "shot",     "type",   ("player",), ("2pt", "3pt")),
+    "shot_type":     TypeGenSpec("shot_type",     "shot",     "type",   ("player",), ZONE_TOKENS),
     "shot_result":   TypeGenSpec("shot_result",   "shot",     "result", ("player", "type")),
-    "assist_type":   TypeGenSpec("assist_type",   "assist",   "type",   ("player",)),
+    "assist_type":   TypeGenSpec("assist_type",   "assist",   "type",   ("player",), ZONE_TOKENS),
     "turnover_type": TypeGenSpec("turnover_type", "turnover", "type",   ("player",)),
     "foul_type":     TypeGenSpec("foul_type",     "foul",     "type",   ("player",)),
     "rebound_type":  TypeGenSpec("rebound_type",  "rebound",  "type",   ()),

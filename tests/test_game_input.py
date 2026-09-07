@@ -37,7 +37,7 @@ def test_whole_roster_union_no_starter_distinction():
     away_after = ["F", "G", "H", "I", "Y"]
     events = [
         _row(0, "start", "start", "start", "start", 2003, 1),
-        _row(10, "shot", "A", "2pt", "made", 2003, 1),
+        _row(10, "shot", "A", "paint", "made", 2003, 1),
         _row(20, "substitution", "X", "substitution", "substitution", 2003, 1,
              secondary="E", home=home_after),
         _row(30, "substitution", "Y", "substitution", "substitution", 2003, 1,
@@ -81,7 +81,7 @@ def test_holdout_inputs_roundtrip(tmp_path):
             rows.append({
                 "game_id": gid, "roster_home": str(HOME), "roster_away": str(AWAY),
                 "time": t, "event": ev, "player": "A" if ev == "shot" else ev,
-                "type": "2pt" if ev == "shot" else ev,
+                "type": "paint" if ev == "shot" else ev,
                 "result": "made" if ev == "shot" else ev,
                 "secondary_player": "none", "season": season, "playoff": playoff,
             })

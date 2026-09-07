@@ -75,6 +75,11 @@ TWO_TOKENS = frozenset(ZONE_TOKENS) - THREE_TOKENS
 # the box score (pinned by tests/test_game_state_features.py).
 ZONE_POINTS = {t: (3 if t in THREE_TOKENS else 2) for t in ZONE_TOKENS}
 
+# A free throw is a shot row in the cleaned data (event="shot", type="free throw"), so it shares
+# the type field with the zone tokens without being one. Named here because every consumer of a
+# made shot has to tell the two apart.
+FREE_THROW = "free throw"
+
 # Where a shot goes when its coordinates are unusable. Coverage is >=98.4% in every one of the
 # 21 seasons (most under 0.1% null), so this path is rare by construction.
 FALLBACK_TWO = "mid_base_l"
@@ -96,6 +101,23 @@ def points_for(token: str) -> int:
         return ZONE_POINTS[token]
     except KeyError:
         raise KeyError(f"unknown shot zone {token!r}; expected one of {ZONE_TOKENS}") from None
+
+
+def points_for_shot(etype: str) -> int:
+    """Points a made ``shot`` row is worth, from its ``type``: a free throw is 1, else the zone.
+
+    In the cleaned data a free throw is a shot row (``event="shot"``, ``type="free throw"``), so
+    every consumer of a made shot has to handle both. This is the **one** function
+    ``simulation/box_score.py`` and ``models/game_state_features.py`` both call, so the trained
+    score feature and the box score are bit-identical by construction rather than by convention
+    (``tests/test_game_state_features.py`` pins the two together).
+
+    Raises on anything else, deliberately. The ``else: # 2pt`` catch-all this replaces is exactly
+    how an unrecognized token scores two points forever without anyone noticing.
+    """
+    if etype == FREE_THROW:
+        return 1
+    return points_for(etype)
 
 
 def marker_is_three(type_text) -> bool:

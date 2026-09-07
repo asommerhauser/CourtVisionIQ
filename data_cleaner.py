@@ -3,6 +3,8 @@ import re
 
 import pandas as pd
 
+import zones
+
 
 class DataCleaner:
     """
@@ -288,22 +290,37 @@ class DataCleaner:
             self.last_time = time_val
         time_safe = time_val if time_val is not None else self.last_time
 
-        shot_type = (
-            "3pt" if (pd.notna(row["type"]) and str(row["type"]).lower().startswith("3pt"))
-            else ("2pt" if pd.notna(row["type"]) else "null")
-        )
+        # ---- SHOT ZONE ----
+        # One of the fifteen spatial tokens (zones.py), replacing the old 2pt/3pt binary. The raw
+        # ``type`` text stays the authority on point value; geometry only picks the zone within
+        # the 2pt or 3pt family. Computed ONLY for shot rows — the old binary ran on every raw
+        # row and produced a bogus type for turnovers, fouls and substitutions alike. Assists and
+        # blocks are emitted from the shot row they belong to, so they share this one value.
+        shot_zone = None
+        if row["event_type"] == "shot":
+            shot_zone = zones.zone_for(
+                row.get("converted_x"), row.get("converted_y"),
+                three=zones.marker_is_three(row.get("type")),
+                shot_distance=row.get("shot_distance"),
+            )
 
         # ---- ASSIST ----
         if pd.notna(row["assist"]) and str(row["assist"]).strip():
             assist_player = str(row["assist"]).strip()
             assist_home = self.home_indicator(clean_home, assist_player)
+            # Assists ride on the shot row they set up (measured: every assist-bearing row in
+            # 2002-03 is event_type="shot"), so shot_zone is set. The fallback covers the case
+            # only in principle, and uses zones.py's own no-coordinates default rather than
+            # inventing a token.
+            assist_zone = shot_zone if shot_zone is not None else zones.zone_for(
+                three=zones.marker_is_three(row.get("type")))
             events.append({
                 "roster_home": clean_home,
                 "roster_away": clean_away,
                 "time": time_safe,
                 "event": "assist",
                 "player": assist_player,
-                "type": shot_type,
+                "type": assist_zone,
                 "result": "score",
                 "secondary_player": "none",
                 "home/away": assist_home,
@@ -321,7 +338,7 @@ class DataCleaner:
                 "time": time_safe,
                 "event": "shot",
                 "player": row["player"] if pd.notna(row["player"]) else "null",
-                "type": shot_type,
+                "type": shot_zone,
                 "result": "blocked" if has_block else (row["result"] if pd.notna(row["result"]) else "null"),
                 "secondary_player": "none",
                 "home/away": home,
@@ -339,7 +356,7 @@ class DataCleaner:
                     "time": time_safe,
                     "event": "block",
                     "player": blocker,
-                    "type": shot_type,
+                    "type": shot_zone,
                     "result": "block",
                     "secondary_player": blocked_shooter,
                     "home/away": block_home,
@@ -500,8 +517,8 @@ class DataCleaner:
         # is also kept and consumed at the game boundary.
         df = df.drop(columns=[
             "game_id", "away_score", "home_score", "remaining_time",
-            "play_length", "play_id", "outof", "possession", "shot_distance",
-            "original_x", "original_y", "converted_x", "converted_y", "description",
+            "play_length", "play_id", "outof", "possession",
+            "original_x", "original_y", "description",
         ], errors="ignore")
 
         for _, row in df.iterrows():

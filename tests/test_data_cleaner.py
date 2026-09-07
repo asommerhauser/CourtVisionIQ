@@ -27,6 +27,7 @@ import pandas as pd
 import pytest
 
 from data_cleaner import DataCleaner
+from zones import ZONE_TOKENS
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +47,7 @@ _DEFAULT_ROW = {
     "steal": None,
     "entered": None,
     "left": None,
-    "type": "2pt",
+    "type": "jump shot",          # raw free text; zones.marker_is_three reads the 3pt prefix
     "result": "made",
     "h1": HOME[0], "h2": HOME[1], "h3": HOME[2], "h4": HOME[3], "h5": HOME[4],
     "a1": AWAY[0], "a2": AWAY[1], "a3": AWAY[2], "a4": AWAY[3], "a5": AWAY[4],
@@ -54,10 +55,12 @@ _DEFAULT_ROW = {
     # columns that get dropped:
     "game_id": 1, "away_score": 0, "home_score": 0, "remaining_time": None,
     "play_length": None, "play_id": None, "team": None, "outof": None,
-    "possession": None, "shot_distance": None,
+    "possession": None,
     "original_x": None, "original_y": None,
-    "converted_x": None, "converted_y": None,
     "description": None,
+    # KEPT from 2.0 on — the shot zone is derived from these (zones.py). (25, 10) is 4.75 ft
+    # straight out from the near hoop: inside the lane, outside the rim -> "paint".
+    "shot_distance": 5, "converted_x": 25.0, "converted_y": 10.0,
 }
 
 
@@ -312,6 +315,63 @@ def test_time_conversion_invalid():
 
 
 # ---------------------------------------------------------------------------
+# Shot zones — the fifteen spatial tokens replacing the 2pt/3pt binary
+# ---------------------------------------------------------------------------
+
+def test_shot_rows_carry_a_zone_token(tmp_path):
+    """The zone comes from the coordinates, not the raw type text."""
+    cleaned = _parse(tmp_path, [{"event_type": "shot", "player": "Alice",
+                                 "converted_x": 25.0, "converted_y": 7.0,
+                                 "shot_distance": 2, "result": "made"}])
+    shot = cleaned[cleaned["event"] == "shot"].iloc[0]
+    assert shot["type"] == "rim"          # 1.75 ft from the hoop
+
+
+def test_the_raw_marker_decides_the_family_not_the_coordinates(tmp_path):
+    """A 3pt-marked attempt gets a three zone; the same spot unmarked gets a two zone."""
+    spot = {"converted_x": 25.0, "converted_y": 30.0, "shot_distance": 25}
+    three = _parse(tmp_path, [{"event_type": "shot", "player": "Alice",
+                               "type": "3pt jump shot", "result": "missed", **spot}])
+    two = _parse(tmp_path, [{"event_type": "shot", "player": "Alice",
+                             "type": "jump shot", "result": "missed", **spot}])
+    assert three[three["event"] == "shot"].iloc[0]["type"] == "top3"
+    assert two[two["event"] == "shot"].iloc[0]["type"] == "mid_top"
+
+
+def test_a_shot_with_no_coordinates_falls_back_rather_than_failing(tmp_path):
+    cleaned = _parse(tmp_path, [{"event_type": "shot", "player": "Alice", "result": "made",
+                                 "converted_x": None, "converted_y": None,
+                                 "shot_distance": None}])
+    shot = cleaned[cleaned["event"] == "shot"].iloc[0]
+    assert shot["type"] == "mid_base_l"   # zones.FALLBACK_TWO
+
+
+def test_assist_and_block_share_the_shot_row_zone(tmp_path):
+    """All three rows describe the same attempt, so all three carry the same token."""
+    cleaned = _parse(tmp_path, [{"event_type": "shot", "player": "Alice", "assist": "Bob",
+                                 "converted_x": 25.0, "converted_y": 7.0,
+                                 "shot_distance": 2, "result": "made"}])
+    assert cleaned[cleaned["event"] == "shot"].iloc[0]["type"] == "rim"
+    assert cleaned[cleaned["event"] == "assist"].iloc[0]["type"] == "rim"
+
+    blocked = _parse(tmp_path, [{"event_type": "shot", "player": "Alice", "block": "Frank",
+                                 "converted_x": 25.0, "converted_y": 7.0,
+                                 "shot_distance": 2, "result": "missed"}])
+    assert blocked[blocked["event"] == "block"].iloc[0]["type"] == "rim"
+
+
+def test_non_shot_rows_never_get_a_zone(tmp_path):
+    """The old binary ran on every raw row and typed turnovers and fouls as '2pt'."""
+    cleaned = _parse(tmp_path, [
+        {"event_type": "turnover", "player": "Alice", "type": "bad pass", "result": None},
+        {"event_type": "foul", "player": "Bob", "type": "shooting", "result": None},
+    ])
+    for _, row in cleaned.iterrows():
+        if row["event"] in ("turnover", "foul"):
+            assert row["type"] not in ZONE_TOKENS, f"{row['event']} typed as {row['type']}"
+
+
+# ---------------------------------------------------------------------------
 # Block events
 # ---------------------------------------------------------------------------
 
@@ -323,7 +383,7 @@ def test_block_creates_shot_and_block_events(tmp_path):
 
     assert shot["result"] == "blocked"
     assert block["player"] == "Frank"
-    assert block["type"] == "2pt"              # shot sub-type (not the victim's name)
+    assert block["type"] == "paint"            # the shot's ZONE (not the victim's name)
     assert block["secondary_player"] == "Alice"  # blocked shooter goes here
     assert block["result"] == "block"
 

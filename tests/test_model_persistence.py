@@ -205,16 +205,16 @@ def _conditional_csv(path: Path) -> None:
     home, away = ["A", "B", "C", "D", "E"], ["F", "G", "H", "I", "J"]
     # (event, type, result) templates cycled through each game.
     plays = [
-        ("shot", "2pt", "made"),
+        ("shot", "paint", "made"),
         ("rebound", "defensive", "cop"),
-        ("shot", "3pt", "missed"),
-        ("assist", "2pt", "score"),
+        ("shot", "top3", "missed"),
+        ("assist", "paint", "score"),
         ("turnover", "steal", "cop"),
         ("foul", "shooting", "free throw"),
         ("shot", "free throw", "made"),
         ("turnover", "violation", "cop"),
         ("foul", "personal", "nothing"),
-        ("assist", "3pt", "score"),
+        ("assist", "top3", "score"),
     ]
     rows = []
     for gid, n in [(1, 10), (2, 9), (3, 9)]:
@@ -288,7 +288,7 @@ def _substitution_csv(path: Path) -> None:
         })
         rows.append({
             "game_id": gid, "roster_home": _roster(home), "roster_away": _roster(away),
-            "time": 10, "event": "shot", "player": "A", "type": "2pt", "result": "made",
+            "time": 10, "event": "shot", "player": "A", "type": "paint", "result": "made",
             "secondary_player": "none", "season": "2003", "playoff": 1, **_SEASON,
         })
         for j, (out, inc) in enumerate(subs):

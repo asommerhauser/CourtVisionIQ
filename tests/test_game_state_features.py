@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from models import game_state_features as gs
 
@@ -42,9 +43,9 @@ def _row(event, player, time, *, type="none", result="none",
 def test_running_score_is_inclusive_and_team_resolved_by_roster():
     rows = [
         _row("start", "start", 0.0),
-        _row("shot", "H1", 10.0, type="2pt", result="made"),    # home +2
-        _row("shot", "A1", 20.0, type="3pt", result="made"),    # away +3
-        _row("shot", "H2", 30.0, type="2pt", result="missed"),  # no points
+        _row("shot", "H1", 10.0, type="paint", result="made"),    # home +2
+        _row("shot", "A1", 20.0, type="top3", result="made"),    # away +3
+        _row("shot", "H2", 30.0, type="paint", result="missed"),  # no points
         _row("shot", "A2", 40.0, type="free throw", result="made"),  # away +1
     ]
     out = gs.derive_game_state(rows)
@@ -56,7 +57,7 @@ def test_running_score_is_inclusive_and_team_resolved_by_roster():
 
 def test_missed_and_nonscoring_events_do_not_move_score():
     rows = [
-        _row("shot", "H1", 5.0, type="2pt", result="missed"),
+        _row("shot", "H1", 5.0, type="paint", result="missed"),
         _row("rebound", "H2", 6.0, type="offensive"),
         _row("turnover", "H3", 7.0, result="cop"),
         _row("assist", "H4", 8.0),
@@ -94,7 +95,7 @@ def test_team_fouls_count_by_side_and_reset_each_period():
         _row("foul", "H2", 300.0, type="offensive"),  # excluded (offensive)
         _row("foul", "H3", 400.0, type="technical"),  # excluded (technical)
         _row("foul", "H4", 500.0, type="loose ball"), # home 2
-        _row("shot", "H1", 800.0, type="2pt", result="made"),  # Q2 — fouls reset
+        _row("shot", "H1", 800.0, type="paint", result="made"),  # Q2 — fouls reset
         _row("foul", "A2", 850.0, type="personal"),   # away 1 (new period)
     ]
     out = gs.derive_game_state(rows)
@@ -134,11 +135,11 @@ def test_normalize_uses_fixed_constants_and_clips():
 
 def test_merge_aligns_positionally_across_games():
     g1 = [
-        _row("shot", "H1", 10.0, type="3pt", result="made"),   # +3 home
-        _row("shot", "A1", 20.0, type="2pt", result="made"),   # +2 away
+        _row("shot", "H1", 10.0, type="top3", result="made"),   # +3 home
+        _row("shot", "A1", 20.0, type="paint", result="made"),   # +2 away
     ]
     g2 = [
-        _row("shot", "H1", 10.0, type="2pt", result="made"),   # +2 home (fresh game)
+        _row("shot", "H1", 10.0, type="paint", result="made"),   # +2 home (fresh game)
     ]
     df = pd.DataFrame(
         [{**r, "game_id": 1} for r in g1] + [{**r, "game_id": 2} for r in g2]
@@ -157,9 +158,9 @@ def test_merge_preserves_non_contiguous_game_order():
     # Interleaved game ids with a non-default index — merge must align by position.
     df = pd.DataFrame(
         [
-            _row("shot", "H1", 10.0, type="2pt", result="made"),  # g1: +2
-            _row("shot", "H1", 10.0, type="3pt", result="made"),  # g2: +3
-            _row("shot", "A1", 20.0, type="2pt", result="made"),  # g1: -2 (diff back to 0)
+            _row("shot", "H1", 10.0, type="paint", result="made"),  # g1: +2
+            _row("shot", "H1", 10.0, type="top3", result="made"),  # g2: +3
+            _row("shot", "A1", 20.0, type="paint", result="made"),  # g1: -2 (diff back to 0)
         ]
     )
     df["game_id"] = [1, 2, 1]
@@ -178,11 +179,11 @@ def test_final_score_matches_box_score_scan():
 
     rows = [
         _row("start", "start", 0.0),
-        _row("shot", "H1", 10.0, type="2pt", result="made"),
-        _row("shot", "H2", 20.0, type="3pt", result="made"),
-        _row("shot", "A1", 30.0, type="2pt", result="made"),
+        _row("shot", "H1", 10.0, type="paint", result="made"),
+        _row("shot", "H2", 20.0, type="top3", result="made"),
+        _row("shot", "A1", 30.0, type="paint", result="made"),
         _row("shot", "A2", 40.0, type="free throw", result="made"),
-        _row("shot", "H3", 50.0, type="2pt", result="missed"),
+        _row("shot", "H3", 50.0, type="paint", result="missed"),
     ]
     out = gs.derive_game_state(rows)
     box = generate_box_score(rows)
@@ -190,3 +191,32 @@ def test_final_score_matches_box_score_scan():
     # The inclusive running diff/total at the last row equals the final box score.
     assert out["score_diff"][-1] == box.home_score - box.away_score
     assert out["score_total"][-1] == box.home_score + box.away_score
+
+
+def test_every_zone_scores_identically_in_both_scans():
+    """The two point lookups must not drift — they are now one function, so prove it.
+
+    A per-zone divergence would desync the trained score feature from the box score silently:
+    the model would learn a running score that never happened.
+    """
+    from simulation.box_score import generate_box_score
+    from zones import ZONE_POINTS, ZONE_TOKENS
+
+    for token in ZONE_TOKENS:
+        rows = [_row("start", "start", 0.0),
+                _row("shot", "H1", 10.0, type=token, result="made")]
+        out = gs.derive_game_state(rows)
+        box = generate_box_score(rows)
+        assert out["score_total"][-1] == box.home_score == ZONE_POINTS[token], token
+
+
+def test_an_unknown_shot_type_raises_in_both_scans():
+    """The old `else: # 2pt` catch-all scored any unrecognized token as two, forever."""
+    from simulation.box_score import generate_box_score
+
+    rows = [_row("start", "start", 0.0),
+            _row("shot", "H1", 10.0, type="mid_nowhere", result="made")]
+    with pytest.raises(KeyError):
+        gs.derive_game_state(rows)
+    with pytest.raises(KeyError):
+        generate_box_score(rows)

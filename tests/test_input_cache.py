@@ -18,6 +18,7 @@ from encoder.encoder import Encoder
 from models.event_time_model import EventTimeModel
 from models.substitution_model import START_TOKEN, SUB_EVENT
 from simulation.game_simulator import HOME, GameSimulator
+from zones import ZONE_TOKENS
 
 SEQ = 16                     # CAP = 32, so a few hundred rows exercise many compactions
 HOME_FULL = [f"H{i}" for i in range(12)]
@@ -50,7 +51,7 @@ def _encoder(tmp_path) -> Encoder:
         enc.encode_secondary_player(p)
     for e in ("start", "end", SUB_EVENT, "shot", "foul", "rebound", "turnover", "assist"):
         enc.encode_event(e)
-    for t in ("start", "end", SUB_EVENT, "2pt", "3pt", "free throw", "technical",
+    for t in ("start", "end", SUB_EVENT, *ZONE_TOKENS, "free throw", "technical",
               "offensive", "personal", "offensive-rebound", "nan"):
         enc.encode_type(t)
     for r in ("start", "end", SUB_EVENT, "made", "missed", "cop", "steal", "nan"):
@@ -117,7 +118,7 @@ def _script(sim: GameSimulator, n_rows: int = 260):
 
         kind = i % 12
         if kind in (0, 1, 6):                                   # made / missed field goals
-            shot_type = "3pt" if kind == 6 else "2pt"
+            shot_type = "top3" if kind == 6 else "paint"
             _play(sim, event="shot", player=sim.home_roster[i % 5], type=shot_type,
                   result="made" if kind != 1 else "missed", secondary="none", time=t)
             label = f"shot {shot_type}"
@@ -221,7 +222,7 @@ def test_direct_history_append_self_heals(tmp_path):
     for _ in zip(range(12), _script(sim)):
         pass
 
-    smuggled = sim._make_row(event="shot", player=sim.home_roster[0], type="3pt",
+    smuggled = sim._make_row(event="shot", player=sim.home_roster[0], type="top3",
                              result="made", secondary_player="none", time=500.0)
     sim.history.append(smuggled)                      # bypasses the cache on purpose
     assert sim._cache.n != len(sim.history)
@@ -243,7 +244,7 @@ def test_base_slab_is_built_once_per_event(tmp_path):
         sim.build_model_inputs()
     assert sim._cache._builds == before + 1
 
-    _play(sim, event="shot", player=sim.home_roster[0], type="2pt", result="missed",
+    _play(sim, event="shot", player=sim.home_roster[0], type="paint", result="missed",
           secondary="none", time=900.0)
     sim.build_model_inputs()
     assert sim._cache._builds == before + 2
@@ -257,7 +258,7 @@ def test_returned_arrays_are_copies_not_buffer_views(tmp_path):
 
     held = {k: v.copy() for k, v in sim.build_model_inputs().items()}
     live = sim.build_model_inputs()
-    _play(sim, event="shot", player=sim.home_roster[0], type="2pt", result="made",
+    _play(sim, event="shot", player=sim.home_roster[0], type="paint", result="made",
           secondary="none", time=777.0)
     for k, v in held.items():
         np.testing.assert_array_equal(live[k], v, err_msg=f"{k} was mutated by a later append")

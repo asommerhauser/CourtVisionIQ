@@ -73,6 +73,14 @@ RESULT_TEMPERATURE = 1.0   # shot_result (made / missed / blocked)
 # v1.0 full1 (100-game holdout, this bias already applied): eFG% still -2.17% / FGM -1.04 vs real
 # -- the +0.27 correction closed most but not all of the original make-rate gap. Bumped further.
 SHOT_RESULT_BIAS: dict[str, float] = {"made": 0.40, "blocked": -0.15}
+# Per-ZONE override of the above, keyed zone then outcome, e.g. {"rim": {"made": 0.1}}. Merged on
+# top of SHOT_RESULT_BIAS for the zone actually sampled, so an absent zone just gets the global.
+# Default {} = global only, which is what v1.0 had to live with: the fitted per-type ideal was
+# already known to differ (+0.22 on 2pt, +0.35 on 3pt) with no hook to express it, so rim make
+# rate and long-mid frequency competed for one number. Fifteen zones give that hook. Fit from
+# zero after the 2.0 train -- every value carried over from full1/full2 is against a vocabulary
+# that no longer exists.
+SHOT_RESULT_BIAS_BY_ZONE: dict[str, dict[str, float]] = {}
 # Per-event-token logit offset applied to the next-event pick (GameController._sample_event), the
 # event-head sibling of SHOT_RESULT_BIAS. Default {} = raw model. Fit to v1.0 trial1: fouls ran
 # 36.1/game vs 40.5 real (-11%, the biggest driver of the FTA -4.7/team deficit) and turnovers
@@ -107,7 +115,11 @@ TYPE_BIAS: dict[str, dict[str, float]] = {
     "foul_type": {"shooting": 0.15, "personal": -0.45, "offensive": -0.30,
                   "loose ball": 1.2, "technical": 1.5},
     "turnover_type": {"steal": -0.12},
-    "assist_type": {"3pt": 0.10},
+    # assist_type was {"3pt": 0.10}. That key can no longer match anything -- assist rows now
+    # carry a zone token, not the 2pt/3pt binary -- so it is removed rather than left as config
+    # that silently does nothing. Re-key per zone when the dials are fitted from zero after the
+    # 2.0 train (the mechanism needs no change: TYPE_BIAS is already head -> token).
+    "assist_type": {},
     "rebound_type": {"offensive": 0.13},
 }
 # Home-court edge. The rollout is otherwise home/away symmetric (HOME just inbounds first), so the
@@ -238,7 +250,8 @@ _TUNING_KEYS = (
     "PLAYER_TEMPERATURE", "EVENT_TEMPERATURE", "TYPE_TEMPERATURE", "RESULT_TEMPERATURE",
     "SUB_TEMPERATURE", "SUB_INCOMING_TEMPERATURE", "SUB_FATIGUE_WEIGHT", "SUB_MAX_GAP_SECONDS",
     "STINT_SAMPLE_SIGMA", "STINT_LENGTH_SCALE", "STINT_MAX_SECONDS", "FOUL_OUT_LIMIT",
-    "SHOT_RESULT_BIAS", "EVENT_BIAS", "TYPE_BIAS", "HOME_COURT_SHOT_BIAS",
+    "SHOT_RESULT_BIAS", "SHOT_RESULT_BIAS_BY_ZONE", "EVENT_BIAS", "TYPE_BIAS",
+    "HOME_COURT_SHOT_BIAS",
 )
 
 
