@@ -31,7 +31,8 @@ from models.game_state_features import NON_TEAM_FOUL_TYPES
 from models.stint_length_model import StintLengthModel
 from models.substitution_model import START_TOKEN
 from simulation.game_simulator import GameSimulator, HOME, AWAY
-from zones import ZONE_TOKENS, is_three, points_for_shot
+from data_cleaner import SHOOTING_2PT, SHOOTING_3PT
+from zones import ZONE_TOKENS, points_for_shot
 
 # --- Game structure (NBA) ---
 PERIOD_LENGTH = 720          # 12:00 regulation quarter (seconds)
@@ -57,7 +58,11 @@ SHOT_TYPES = list(ZONE_TOKENS)           # a live field goal is one of the fifte
 LIVE_SHOT_RESULTS = ["made", "missed", "blocked"]
 FT_RESULTS = ["made", "missed"]
 TURNOVER_TYPES = ["steal", "violation", "error"]
-FOUL_TYPES = ["personal", "shooting", "offensive", "loose ball",
+# A shooting foul carries the fouled attempt's point value: the foul-type head learns the real
+# share of three-shot trips in game context, rather than the controller guessing it by sampling
+# a live shot-type head that was never trained to answer the question.
+SHOOTING_FOUL_TYPES = (SHOOTING_2PT, SHOOTING_3PT)
+FOUL_TYPES = ["personal", SHOOTING_2PT, SHOOTING_3PT, "offensive", "loose ball",
               "technical", "flagrant-1", "flagrant-2", "away from play",
               "personal take", "transition take"]
 # A foul drawn while a missed shot is in the air to be rebounded is a loose-ball / common foul,
@@ -550,8 +555,8 @@ class GameController:
         ftype = self.sim.predict_type("foul_type", "foul", fouler, allowed_types,
                                       delta_seconds=delta, greedy=self.greedy)
 
-        if ftype == "shooting":
-            self._do_shooting_foul(fouler, fouler_team, delta)
+        if ftype in SHOOTING_FOUL_TYPES:
+            self._do_shooting_foul(fouler, fouler_team, ftype, delta)
             return
 
         # Free throws always go to the fouler's OPPONENT, in every branch. Reading possession
@@ -606,20 +611,27 @@ class GameController:
                 return scorer_team
         return self.possession
 
-    def _do_shooting_foul(self, fouler: str, fouler_team: str, delta: float) -> None:
-        """A shooting foul: and-1 if a basket just went in, else 2 FTs (2pt) or 3 FTs (3pt).
+    def _do_shooting_foul(self, fouler: str, fouler_team: str, ftype: str,
+                          delta: float) -> None:
+        """A shooting foul: and-1 if a basket just went in, else the count ``ftype`` carries.
 
-        And-1 — the previous row is a made field goal — keeps the basket (already scored) and
-        awards a single free throw to that shooter. Otherwise the fouled attempt is *not* logged
-        as a field-goal attempt (NBA scoring); we sample the intended shot type only to decide
-        whether it was a 2 (2 FTs) or a 3 (3 FTs), with the fouled offensive player shooting.
+        The free-throw count now comes from the **foul token itself** — ``shooting 3pt`` is three
+        attempts, ``shooting 2pt`` is two. Before 2.0 the controller sampled the live shot-type
+        head here to guess whether the fouled attempt was a 2 or a 3, which asked a head trained
+        on *taken* shots a question about an attempt that was never logged. The cleaner reads the
+        answer off the real trip's ``outof`` instead, so the foul-type head learns the true share
+        of three-shot trips in context: who is fouling, who is shooting, where in the game.
+
+        And-1 — the previous row is a made field goal — still overrides the count structurally:
+        the basket already counted, so it is one attempt whatever the token says. That path is
+        properly reachable now (see :meth:`_foul_offense`).
 
         ``fouler_team`` is resolved by the caller before the type is sampled, so "a shooting foul
-        is defensive by definition" is now true by construction: ``shooting`` is not in the
+        is defensive by definition" is true by construction: neither shooting token is in the
         offensive side's mask, so this is only ever reached for a defender.
         """
-        self._append("foul", fouler, "shooting", "free throw")
-        self._charge_foul(fouler, "shooting")
+        self._append("foul", fouler, ftype, "free throw")
+        self._charge_foul(fouler, ftype)
         self.ball_dead = True          # whistle; _free_throws decides the state after the trip
         shooting_team = self._other(fouler_team)
 
@@ -633,9 +645,7 @@ class GameController:
             n_ft = 1                                   # the basket already counted
         else:
             shooter = self._pick_shooter(shooting_team)
-            stype = self.sim.predict_type("shot_type", "shot", shooter, SHOT_TYPES,
-                                          delta_seconds=0.0, greedy=self.greedy)
-            n_ft = 3 if is_three(stype) else 2         # a 3pt shooting foul is three FTs
+            n_ft = 3 if ftype == SHOOTING_3PT else 2   # straight off the sampled foul token
 
         self._count_team_foul(fouler_team)             # always a defensive team foul
         self._free_throws(shooter, shooting_team, n_ft, live_last=True, retain=False)

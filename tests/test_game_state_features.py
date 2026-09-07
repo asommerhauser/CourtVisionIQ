@@ -91,7 +91,7 @@ def test_period_index_and_time_left_across_quarters_and_ot():
 def test_team_fouls_count_by_side_and_reset_each_period():
     rows = [
         _row("foul", "H1", 100.0, type="personal"),   # home 1
-        _row("foul", "A1", 200.0, type="shooting"),   # away 1
+        _row("foul", "A1", 200.0, type="shooting 2pt"),   # away 1
         _row("foul", "H2", 300.0, type="offensive"),  # excluded (offensive)
         _row("foul", "H3", 400.0, type="technical"),  # excluded (technical)
         _row("foul", "H4", 500.0, type="loose ball"), # home 2

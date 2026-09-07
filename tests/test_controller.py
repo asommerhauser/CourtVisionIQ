@@ -19,6 +19,7 @@ from config import ROSTER_SIZE
 from simulation.controller import (
     GameController, OPEN_PLAY_EVENTS, REGULATION, OT_LENGTH, PERIOD_LENGTH,
 )
+from simulation.controller import SHOOTING_2PT, SHOOTING_3PT, SHOOTING_FOUL_TYPES
 from simulation.game_simulator import HOME, AWAY
 from zones import ZONE_TOKENS
 
@@ -249,12 +250,12 @@ def test_nonsteal_turnover_single_row():
 def test_shooting_foul_on_2pt_yields_two_free_throws():
     ctrl = make_controller(HOME)            # home has the ball; away fouls
     # fouler F, then the fouled shooter A; the intended attempt is a 2pt → 2 FTs.
-    ctrl.sim.script(player=["F", "A"], type=["shooting", "paint"], result=["made", "made"])
+    ctrl.sim.script(player=["F", "A"], type=[SHOOTING_2PT], result=["made", "made"])
     ctrl._do_foul(delta=5.0)
 
     foul = rows(ctrl)[0]
     fts = rows(ctrl)[1:]
-    assert (foul["event"], foul["type"], foul["result"]) == ("foul", "shooting", "free throw")
+    assert (foul["event"], foul["type"], foul["result"]) == ("foul", SHOOTING_2PT, "free throw")
     assert len(fts) == 2 and all(r["type"] == "free throw" for r in fts)
     assert ctrl.score[HOME] == 2
     assert ctrl.possession == AWAY         # made last FT → other team inbounds
@@ -262,7 +263,7 @@ def test_shooting_foul_on_2pt_yields_two_free_throws():
 
 def test_shooting_foul_on_3pt_yields_three_free_throws():
     ctrl = make_controller(HOME)
-    ctrl.sim.script(player=["F", "A"], type=["shooting", "top3"],
+    ctrl.sim.script(player=["F", "A"], type=[SHOOTING_3PT],
                     result=["made", "made", "made"])
     ctrl._do_foul(delta=5.0)
     fts = rows(ctrl)[1:]
@@ -275,7 +276,7 @@ def test_and_one_keeps_basket_and_adds_one_free_throw():
     ctrl.sim.append_event("shot", "A", "paint", "made", time=0)   # A (home) just scored
     ctrl.score[HOME] = 2                     # the basket counted
     # An away player fouls on the made basket → and-1: A shoots a single FT.
-    ctrl.sim.script(player=["G"], type=["shooting"], result=["made"])
+    ctrl.sim.script(player=["G"], type=[SHOOTING_2PT], result=["made"])
     ctrl._do_foul(delta=5.0)
 
     fts = [r for r in rows(ctrl) if r["type"] == "free throw"]
@@ -290,7 +291,7 @@ def test_rebounding_foul_is_masked_to_common_types():
     ctrl.sim.script(player=["F"], type=["personal"])
     ctrl._do_foul(delta=5.0, rebounding=True)   # a foul during a rebound
     type_call = [c for c in ctrl.sim.calls if c[0] == "type"][0]
-    assert "shooting" not in type_call[3]        # never a shooting foul on a rebound
+    assert not any(t in type_call[3] for t in SHOOTING_FOUL_TYPES)   # never on a rebound
     foul = rows(ctrl)[-1]
     assert (foul["event"], foul["type"]) == ("foul", "personal")
 
@@ -351,7 +352,7 @@ def test_offense_side_fouler_is_masked_to_offensive_side_types():
     type_call = [c for c in ctrl.sim.calls if c[0] == "type"][0]
     allowed = type_call[3]
     # An offensive player cannot commit a shooting, personal, take or away-from-play foul.
-    assert "shooting" not in allowed
+    assert not any(t in allowed for t in SHOOTING_FOUL_TYPES)
     assert "personal" not in allowed
     assert "away from play" not in allowed
     assert "personal take" not in allowed and "transition take" not in allowed
@@ -360,12 +361,12 @@ def test_offense_side_fouler_is_masked_to_offensive_side_types():
 
 def test_defense_side_fouler_is_masked_to_everything_but_offensive():
     ctrl = make_controller(HOME)
-    ctrl.sim.script(player=["F", "A"], type=["shooting", "paint"], result=["made", "made"])
+    ctrl.sim.script(player=["F", "A"], type=[SHOOTING_2PT], result=["made", "made"])
     ctrl._do_foul(delta=5.0)
 
     allowed = [c for c in ctrl.sim.calls if c[0] == "type"][0][3]
     assert "offensive" not in allowed       # a defender cannot commit an offensive foul
-    assert "shooting" in allowed
+    assert SHOOTING_2PT in allowed
 
 
 def test_foul_side_is_resolved_before_the_type_is_sampled():
@@ -438,11 +439,11 @@ def test_and_one_survives_the_possession_flip_on_the_made_basket():
     """A made FG flips possession, so the and-1 foul must not read as an offensive-side foul."""
     ctrl = make_controller(AWAY)                 # made FG already flipped possession to AWAY
     ctrl.sim.append_event("shot", "A", "paint", "made", time=0)   # A (home) just scored
-    ctrl.sim.script(player=["G"], type=["shooting"], result=["made"])
+    ctrl.sim.script(player=["G"], type=[SHOOTING_2PT], result=["made"])
     ctrl._do_foul(delta=5.0)
 
     allowed = [c for c in ctrl.sim.calls if c[0] == "type"][0][3]
-    assert "shooting" in allowed                 # G is still the defender on that possession
+    assert SHOOTING_2PT in allowed               # G is still the defender on that possession
 
 
 # ===================================================================== #
@@ -535,12 +536,36 @@ def test_the_per_zone_result_bias_layers_on_top_of_the_global():
     assert top["made"] == pytest.approx(0.40 + ctrl.home_court_bias)
 
 
-def test_a_three_point_zone_shooting_foul_is_three_free_throws():
+def test_the_foul_token_decides_the_free_throw_count():
+    """Not a sampled shot type: the cleaner read the count off the real trip's `outof`."""
+    for token, want in ((SHOOTING_2PT, 2), (SHOOTING_3PT, 3)):
+        ctrl = make_controller(HOME)
+        ctrl.sim.script(player=["F", "A"], type=[token], result=["made"] * want)
+        ctrl._do_foul(delta=5.0)
+        assert len([r for r in rows(ctrl) if r["type"] == "free throw"]) == want, token
+
+
+def test_a_shooting_foul_never_samples_the_shot_type_head():
+    """The phantom sample: a head trained on TAKEN shots asked about an attempt never logged."""
     ctrl = make_controller(HOME)
-    ctrl.sim.script(player=["F", "A"], type=["shooting", "corner3_r"],
-                    result=["made", "made", "made"])
+    ctrl.sim.script(player=["F", "A"], type=[SHOOTING_3PT], result=["made", "made", "made"])
     ctrl._do_foul(delta=5.0)
-    assert len([r for r in rows(ctrl) if r["type"] == "free throw"]) == 3
+    assert not [c for c in ctrl.sim.calls if c[0] == "type" and c[1] == "shot_type"]
+    # The only type call was the foul-type pick itself.
+    assert [c[1] for c in ctrl.sim.calls if c[0] == "type"] == ["foul_type"]
+
+
+def test_an_and_one_is_one_free_throw_whatever_the_token_says():
+    """The made basket already counted, so the structural check overrides the token's count."""
+    ctrl = make_controller(AWAY)                 # made FG already flipped possession
+    ctrl.sim.append_event("shot", "A", "top3", "made", time=0)
+    ctrl.score[HOME] = 3
+    ctrl.sim.script(player=["G"], type=[SHOOTING_3PT], result=["made"])
+    ctrl._do_foul(delta=5.0)
+
+    fts = [r for r in rows(ctrl) if r["type"] == "free throw"]
+    assert len(fts) == 1 and fts[0]["player"] == "A"
+    assert ctrl.score[HOME] == 4                 # 3 (basket) + 1 (and-1 FT)
 
 
 # ===================================================================== #

@@ -112,7 +112,12 @@ EVENT_BIAS: dict[str, float] = {"foul": 0.11, "turnover": -0.08}
 # up a touch to protect OREB's share while DEADBALL_REBOUND_PROB (below) pulls more total volume,
 # mostly from DREB, on the next pass. "loose ball" left untouched to isolate its effect this round.
 TYPE_BIAS: dict[str, dict[str, float]] = {
-    "foul_type": {"shooting": 0.15, "personal": -0.45, "offensive": -0.30,
+    # "shooting" split into two tokens in 2.0; the fitted +0.15 is carried onto both so the
+    # shooting-foul family keeps the same aggregate nudge relative to the other foul types.
+    # The 2pt/3pt split between them is the head's to learn, so neither is biased toward the
+    # other. Re-fit from zero after the train like everything else here.
+    "foul_type": {"shooting 2pt": 0.15, "shooting 3pt": 0.15,
+                  "personal": -0.45, "offensive": -0.30,
                   "loose ball": 1.2, "technical": 1.5},
     "turnover_type": {"steal": -0.12},
     # assist_type was {"3pt": 0.10}. That key can no longer match anything -- assist rows now
