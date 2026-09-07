@@ -288,7 +288,7 @@ def test_and_one_keeps_basket_and_adds_one_free_throw():
 
 def test_rebounding_foul_is_masked_to_common_types():
     ctrl = make_controller(HOME)
-    ctrl.sim.script(player=["F"], type=["personal"])
+    ctrl.sim.script(player=["F", "A"], type=["personal"])   # fouler F, then his victim
     ctrl._do_foul(delta=5.0, rebounding=True)   # a foul during a rebound
     type_call = [c for c in ctrl.sim.calls if c[0] == "type"][0]
     assert not any(t in type_call[3] for t in SHOOTING_FOUL_TYPES)   # never on a rebound
@@ -298,7 +298,7 @@ def test_rebounding_foul_is_masked_to_common_types():
 
 def test_offensive_foul_is_a_turnover_no_fts():
     ctrl = make_controller(HOME)
-    ctrl.sim.script(player=["A"], type=["offensive"])  # fouler A is on offense
+    ctrl.sim.script(player=["A", "F"], type=["offensive"])  # fouler A on offense, victim F
     ctrl._do_foul(delta=5.0)
     (foul,) = rows(ctrl)
     assert (foul["type"], foul["result"]) == ("offensive", "cop")
@@ -307,7 +307,7 @@ def test_offensive_foul_is_a_turnover_no_fts():
 
 def test_common_foul_nothing_when_not_in_bonus():
     ctrl = make_controller(HOME)
-    ctrl.sim.script(player=["F"], type=["personal"])   # away defender, team not in penalty
+    ctrl.sim.script(player=["F", "A"], type=["personal"])   # away defender, not in penalty
     ctrl._do_foul(delta=5.0)
     (foul,) = rows(ctrl)
     assert (foul["type"], foul["result"]) == ("personal", "nothing")
@@ -346,7 +346,7 @@ def test_flagrant2_ejects_fouler_and_keeps_possession():
 
 def test_offense_side_fouler_is_masked_to_offensive_side_types():
     ctrl = make_controller(HOME)
-    ctrl.sim.script(player=["A"], type=["offensive"])   # A is on the offense (home has the ball)
+    ctrl.sim.script(player=["A", "F"], type=["offensive"])  # A is on the offense; victim F
     ctrl._do_foul(delta=5.0)
 
     type_call = [c for c in ctrl.sim.calls if c[0] == "type"][0]
@@ -372,11 +372,12 @@ def test_defense_side_fouler_is_masked_to_everything_but_offensive():
 def test_foul_side_is_resolved_before_the_type_is_sampled():
     """The fouler must be picked first — the mask depends on which side he turns out to be on."""
     ctrl = make_controller(HOME)
-    ctrl.sim.script(player=["A"], type=["offensive"])
+    ctrl.sim.script(player=["A", "F"], type=["offensive"])
     ctrl._do_foul(delta=5.0)
 
     kinds = [c[0] for c in ctrl.sim.calls if c[0] in ("player", "type")]
-    assert kinds[0] == "player" and kinds[1] == "type"
+    # fouler, then type, then the victim -- the mask depends on the fouler's side.
+    assert kinds[:2] == ["player", "type"]
 
 
 def test_offense_side_technical_sends_free_throws_to_the_defense():
@@ -404,7 +405,7 @@ def test_offense_side_flagrant_sends_free_throws_and_the_ball_to_the_defense():
 
 def test_offense_side_loose_ball_foul_counts_and_keeps_possession():
     ctrl = make_controller(HOME)
-    ctrl.sim.script(player=["A"], type=["loose ball"])
+    ctrl.sim.script(player=["A", "F"], type=["loose ball"])
     ctrl._do_foul(delta=5.0)
 
     (foul,) = rows(ctrl)
@@ -500,6 +501,85 @@ def test_fouls_before_the_window_do_not_count_toward_it():
 
 
 # ===================================================================== #
+# The fouled player
+# ===================================================================== #
+
+def test_a_foul_row_names_who_was_fouled_and_he_shoots():
+    """One player, drawn once: the foul row's victim IS the free-throw shooter."""
+    ctrl = make_controller(HOME)
+    ctrl.team_fouls[AWAY] = 4                    # put the defense in the penalty -> 2 FTs
+    ctrl.sim.script(player=["F", "B"], type=["personal"], result=["made", "made"])
+    ctrl._do_foul(delta=5.0)
+
+    foul = rows(ctrl)[0]
+    fts = [r for r in rows(ctrl) if r["type"] == "free throw"]
+    assert foul["secondary_player"] == "B"       # the fouled player rides in the row
+    assert len(fts) == 2 and all(r["player"] == "B" for r in fts)
+    # Exactly one player draw for the victim, not one for the row and another for the shooter.
+    assert len([c for c in ctrl.sim.calls if c[0] == "player" and c[1] == "shot"]) == 1
+
+
+def test_the_fouled_player_comes_from_the_fouled_team():
+    ctrl = make_controller(HOME)
+    ctrl.sim.script(player=["F", "C"], type=["personal"])
+    ctrl._do_foul(delta=5.0)
+    victim_call = [c for c in ctrl.sim.calls if c[0] == "player" and c[1] == "shot"][0]
+    assert victim_call[2] == HOME_FIVE           # F (away) fouled someone on home
+
+
+def test_a_common_foul_with_no_free_throws_still_names_the_victim():
+    """Drawing a foul is a skill whether or not it produced a trip to the line."""
+    ctrl = make_controller(HOME)
+    ctrl.sim.script(player=["F", "D"], type=["personal"])
+    ctrl._do_foul(delta=5.0)
+    (foul,) = rows(ctrl)
+    assert (foul["result"], foul["secondary_player"]) == ("nothing", "D")
+
+
+def test_a_technical_names_nobody():
+    ctrl = make_controller(HOME)
+    ctrl.sim.script(player=["F", "A"], type=["technical"], result=["made"])
+    ctrl._do_foul(delta=5.0)
+    foul = rows(ctrl)[0]
+    assert foul["secondary_player"] == "none"    # no victim; the raw data agrees
+    fts = [r for r in rows(ctrl) if r["type"] == "free throw"]
+    assert len(fts) == 1 and fts[0]["player"] == "A"   # an independent draw, by design
+
+
+def test_a_shooting_foul_names_the_fouled_shooter():
+    ctrl = make_controller(HOME)
+    ctrl.sim.script(player=["F", "C"], type=[SHOOTING_3PT], result=["made"] * 3)
+    ctrl._do_foul(delta=5.0)
+
+    foul = rows(ctrl)[0]
+    fts = [r for r in rows(ctrl) if r["type"] == "free throw"]
+    assert foul["secondary_player"] == "C"
+    assert len(fts) == 3 and all(r["player"] == "C" for r in fts)
+
+
+def test_an_and_one_names_the_scorer_as_the_fouled_player():
+    ctrl = make_controller(AWAY)                 # made FG already flipped possession
+    ctrl.sim.append_event("shot", "A", "paint", "made", time=0)
+    ctrl.score[HOME] = 2
+    ctrl.sim.script(player=["G"], type=[SHOOTING_2PT], result=["made"])
+    ctrl._do_foul(delta=5.0)
+
+    foul = [r for r in rows(ctrl) if r["event"] == "foul"][0]
+    assert foul["secondary_player"] == "A"       # the scorer was the one fouled
+    # No extra draw: the and-1 victim is known structurally.
+    assert not [c for c in ctrl.sim.calls if c[0] == "player" and c[1] == "shot"]
+
+
+def test_an_offensive_foul_names_the_defender_who_drew_it():
+    ctrl = make_controller(HOME)
+    ctrl.sim.script(player=["A", "G"], type=["offensive"])
+    ctrl._do_foul(delta=5.0)
+    (foul,) = rows(ctrl)
+    assert (foul["type"], foul["secondary_player"]) == ("offensive", "G")
+    assert ctrl.possession == AWAY
+
+
+# ===================================================================== #
 # Shot zones
 # ===================================================================== #
 
@@ -575,7 +655,7 @@ def test_an_and_one_is_one_free_throw_whatever_the_token_says():
 def test_a_foul_kills_the_ball():
     ctrl = make_controller(HOME)
     ctrl.ball_dead = False
-    ctrl.sim.script(player=["F"], type=["personal"])   # defensive common foul, no FTs
+    ctrl.sim.script(player=["F", "A"], type=["personal"])   # defensive common foul, no FTs
     ctrl._do_foul(delta=5.0)
     assert ctrl.ball_dead is True
 
@@ -784,7 +864,7 @@ def test_do_foul_charges_the_fouler():
     ctrl = make_controller(AWAY)                     # F (away) is on offense → clean "nothing" foul
     # "loose ball" is the common foul an offensive player can legally commit (a "personal" is
     # masked out on that side now), and it still resolves to "nothing" outside the bonus.
-    ctrl.sim.script(player=["F"], type=["loose ball"])
+    ctrl.sim.script(player=["F", "A"], type=["loose ball"])
     ctrl._do_foul(delta=5.0)
     assert ctrl.player_fouls["F"] == 1
 
