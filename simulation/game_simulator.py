@@ -625,8 +625,9 @@ class GameSimulator:
         """Sample an event's ``type`` from ``allowed`` via a conditional type head.
 
         ``key`` is the head (``shot_type`` / ``assist_type`` / ``turnover_type`` /
-        ``foul_type``); ``allowed`` is the legal token set (e.g. ``{"2pt", "3pt"}`` for a live
-        field goal). The head outputs ``type_output`` and conditions on the decided actor.
+        ``foul_type``); ``allowed`` is the legal token set (e.g. the fifteen ``zones.ZONE_TOKENS``
+        for a live field goal). The head outputs ``type_output`` and conditions on the decided
+        actor.
 
         ``bias`` adds a per-token logit offset on top of the head's ``TYPE_BIAS`` calibration
         entry (config.py, keyed by ``key``) — e.g. ``{"turnover_type": {"steal": -0.2}}`` pulls

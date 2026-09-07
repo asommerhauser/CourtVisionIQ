@@ -20,6 +20,7 @@ from simulation.controller import (
     GameController, OPEN_PLAY_EVENTS, REGULATION, OT_LENGTH, PERIOD_LENGTH,
 )
 from simulation.game_simulator import HOME, AWAY
+from zones import ZONE_TOKENS
 
 HOME_FIVE = ["A", "B", "C", "D", "E"]
 AWAY_FIVE = ["F", "G", "H", "I", "J"]
@@ -133,14 +134,14 @@ def rows(ctrl):
 
 def test_assist_forces_made_shot_by_different_teammate():
     ctrl = make_controller(HOME)
-    ctrl.sim.script(player=["A", "C"], type=["2pt"])  # assister A, shooter C
+    ctrl.sim.script(player=["A", "C"], type=["paint"])  # assister A, shooter C
     ctrl._do_assist(delta=5.0)
 
     assist, shot = rows(ctrl)
     assert (assist["event"], assist["player"], assist["type"], assist["result"]) == \
-        ("assist", "A", "2pt", "score")
+        ("assist", "A", "paint", "score")
     assert (shot["event"], shot["player"], shot["type"], shot["result"]) == \
-        ("shot", "C", "2pt", "made")
+        ("shot", "C", "paint", "made")
     # The shooter pool excluded the assister.
     shooter_call = [c for c in ctrl.sim.calls if c[0] == "player" and c[1] == "shot"][0]
     assert "A" not in shooter_call[2]
@@ -154,7 +155,7 @@ def test_assist_forces_made_shot_by_different_teammate():
 
 def test_blocked_shot_emits_paired_block_and_awaits_rebound():
     ctrl = make_controller(HOME)
-    ctrl.sim.script(player=["A", "F"], type=["2pt"], result=["blocked"])  # shooter A, blocker F
+    ctrl.sim.script(player=["A", "F"], type=["paint"], result=["blocked"])  # shooter A, blocker F
     ctrl._do_shot(delta=5.0)
 
     shot, block = rows(ctrl)
@@ -170,7 +171,7 @@ def test_blocked_shot_emits_paired_block_and_awaits_rebound():
 
 def test_missed_shot_awaits_rebound_no_score():
     ctrl = make_controller(HOME)
-    ctrl.sim.script(player=["A"], type=["2pt"], result=["missed"])
+    ctrl.sim.script(player=["A"], type=["paint"], result=["missed"])
     ctrl._do_shot(delta=5.0)
     assert ctrl.pending_rebound is True
     assert ctrl.possession == HOME     # no change until the rebound resolves
@@ -248,7 +249,7 @@ def test_nonsteal_turnover_single_row():
 def test_shooting_foul_on_2pt_yields_two_free_throws():
     ctrl = make_controller(HOME)            # home has the ball; away fouls
     # fouler F, then the fouled shooter A; the intended attempt is a 2pt → 2 FTs.
-    ctrl.sim.script(player=["F", "A"], type=["shooting", "2pt"], result=["made", "made"])
+    ctrl.sim.script(player=["F", "A"], type=["shooting", "paint"], result=["made", "made"])
     ctrl._do_foul(delta=5.0)
 
     foul = rows(ctrl)[0]
@@ -261,7 +262,7 @@ def test_shooting_foul_on_2pt_yields_two_free_throws():
 
 def test_shooting_foul_on_3pt_yields_three_free_throws():
     ctrl = make_controller(HOME)
-    ctrl.sim.script(player=["F", "A"], type=["shooting", "3pt"],
+    ctrl.sim.script(player=["F", "A"], type=["shooting", "top3"],
                     result=["made", "made", "made"])
     ctrl._do_foul(delta=5.0)
     fts = rows(ctrl)[1:]
@@ -271,7 +272,7 @@ def test_shooting_foul_on_3pt_yields_three_free_throws():
 
 def test_and_one_keeps_basket_and_adds_one_free_throw():
     ctrl = make_controller(AWAY)            # made FG already flipped possession to AWAY
-    ctrl.sim.append_event("shot", "A", "2pt", "made", time=0)   # A (home) just scored
+    ctrl.sim.append_event("shot", "A", "paint", "made", time=0)   # A (home) just scored
     ctrl.score[HOME] = 2                     # the basket counted
     # An away player fouls on the made basket → and-1: A shoots a single FT.
     ctrl.sim.script(player=["G"], type=["shooting"], result=["made"])
@@ -281,7 +282,7 @@ def test_and_one_keeps_basket_and_adds_one_free_throw():
     assert len(fts) == 1 and fts[0]["player"] == "A"
     assert ctrl.score[HOME] == 3            # 2 (basket) + 1 (and-1 FT)
     # The fouled attempt was a made FG, so it is the only field-goal attempt logged (no phantom).
-    assert sum(1 for r in rows(ctrl) if r["type"] in ("2pt", "3pt")) == 1
+    assert sum(1 for r in rows(ctrl) if r["type"] in ZONE_TOKENS) == 1
 
 
 def test_rebounding_foul_is_masked_to_common_types():
@@ -359,7 +360,7 @@ def test_offense_side_fouler_is_masked_to_offensive_side_types():
 
 def test_defense_side_fouler_is_masked_to_everything_but_offensive():
     ctrl = make_controller(HOME)
-    ctrl.sim.script(player=["F", "A"], type=["shooting", "2pt"], result=["made", "made"])
+    ctrl.sim.script(player=["F", "A"], type=["shooting", "paint"], result=["made", "made"])
     ctrl._do_foul(delta=5.0)
 
     allowed = [c for c in ctrl.sim.calls if c[0] == "type"][0][3]
@@ -436,7 +437,7 @@ def test_foul_by_a_subbed_off_player_still_resolves_to_his_own_team():
 def test_and_one_survives_the_possession_flip_on_the_made_basket():
     """A made FG flips possession, so the and-1 foul must not read as an offensive-side foul."""
     ctrl = make_controller(AWAY)                 # made FG already flipped possession to AWAY
-    ctrl.sim.append_event("shot", "A", "2pt", "made", time=0)   # A (home) just scored
+    ctrl.sim.append_event("shot", "A", "paint", "made", time=0)   # A (home) just scored
     ctrl.sim.script(player=["G"], type=["shooting"], result=["made"])
     ctrl._do_foul(delta=5.0)
 
@@ -498,6 +499,51 @@ def test_fouls_before_the_window_do_not_count_toward_it():
 
 
 # ===================================================================== #
+# Shot zones
+# ===================================================================== #
+
+def test_the_shot_type_head_is_masked_to_the_fifteen_zones():
+    ctrl = make_controller(HOME)
+    ctrl.sim.script(player=["A"], type=["rim"], result=["made"])
+    ctrl._do_shot(delta=5.0)
+    allowed = [c for c in ctrl.sim.calls if c[0] == "type" and c[1] == "shot_type"][0][3]
+    assert allowed == list(ZONE_TOKENS)
+    assert "2pt" not in allowed and "3pt" not in allowed
+
+
+def test_each_zone_scores_its_own_point_value():
+    for token, want in (("rim", 2), ("paint", 2), ("mid_top", 2),
+                        ("corner3_l", 3), ("top3", 3), ("heave", 3)):
+        ctrl = make_controller(HOME)
+        ctrl.sim.script(player=["A"], type=[token], result=["made"])
+        ctrl._do_shot(delta=5.0)
+        assert ctrl.score[HOME] == want, token
+
+
+def test_the_per_zone_result_bias_layers_on_top_of_the_global():
+    """v1.0 had one make-rate dial for every shot; fifteen zones give it a hook."""
+    ctrl = make_controller(HOME)
+    config.SHOT_RESULT_BIAS = {"made": 0.40, "blocked": -0.15}
+    config.SHOT_RESULT_BIAS_BY_ZONE = {"rim": {"made": 0.9}}
+
+    rim = ctrl._shot_result_bias(HOME, "rim")
+    assert rim["made"] == pytest.approx(0.9 + ctrl.home_court_bias)
+    assert rim["blocked"] == pytest.approx(-0.15)          # untouched keys fall through
+
+    # A zone with no entry gets the global value.
+    top = ctrl._shot_result_bias(HOME, "top3")
+    assert top["made"] == pytest.approx(0.40 + ctrl.home_court_bias)
+
+
+def test_a_three_point_zone_shooting_foul_is_three_free_throws():
+    ctrl = make_controller(HOME)
+    ctrl.sim.script(player=["F", "A"], type=["shooting", "corner3_r"],
+                    result=["made", "made", "made"])
+    ctrl._do_foul(delta=5.0)
+    assert len([r for r in rows(ctrl) if r["type"] == "free throw"]) == 3
+
+
+# ===================================================================== #
 # Dead-ball state — what actually stops play (and so allows substitutions)
 # ===================================================================== #
 
@@ -544,14 +590,14 @@ def test_a_made_basket_only_stops_the_clock_late_in_the_period():
     # Q1 with 1:30 left — the clock keeps running, so this is not a substitution opportunity.
     early = make_controller(HOME)
     early.clock = PERIOD_LENGTH - 90
-    early.sim.script(player=["A"], type=["2pt"], result=["made"])
+    early.sim.script(player=["A"], type=["paint"], result=["made"])
     early._do_shot(delta=5.0)
     assert early.ball_dead is False
 
     # Same 1:30 left, but in Q4 — the window is two minutes there, so the ball is dead.
     late = make_controller(HOME)
     late.clock = REGULATION - 90
-    late.sim.script(player=["A"], type=["2pt"], result=["made"])
+    late.sim.script(player=["A"], type=["paint"], result=["made"])
     late._do_shot(delta=5.0)
     assert late.ball_dead is True
 
@@ -559,7 +605,7 @@ def test_a_made_basket_only_stops_the_clock_late_in_the_period():
 def test_a_missed_shot_leaves_the_ball_live():
     ctrl = make_controller(HOME)
     ctrl.ball_dead = True
-    ctrl.sim.script(player=["A"], type=["2pt"], result=["missed"])
+    ctrl.sim.script(player=["A"], type=["paint"], result=["missed"])
     ctrl._do_shot(delta=5.0)
     assert ctrl.ball_dead is False and ctrl.pending_rebound is True
 
@@ -651,7 +697,7 @@ def test_missing_heads_raises():
 def test_player_temperature_passed_to_actor_picks():
     ctrl = GameController(FakeSim(), seed=0, player_temp=1.7)
     ctrl.possession = HOME
-    ctrl.sim.script(player=["A"], type=["2pt"], result=["missed"])
+    ctrl.sim.script(player=["A"], type=["paint"], result=["missed"])
     ctrl._do_shot(delta=5.0)
     shooter_call = [c for c in ctrl.sim.calls if c[0] == "player" and c[1] == "shot"][0]
     assert shooter_call[3] == 1.7           # temperature threaded through to the player head
@@ -749,7 +795,7 @@ def test_conditional_time_head_drives_clock_when_loaded():
     sim.heads["event_time_cond"] = object()
     ctrl = GameController(sim, seed=0)
     assert ctrl.use_condtime
-    sim.script(player=["A"], type=["2pt"], result=["missed"], delta=[18.0])
+    sim.script(player=["A"], type=["paint"], result=["missed"], delta=[18.0])
     ctrl._do_shot(delta=5.0)                 # marginal 5.0 conditions the actor pick; clock uses 18.0
     assert ctrl.player_seconds["A"] == pytest.approx(18.0 * config.DELTA_TIME_SCALE)
     assert ("delta", "shot", "A") in sim.calls
@@ -759,7 +805,7 @@ def test_marginal_delta_drives_clock_without_conditional_head():
     # Back-compat: no conditional time head → fall back to the event head's marginal Δt.
     ctrl = make_controller(HOME)
     assert not ctrl.use_condtime
-    ctrl.sim.script(player=["A"], type=["2pt"], result=["missed"])
+    ctrl.sim.script(player=["A"], type=["paint"], result=["missed"])
     ctrl._do_shot(delta=7.0)
     assert ctrl.player_seconds["A"] == pytest.approx(7.0 * config.DELTA_TIME_SCALE)
 

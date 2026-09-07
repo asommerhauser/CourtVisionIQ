@@ -30,10 +30,10 @@ def _by_name(box):
 def test_scoring_and_shooting_splits():
     events = [
         _row(0, "start", "start", "start", "start"),
-        _row(10, "shot", "A", "2pt", "made"),      # +2 home
-        _row(20, "shot", "A", "2pt", "missed"),    # FGA only
-        _row(30, "shot", "B", "3pt", "made"),      # +3 home
-        _row(40, "shot", "F", "3pt", "missed"),    # away FGA/3PA only
+        _row(10, "shot", "A", "paint", "made"),      # +2 home
+        _row(20, "shot", "A", "paint", "missed"),    # FGA only
+        _row(30, "shot", "B", "top3", "made"),      # +3 home
+        _row(40, "shot", "F", "top3", "missed"),    # away FGA/3PA only
         _row(50, "shot", "F", "free throw", "made"),    # +1 away
         _row(60, "shot", "F", "free throw", "missed"),  # FTA only
         _row(70, "end", "end", "end", "end"),
@@ -80,8 +80,8 @@ def test_blocked_shot():
     # The shooter's row carries result="blocked" (a missed FGA); the blocker gets a block.
     events = [
         _row(0, "start", "start", "start", "start"),
-        _row(10, "shot", "A", "2pt", "blocked"),
-        _row(10, "block", "F", "2pt", "block", secondary="A"),
+        _row(10, "shot", "A", "paint", "blocked"),
+        _row(10, "block", "F", "paint", "block", secondary="A"),
         _row(20, "end", "end", "end", "end"),
     ]
     p = _by_name(generate_box_score(events))
@@ -94,7 +94,7 @@ def test_rebounds_assists_fouls():
         _row(0, "start", "start", "start", "start"),
         _row(10, "rebound", "A", "offensive", "null"),
         _row(20, "rebound", "B", "defensive", "cop"),
-        _row(30, "assist", "C", "2pt", "score"),
+        _row(30, "assist", "C", "paint", "score"),
         _row(40, "foul", "D", "shooting", "free throw"),
         _row(50, "foul", "E", "technical", "free throw"),  # technical: NOT a personal foul
         _row(60, "end", "end", "end", "end"),
@@ -111,8 +111,8 @@ def test_minutes_accrual():
     # 120s of clock with the same five on court => 2.0 minutes each.
     events = [
         _row(0, "start", "start", "start", "start"),
-        _row(60, "shot", "A", "2pt", "made"),
-        _row(120, "shot", "F", "2pt", "made"),
+        _row(60, "shot", "A", "paint", "made"),
+        _row(120, "shot", "F", "paint", "made"),
         _row(120, "end", "end", "end", "end"),
     ]
     p = _by_name(generate_box_score(events))

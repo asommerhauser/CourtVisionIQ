@@ -46,7 +46,7 @@ def test_cleaned_frame_columns_match_real_data():
 def test_home_away_flag_derivation():
     history = [
         _row(0, "start", "start", "start", "start"),     # boundary → 0
-        _row(5, "shot", "A", "2pt", "made"),             # home → 1
+        _row(5, "shot", "A", "paint", "made"),             # home → 1
         _row(10, "rebound", "F", "defensive", "cop"),    # away → 2
         _row(15, "substitution", "A", "substitution", "substitution", secondary="K",
              home=["K", "B", "C", "D", "E"]),            # keyed off incoming K (home) → 1
@@ -66,8 +66,8 @@ def test_playoff_flag_mapping():
 def test_roundtrip_through_box_score():
     history = [
         _row(0, "start", "start", "start", "start"),
-        _row(10, "shot", "A", "2pt", "made"),
-        _row(20, "shot", "F", "3pt", "made"),
+        _row(10, "shot", "A", "paint", "made"),
+        _row(20, "shot", "F", "top3", "made"),
         _row(30, "end", "end", "end", "end"),
     ]
     # The exported frame must decode back to the same scores.
@@ -81,8 +81,8 @@ def test_roundtrip_through_box_score():
 def test_plus_minus_credited_to_on_court_lineups():
     history = [
         _row(0, "start", "start", "start", "start"),
-        _row(10, "shot", "A", "2pt", "made"),     # home +2: A..E +2, F..J -2
-        _row(20, "shot", "F", "3pt", "made"),      # away +3: F..J +3, A..E -3
+        _row(10, "shot", "A", "paint", "made"),     # home +2: A..E +2, F..J -2
+        _row(20, "shot", "F", "top3", "made"),      # away +3: F..J +3, A..E -3
         _row(30, "end", "end", "end", "end"),
     ]
     box = generate_box_score(history, home_team="HOM", away_team="AWY")
@@ -133,7 +133,7 @@ def test_score_dict_picks_winner():
 def test_box_row_has_full_nba_columns():
     box = generate_box_score([
         _row(0, "start", "start", "start", "start"),
-        _row(10, "shot", "A", "2pt", "made"),
+        _row(10, "shot", "A", "paint", "made"),
         _row(20, "end", "end", "end", "end"),
     ])
     frame = box.to_frame("home")

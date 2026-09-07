@@ -48,7 +48,7 @@ def _make_csv(path: Path) -> None:
         # start frame
         rows.append(_row(gid, 0, "start", "start", "start", "start", "none"))
         for i in range(1, n):
-            rows.append(_row(gid, i * 10, "shot", "A", "2pt", "missed", "none"))
+            rows.append(_row(gid, i * 10, "shot", "A", "paint", "missed", "none"))
         rows.append(_row(gid, n * 10, "end", "end", "end", "end", "none"))
     # ensure a substitution token exists in the vocab
     rows.append(_row(1, 5, "substitution", "K", "substitution", "substitution", "B"))
@@ -107,7 +107,7 @@ def test_build_inputs_shape_parity(tmp_path):
     """Inputs match the model's expected keys/shapes/dtypes (batch = 1)."""
     sim = _load_sim(tmp_path)
     sim.start_game(HOME_FIVE, AWAY_FIVE, season="2003")
-    sim.append_event("shot", "A", "2pt", "missed")
+    sim.append_event("shot", "A", "paint", "missed")
 
     inputs = sim.build_model_inputs()
     assert set(inputs.keys()) == set(EventTimeModel.INPUT_KEYS)
@@ -133,7 +133,7 @@ def test_predict_next_returns_raw_distribution(tmp_path):
     sim = _load_sim(tmp_path)
     sim.start_game(HOME_FIVE, AWAY_FIVE, season="2003")
     for _ in range(5):
-        sim.append_event("shot", "A", "2pt", "missed", time=10)
+        sim.append_event("shot", "A", "paint", "missed", time=10)
 
     pred = sim.predict_next()
     n_events = sim.encoder.event_vocab.next_token
@@ -155,7 +155,7 @@ def test_the_simulator_does_not_track_possession(tmp_path):
     """
     sim = _load_sim(tmp_path)
     sim.start_game(HOME_FIVE, AWAY_FIVE, season="2003")
-    sim.append_event("shot", "A", "2pt", "missed")
+    sim.append_event("shot", "A", "paint", "missed")
     sim.append_event("rebound", "F", "defensive", "cop")
 
     assert not hasattr(sim, "possession")
@@ -227,7 +227,7 @@ def test_conditioned_inputs_carry_incoming_player(tmp_path):
     """The stint-head conditioning attaches next_secondary_player (the decided incoming player)."""
     sim = _load_sim(tmp_path)
     sim.start_game(HOME_FIVE, AWAY_FIVE, season="2003")
-    sim.append_event("shot", "A", "2pt", "missed")
+    sim.append_event("shot", "A", "paint", "missed")
 
     inputs = sim._conditioned_inputs(next_event="substitution", delta_seconds=0.0,
                                      next_player="B", next_secondary_player="K")

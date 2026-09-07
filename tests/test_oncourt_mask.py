@@ -42,9 +42,9 @@ def _game_rows(gid):
         {**full, "game_id": gid, "time": 0, "event": "start", "player": "start",
          "type": "start", "result": "start", "secondary_player": "none", "home/away": 0},
         {**full, "game_id": gid, "time": 12, "event": "shot", "player": "A",
-         "type": "2pt", "result": "made", "secondary_player": "none", "home/away": 1},
+         "type": "paint", "result": "made", "secondary_player": "none", "home/away": 1},
         {**full, "game_id": gid, "time": 30, "event": "shot", "player": "F",
-         "type": "2pt", "result": "missed", "secondary_player": "none", "home/away": 2},
+         "type": "paint", "result": "missed", "secondary_player": "none", "home/away": 2},
         # real in-game sub: A (outgoing, on the five) -> K (incoming, off the bench);
         # sub rows carry the POST-sub lineup, matching the cleaned-data convention.
         {"game_id": gid, "roster_home": _roster(["K", "B", "C", "D", "E"]),
@@ -53,7 +53,7 @@ def _game_rows(gid):
          "secondary_player": "K", "home/away": 1, **_SEASON},
         {"game_id": gid, "roster_home": _roster(["K", "B", "C", "D", "E"]),
          "roster_away": _roster(AWAY), "season": "2003", "playoff": 1, "time": 55,
-         "event": "shot", "player": "K", "type": "2pt", "result": "made",
+         "event": "shot", "player": "K", "type": "paint", "result": "made",
          "secondary_player": "none", "home/away": 1, **_SEASON},
         {"game_id": gid, "roster_home": _roster(["K", "B", "C", "D", "E"]),
          "roster_away": _roster(AWAY), "season": "2003", "playoff": 1, "time": 60,

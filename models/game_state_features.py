@@ -32,6 +32,8 @@ import ast
 
 import numpy as np
 
+from zones import points_for_shot
+
 # --- Period geometry (mirrors simulation/controller.py constants) ---
 PERIOD_LENGTH = 720          # 12:00 regulation quarter (seconds)
 OT_LENGTH = 300              # 5:00 overtime period
@@ -134,7 +136,9 @@ class GameStateScan:
             etype = _norm(row.get("type"))
             result = _norm(row.get("result"))
             if event == "shot" and result == "made":
-                pts = 3 if etype == "3pt" else 1 if etype == "free throw" else 2
+                # Through zones.points_for_shot, which simulation/box_score.py also calls, so
+                # the trained score feature and the box score cannot drift apart.
+                pts = points_for_shot(etype)
                 if team == "home":
                     self.home_pts += pts
                 elif team == "away":
