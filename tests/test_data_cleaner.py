@@ -54,7 +54,10 @@ _DEFAULT_ROW = {
     "data_set": "2002-03 regular season",
     # columns that get dropped:
     "game_id": 1, "away_score": 0, "home_score": 0, "remaining_time": None,
-    "play_length": None, "play_id": None, "team": None, "outof": None,
+    "play_length": None, "play_id": None, "team": None,
+    # KEPT from 2.0 on — a shooting foul's free-throw count is read off the following trip's
+    # `outof` (and, for an and-1, the preceding basket's `points`). See _label_shooting_fouls.
+    "outof": None, "num": None, "points": None,
     "possession": None,
     "original_x": None, "original_y": None,
     "description": None,
@@ -369,6 +372,79 @@ def test_non_shot_rows_never_get_a_zone(tmp_path):
     for _, row in cleaned.iterrows():
         if row["event"] in ("turnover", "foul"):
             assert row["type"] not in ZONE_TOKENS, f"{row['event']} typed as {row['type']}"
+
+
+# ---------------------------------------------------------------------------
+# Learned free-throw counts — the shooting foul splits into 2pt / 3pt
+# ---------------------------------------------------------------------------
+
+def _ft(num, outof, player="Alice"):
+    return {"event_type": "free throw", "player": player, "type": "free throw",
+            "num": num, "outof": outof, "result": "made"}
+
+
+def test_shooting_foul_is_labelled_from_the_following_trips_outof(tmp_path):
+    two = _parse(tmp_path, [
+        {"event_type": "foul", "player": "Frank", "type": "shooting", "result": None},
+        _ft(1, 2), _ft(2, 2),
+    ])
+    three = _parse(tmp_path, [
+        {"event_type": "foul", "player": "Frank", "type": "shooting", "result": None},
+        _ft(1, 3), _ft(2, 3), _ft(3, 3),
+    ])
+    assert two[two["event"] == "foul"].iloc[0]["type"] == "shooting 2pt"
+    assert three[three["event"] == "foul"].iloc[0]["type"] == "shooting 3pt"
+
+
+def test_the_trip_is_found_across_an_intervening_substitution(tmp_path):
+    cleaned = _parse(tmp_path, [
+        {"event_type": "foul", "player": "Frank", "type": "shooting", "result": None},
+        {"event_type": "substitution", "player": None, "entered": "Kim", "left": "Bob",
+         "type": None, "result": None},
+        _ft(1, 3), _ft(2, 3), _ft(3, 3),
+    ])
+    assert cleaned[cleaned["event"] == "foul"].iloc[0]["type"] == "shooting 3pt"
+
+
+def test_an_and_one_is_labelled_from_the_basket_it_followed(tmp_path):
+    """outof == 1 is an and-1 (24% of shooting fouls); the attempt's value is the made basket's."""
+    two = _parse(tmp_path, [
+        {"event_type": "shot", "player": "Alice", "type": "jump shot", "result": "made",
+         "points": 2, "converted_x": 25.0, "converted_y": 10.0, "shot_distance": 5},
+        {"event_type": "foul", "player": "Frank", "type": "shooting", "result": None},
+        _ft(1, 1),
+    ])
+    three = _parse(tmp_path, [
+        {"event_type": "shot", "player": "Alice", "type": "3pt jump shot", "result": "made",
+         "points": 3, "converted_x": 25.0, "converted_y": 30.0, "shot_distance": 25},
+        {"event_type": "foul", "player": "Frank", "type": "shooting", "result": None},
+        _ft(1, 1),
+    ])
+    assert two[two["event"] == "foul"].iloc[0]["type"] == "shooting 2pt"
+    assert three[three["event"] == "foul"].iloc[0]["type"] == "shooting 3pt"
+
+
+def test_a_shooting_foul_with_no_trip_falls_back_to_two(tmp_path):
+    cleaned = _parse(tmp_path, [
+        {"event_type": "foul", "player": "Frank", "type": "shooting", "result": None},
+    ])
+    assert cleaned[cleaned["event"] == "foul"].iloc[0]["type"] == "shooting 2pt"
+
+
+def test_the_bare_shooting_token_is_gone_from_the_cleaned_data(tmp_path):
+    cleaned = _parse(tmp_path, [
+        {"event_type": "foul", "player": "Frank", "type": "shooting", "result": None},
+        _ft(1, 2), _ft(2, 2),
+    ])
+    assert "shooting" not in set(cleaned["type"])
+
+
+def test_other_foul_types_are_untouched(tmp_path):
+    cleaned = _parse(tmp_path, [
+        {"event_type": "foul", "player": "Frank", "type": "personal", "result": None},
+        {"event_type": "foul", "player": "Gus", "type": "offensive charge", "result": None},
+    ])
+    assert list(cleaned[cleaned["event"] == "foul"]["type"]) == ["personal", "offensive"]
 
 
 # ---------------------------------------------------------------------------

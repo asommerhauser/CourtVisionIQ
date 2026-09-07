@@ -95,7 +95,7 @@ def test_rebounds_assists_fouls():
         _row(10, "rebound", "A", "offensive", "null"),
         _row(20, "rebound", "B", "defensive", "cop"),
         _row(30, "assist", "C", "paint", "score"),
-        _row(40, "foul", "D", "shooting", "free throw"),
+        _row(40, "foul", "D", "shooting 2pt", "free throw"),
         _row(50, "foul", "E", "technical", "free throw"),  # technical: NOT a personal foul
         _row(60, "end", "end", "end", "end"),
     ]

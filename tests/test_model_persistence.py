@@ -210,7 +210,7 @@ def _conditional_csv(path: Path) -> None:
         ("shot", "top3", "missed"),
         ("assist", "paint", "score"),
         ("turnover", "steal", "cop"),
-        ("foul", "shooting", "free throw"),
+        ("foul", "shooting 2pt", "free throw"),
         ("shot", "free throw", "made"),
         ("turnover", "violation", "cop"),
         ("foul", "personal", "nothing"),

@@ -5,6 +5,23 @@ import pandas as pd
 
 import zones
 
+# The raw foul label, and the two tokens it splits into. A shooting foul's free-throw count is a
+# fact about the fouled *attempt* (was it a 2 or a 3), which the cleaner can read off the
+# following trip's ``outof``. Before 2.0 the controller guessed it by sampling the live shot-type
+# head — a head never trained to answer that question.
+SHOOTING_FOUL = "shooting"
+SHOOTING_2PT = "shooting 2pt"
+SHOOTING_3PT = "shooting 3pt"
+# Private column carrying the precomputed label from parse_file into process_row. Never emitted.
+_SHOOTING_LABEL_COL = "_shooting_foul_label"
+# How far to look for the trip a shooting foul produced. Measured on 2022-23: the free throw is
+# the very next row 82% of the time, but a substitution or two can sit in between (observed max
+# gap 7). Rows that find nothing inside the window fall back on the preceding shot.
+_FT_LOOKAHEAD = 8
+_SHOT_LOOKBEHIND = 6
+# Raw rows that end a possession sequence — never scan a lookahead/lookbehind across one.
+_BOUNDARY_EVENTS = {"start of period", "end of period"}
+
 
 class DataCleaner:
     """
@@ -174,13 +191,66 @@ class DataCleaner:
             return "technical"
         return data_str
 
+    @staticmethod
+    def _label_shooting_fouls(df):
+        """Per-row ``shooting 2pt`` / ``shooting 3pt`` label for every shooting-foul row.
+
+        Needs a whole-file pass because the answer lives *after* the foul: the trip it produced
+        carries ``outof``. Two or three is read straight off it. ``outof == 1`` is an and-1 —
+        24% of shooting fouls in 2022-23, and 98.6% of them sit directly behind a made field
+        goal — so the label comes from what that basket was worth, which is the same question
+        ("was the fouled attempt a 2 or a 3") answered from the other side.
+
+        Falls back to ``shooting 2pt``: it is 96% of the non-and-1 population, and the rows that
+        reach the fallback are the 0.17% with no trip inside the window at all.
+        """
+        events = df["event_type"].tolist() if "event_type" in df else []
+        outof = df["outof"].tolist() if "outof" in df else [None] * len(events)
+        results = df["result"].tolist() if "result" in df else [None] * len(events)
+        points = df["points"].tolist() if "points" in df else [None] * len(events)
+        types = df["type"].tolist() if "type" in df else [None] * len(events)
+
+        def _int(value):
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return None
+
+        labels = [None] * len(events)
+        for i, event in enumerate(events):
+            if event != "foul" or str(types[i] or "").strip() != SHOOTING_FOUL:
+                continue
+
+            trip = None
+            for j in range(i + 1, min(i + _FT_LOOKAHEAD, len(events))):
+                if events[j] in _BOUNDARY_EVENTS:
+                    break
+                if events[j] == "free throw":
+                    trip = _int(outof[j])
+                    break
+            if trip in (2, 3):
+                labels[i] = SHOOTING_3PT if trip == 3 else SHOOTING_2PT
+                continue
+
+            # And-1 (trip == 1), or no trip found: read the fouled attempt off the basket itself.
+            labels[i] = SHOOTING_2PT
+            for k in range(i - 1, max(i - _SHOT_LOOKBEHIND, -1), -1):
+                if events[k] in _BOUNDARY_EVENTS:
+                    break
+                if events[k] == "shot":
+                    if results[k] == "made" and _int(points[k]) == 3:
+                        labels[i] = SHOOTING_3PT
+                    break
+        return labels
+
     def determine_foul_result(self, foul_type):
         """Map foul type to a result token."""
         mapping = {
             "personal": "nothing",
             "null": "nothing",
             "away from play": "nothing",
-            "shooting": "free throw",
+            SHOOTING_2PT: "free throw",
+            SHOOTING_3PT: "free throw",
             "technical": "free throw",
             "personal take": "free throw op",
             "flagrant-1": "free throw op",
@@ -460,6 +530,11 @@ class DataCleaner:
         # ---- FOUL ----
         if row["event_type"] == "foul":
             foul_type = self.determine_foul_type(row.get("type"))
+            if foul_type == SHOOTING_FOUL:
+                # Split into "shooting 2pt" / "shooting 3pt" so the foul-type head learns the
+                # real share of three-shot trips in game context. The label is precomputed over
+                # the whole file (needs the *following* trip's `outof`); see _label_shooting_fouls.
+                foul_type = row.get(_SHOOTING_LABEL_COL) or SHOOTING_2PT
             foul_result = self.determine_foul_result(foul_type)
             events.append({
                 "roster_home": clean_home,
@@ -517,9 +592,13 @@ class DataCleaner:
         # is also kept and consumed at the game boundary.
         df = df.drop(columns=[
             "game_id", "away_score", "home_score", "remaining_time",
-            "play_length", "play_id", "outof", "possession",
+            "play_length", "play_id", "possession",
             "original_x", "original_y", "description",
         ], errors="ignore")
+
+        # Shooting fouls need the FOLLOWING trip's `outof` to know whether the fouled attempt
+        # was a 2 or a 3, so the label is computed over the whole file before the row loop.
+        df[_SHOOTING_LABEL_COL] = self._label_shooting_fouls(df)
 
         for _, row in df.iterrows():
             new_row = self.process_row(row)
