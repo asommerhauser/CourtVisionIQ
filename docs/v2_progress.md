@@ -37,7 +37,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged
 | — | **Gate A — Phase 1 short eval** | 1 | | skipped | - |
 | 3 | `feature/shot-zone-geometry` | 2 | §3 | [x] | 8434786 |
 | 4 | `feature/shot-zones` | 2 | §3 | [x] | 27a3327 |
-| 5 | `feature/ft-count-tokens` | 2 | §4 | [ ] | |
+| 5 | `feature/ft-count-tokens` | 2 | §4 | [x] | 4b0dd09 |
 | 6 | `feature/fouled-player` | 2 | §5 | [ ] | |
 | 7 | `feature/timeouts-team-rebounds` | 2 | §6 | [ ] | |
 | 8 | `feature/schema-cleanup` | 2 | §7 | [ ] | |
@@ -278,9 +278,29 @@ pytest tests/test_data_cleaner.py tests/test_controller.py -q
 Note `tests/test_controller.py:258` is `test_shooting_foul_on_3pt_yields_three_free_throws` — it
 tests exactly the mechanism being replaced and will need rewriting, not just retokenizing.
 
-**Result:**
+**Result:** 146 passed / 1 failed on the targeted set, then 52 passed on dials+shell
+after the fix. The failure was mine: `test_get_dials_returns_deep_copies` read
+`TYPE_BIAS["foul_type"]["shooting"]` from the live module dict, which the split
+renamed. It now names the token off the live dict so the same rename cannot break it
+again (commit 5748060).
 
-**Notes:**
+**Notes:** The spec gives no rule for and-1s, and they are too big to ignore: `outof == 1`
+is **24%** of shooting fouls in 2022-23 (4584 of ~18k sampled), and maps to neither token.
+98.6% of them sit directly behind a made field goal, so they are labelled from what that
+basket was worth - the same question ('was the fouled attempt a 2 or a 3') answered from
+the other side. See correction I.
+
+Validated by running the real `_label_shooting_fouls` over the whole 2022-23 file: **27708
+of 27708** shooting fouls labelled, 96.4% two-shot / 3.6% three-shot - a realistic
+three-shot-trip share, and proof the fallback path is rare rather than quietly absorbing
+everything. The lookahead spans an intervening substitution (observed gap up to 7 rows) and
+never crosses a period boundary; 0.17% find no trip and fall back to 2pt.
+
+`simulation/controller.py` now imports the two tokens from `data_cleaner` - a new
+sim-reads-cleaner dependency direction. Justified by the controller's own docstring ('the
+cleaned-data semantics are the source of truth') and better than duplicating literals that
+could drift, but if the layering matters later, a small shared constants module is the
+alternative.
 
 ### 6. `feature/fouled-player` — §5
 
@@ -641,6 +661,14 @@ rule when that column is missing. Impact: the basket changes for 0.193% of 2022-
 rows and the zone for 161 of them. This is why the measured `heave` volumes run slightly above
 the spec's 0.3-0.4%.
 
+**I. And-1s need a labelling rule section 4 does not give.** The spec says to label each shooting
+foul from the following trip's `outof`, but `outof == 1` - an and-1 - matches neither
+`shooting 2pt` nor `shooting 3pt`, and it is 24% of all shooting fouls, far too many to drop or
+default. `data_cleaner._label_shooting_fouls` labels them from the point value of the made
+basket they follow (98.6% have one within five rows). The controller still overrides the count
+structurally - an and-1 is one attempt whatever the token says - so the token is only ever read
+as 'the fouled attempt was a 2 or a 3', which is exactly what it means in every other case.
+
 ---
 
 ## Log
@@ -653,3 +681,4 @@ Append one line per merge. Newest last.
 | 2026-09-06 | `feature/dead-ball-state` | 5ea3afd | 76 green; found pre-existing test-isolation bug (correction G) |
 | 2026-09-06 | `feature/shot-zone-geometry` | 8434786 | 42 green; zone validation table passes all gates (correction H) |
 | 2026-09-07 | `feature/shot-zones` | 27a3327 | full suite green; 13 test files re-tokenized, not 6 |
+| 2026-09-07 | `feature/ft-count-tokens` | 4b0dd09 | phantom shot_type sample deleted; and-1 rule added (correction I) |
