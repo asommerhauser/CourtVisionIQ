@@ -24,9 +24,9 @@ do is Gate B — the re-clean and vocab rebuild.** Nothing has been re-cleaned y
 cleaned data exists on disk: `data/season*.csv` is still the v1.0 output and `encoder/vocabs/`
 is still the v1.0 frozen vocab.
 
-One caveat before trusting anything: **workstream 8 was merged without its test run** (see its
-Result). If Gate B fails in a way that does not obviously match the checklist below, run the
-full suite first.
+The workstream 8 caveat is closed: the full suite was run on 2026-09-07 after the merge and
+came back **634 passed / 1 failed**, the failure being the pre-existing correction G test-
+isolation bug. Every branch in Phase 2 is now verified by a real pytest run.
 
 ### What Gate B is actually testing
 
@@ -84,7 +84,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | 5 | `feature/ft-count-tokens` | 2 | §4 | [x] | 4b0dd09 |
 | 6 | `feature/fouled-player` | 2 | §5 | [x] | 715cedb |
 | 7 | `feature/timeouts-team-rebounds` | 2 | §6 | [x] | b54685f |
-| 8 | `feature/schema-cleanup` | 2 | §7 | [x]* | 0605a35 |
+| 8 | `feature/schema-cleanup` | 2 | §7 | [x] | 0605a35 |
 | — | **Gate B — the re-clean + vocab rebuild** | 2 | | [ ] | |
 | 9 | `feature/shared-backbone` | 3 | §9 pre | [ ] | |
 | 10 | `feature/local-context` | 3 | §9 | [ ] | |
@@ -447,10 +447,10 @@ The repo has no pytest config at all; a `filterwarnings` entry would silence it.
 pytest tests/test_data_cleaner.py tests/test_chronology.py tests/test_preprocess.py -q
 ```
 
-**Result:** *** NOT RUN.** Merged on Alec's instruction to assume it passes while
-moving to a fresh chat for Gate B. Everything else in this file was verified by a
-real pytest run; this one was not. **If Gate B fails oddly, suspect this branch
-first** and run `python -m pytest tests/ -q` before debugging anything else.
+**Result:** Full suite: **634 passed, 1 failed** - the pre-existing correction G
+failure, unrelated. Run after the merge rather than before it: the branch was merged on
+Alec's instruction to assume it passes while moving to a fresh chat for Gate B, and the
+run was collected on the next session. The assumption held.
 
 **Notes:** Verified locally without pytest (the cleaner and box score import without a TF
 session): steal -> one row with the stealer in `secondary_player`; plain turnover -> `none`;
@@ -806,4 +806,4 @@ Append one line per merge. Newest last.
 | 2026-09-07 | `feature/ft-count-tokens` | 4b0dd09 | phantom shot_type sample deleted; and-1 rule added (correction I) |
 | 2026-09-07 | `feature/fouled-player` | 715cedb | 144 green; opponent 100% populated except technicals |
 | 2026-09-07 | `feature/timeouts-team-rebounds` | b54685f | 628 green; team-rebound side recovered at 99.8% (correction J) |
-| 2026-09-07 | `feature/schema-cleanup` | 0605a35 | **tests not run** - merged on instruction; Phase 2 complete |
+| 2026-09-07 | `feature/schema-cleanup` | 0605a35 | merged on instruction, verified after: 634 green; Phase 2 complete |
