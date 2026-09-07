@@ -29,15 +29,36 @@ FF = 24
 HEADS = 2
 
 
-def backbone_layer_names(num_layers: int) -> list[str]:
-    """The canonical backbone layer names, in graph order."""
+# The mask layer hangs off the ``pad_mask`` input rather than off the running tensor, so Keras is
+# free to place it anywhere after that input in the topological sort -- it is not a link in the
+# chain and carries no ordering guarantee. Its presence is asserted separately, and
+# ``test_padded_keys_do_not_reach_later_rows`` proves it is actually wired into the attention.
+SIDE_BRANCH_LAYERS = ("attn_pad_mask",)
+
+
+def backbone_chain_names(num_layers: int) -> list[str]:
+    """The canonical backbone layer names that sit on the main tensor path, in graph order."""
     names = ["fusion_concat", "fusion_projection", "fusion_ln",
-             "positional_embedding", "emb_dropout", "attn_pad_mask"]
+             "positional_embedding", "emb_dropout"]
     for i in range(num_layers):
         names += [f"block{i}_ln1", f"block{i}_mha", f"block{i}_res1",
                   f"block{i}_ln2", f"block{i}_ff1", f"block{i}_ffdrop",
                   f"block{i}_ff2", f"block{i}_res2"]
     return names + ["final_ln"]
+
+
+def backbone_layer_names(num_layers: int) -> list[str]:
+    """Every canonical backbone layer name (chain plus side branches)."""
+    return backbone_chain_names(num_layers) + list(SIDE_BRANCH_LAYERS)
+
+
+def assert_backbone_names(model, num_layers: int, label: str) -> None:
+    """Every canonical name is present, and the main path is in graph order."""
+    order = {l.name: i for i, l in enumerate(model.layers)}
+    missing = [n for n in backbone_layer_names(num_layers) if n not in order]
+    assert not missing, f"{label} lost backbone layer(s): {missing}"
+    positions = [order[n] for n in backbone_chain_names(num_layers)]
+    assert positions == sorted(positions), f"{label} backbone chain is out of graph order"
 
 
 def _tiny_backbone(num_layers=2):
@@ -55,13 +76,7 @@ def _tiny_backbone(num_layers=2):
 # --------------------------------------------------------------------------- #
 
 def test_backbone_emits_the_canonical_layer_names_in_order():
-    model = _tiny_backbone(num_layers=2)
-    order = {l.name: i for i, l in enumerate(model.layers)}
-    expected = backbone_layer_names(2)
-    missing = [n for n in expected if n not in order]
-    assert not missing, f"backbone lost layer(s): {missing}"
-    positions = [order[n] for n in expected]
-    assert positions == sorted(positions), "backbone layers are out of graph order"
+    assert_backbone_names(_tiny_backbone(num_layers=2), 2, "backbone")
 
 
 def test_backbone_weight_shapes_follow_d_model_and_ff_dim():
@@ -132,10 +147,5 @@ def test_head_carries_the_backbone_layer_names(adapter, tmp_path):
     inst.model_dim = D
     model = inst.model(num_layers=2, num_heads=HEADS, ff_dim=FF)
 
-    order = {l.name: i for i, l in enumerate(model.layers)}
-    expected = backbone_layer_names(2)
-    missing = [n for n in expected if n not in order]
-    assert not missing, f"{adapter.key} lost backbone layer(s): {missing}"
-    positions = [order[n] for n in expected]
-    assert positions == sorted(positions), f"{adapter.key} backbone is out of graph order"
+    assert_backbone_names(model, 2, adapter.key)
     assert model.get_layer("positional_embedding").weights[0].shape == (inst.sequence_length, D)

@@ -22,6 +22,7 @@ never overwrite the committed ``encoder/vocabs/``.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sys
 import tempfile
 from pathlib import Path
@@ -48,7 +49,11 @@ def _build(adapter, tmp: Path):
     # Isolated vocab dir: a default Encoder() would rewrite the committed encoder artifacts.
     enc = Encoder(vocab_dir=tmp / adapter.key / "vocabs")
     inst = adapter.build(enc, data_dir, tmp / adapter.key / "processed")
-    inst.preprocess(rebuild_vocabs=True, test_frac=0.34)
+    # preprocess prints a summary line carrying the temp directory, which differs on every
+    # run and would show up as a spurious hunk in the before/after diff this script exists
+    # to produce. Only layer lines belong on stdout.
+    with contextlib.redirect_stdout(sys.stderr):
+        inst.preprocess(rebuild_vocabs=True, test_frac=0.34)
     inst.model_dim = MODEL_DIM
     return inst.model(num_layers=NUM_LAYERS, num_heads=NUM_HEADS, ff_dim=FF_DIM)
 
