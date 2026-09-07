@@ -136,8 +136,8 @@ def _script(sim: GameSimulator, n_rows: int = 260):
                   result="nan", secondary="none", time=t)
             label = "non-team foul"
         elif kind == 5:                                          # possession-flipping turnover
-            _play(sim, event="turnover", player=sim.home_roster[i % 5], type="nan",
-                  result="steal", secondary=sim.away_roster[i % 5], time=t)
+            _play(sim, event="turnover", player=sim.home_roster[i % 5], type="steal",
+                  result="cop", secondary=sim.away_roster[i % 5], time=t)
             label = "turnover"
         elif kind == 7 and bench_h < len(HOME_FULL):             # home sub: mutates the roster
             outgoing, incoming = sim.home_roster[0], HOME_FULL[bench_h]

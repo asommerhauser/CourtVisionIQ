@@ -377,6 +377,73 @@ def test_non_shot_rows_never_get_a_zone(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Schema cleanup — one row per play
+# ---------------------------------------------------------------------------
+
+def test_a_steal_is_one_row_naming_the_stealer(tmp_path):
+    """It used to be two rows -- a grammar the controller then had to reproduce exactly."""
+    cleaned = _parse(tmp_path, [
+        {"event_type": "turnover", "player": "Alice", "steal": "Frank", "type": "lost ball",
+         "result": None},
+    ])
+    tos = cleaned[cleaned["event"] == "turnover"]
+    assert len(tos) == 1
+    row = tos.iloc[0]
+    assert (row["player"], row["type"], row["result"]) == ("Alice", "steal", "cop")
+    assert row["secondary_player"] == "Frank"          # the stealer, as a block row carries one
+
+
+def test_a_plain_turnover_names_nobody(tmp_path):
+    cleaned = _parse(tmp_path, [
+        {"event_type": "turnover", "player": "Alice", "steal": None, "type": "bad pass",
+         "result": None},
+    ])
+    row = cleaned[cleaned["event"] == "turnover"].iloc[0]
+    assert (row["type"], row["secondary_player"]) == ("error", "none")
+
+
+def test_an_offensive_foul_emits_no_trailing_turnover(tmp_path):
+    """The raw data pairs the two for 100% of them; the box score counts the TOV from the foul."""
+    cleaned = _parse(tmp_path, [
+        {"event_type": "foul", "player": "Cara", "type": "offensive charge", "opponent": "Gus",
+         "result": None},
+        {"event_type": "turnover", "player": "Cara", "steal": None, "type": "offensive foul",
+         "result": None},
+    ])
+    assert cleaned[cleaned["event"] == "turnover"].empty
+    assert cleaned[cleaned["event"] == "foul"].iloc[0]["type"] == "offensive"
+
+
+def test_a_standalone_technical_becomes_a_technical_foul_row(tmp_path):
+    """Defensive three seconds and double technicals file under their own raw event_type."""
+    cleaned = _parse(tmp_path, [
+        {"event_type": "technical foul", "player": "Gus", "type": "defensive 3 seconds",
+         "result": None},
+    ])
+    row = cleaned[cleaned["event"] == "foul"].iloc[0]
+    assert (row["player"], row["type"], row["result"]) == ("Gus", "technical", "free throw")
+
+
+def test_a_technical_with_no_player_is_dropped(tmp_path):
+    """Coach technicals name no actor to attribute it to."""
+    cleaned = _parse(tmp_path, [
+        {"event_type": "technical foul", "player": None, "type": "coach technical foul",
+         "result": None},
+    ])
+    assert cleaned[cleaned["event"] == "foul"].empty
+
+
+def test_the_emitted_schema_is_enforced(tmp_path):
+    """A missing key would otherwise land as a silent all-NaN column in the season file."""
+    from data_cleaner import OUTPUT_COLUMNS
+    cleaned = _parse(tmp_path, [{"event_type": "shot", "player": "Alice", "result": "made"}])
+    assert list(cleaned.columns) == list(OUTPUT_COLUMNS)
+
+    with pytest.raises(ValueError, match="cleaned schema"):
+        DataCleaner._check_schema([{"game_id": 1}])
+
+
+# ---------------------------------------------------------------------------
 # Timeouts
 # ---------------------------------------------------------------------------
 
@@ -647,33 +714,15 @@ def test_assist_emitted_before_shot(tmp_path):
 # Steal / turnover
 # ---------------------------------------------------------------------------
 
-def test_steal_creates_two_turnover_events(tmp_path):
-    row = {
-        "event_type": "turnover", "player": "Alice",
-        "steal": "Frank", "type": None,
-    }
-    cleaned = _parse(tmp_path, [row])
-    turnovers = cleaned[cleaned["event"] == "turnover"]
-    assert len(turnovers) == 2
-
-    steal_evt = turnovers[turnovers["result"] == "steal"].iloc[0]
-    cop_evt = turnovers[turnovers["result"] == "cop"].iloc[0]
-
-    assert steal_evt["player"] == "Frank"
-    assert steal_evt["type"] == "steal"
-    assert cop_evt["player"] == "Alice"
-    assert cop_evt["type"] == "steal"
-
-
-def test_steal_home_away_for_both_events(tmp_path):
-    """Frank (away) steals from Alice (home)."""
+def test_steal_home_away_is_the_ball_losers(tmp_path):
+    """Frank (away) steals from Alice (home): the row belongs to Alice, who lost it."""
     row = {"event_type": "turnover", "player": "Alice", "steal": "Frank"}
     cleaned = _parse(tmp_path, [row])
     turnovers = cleaned[cleaned["event"] == "turnover"]
-    steal_evt = turnovers[turnovers["result"] == "steal"].iloc[0]
-    cop_evt = turnovers[turnovers["result"] == "cop"].iloc[0]
-    assert steal_evt["home/away"] == 2   # Frank is away (home_indicator: 1=home, 2=away)
-    assert cop_evt["home/away"] == 1     # Alice is home
+    assert len(turnovers) == 1
+    turnover = turnovers.iloc[0]
+    assert turnover["home/away"] == 1     # Alice is home (home_indicator: 1=home, 2=away)
+    assert turnover["secondary_player"] == "Frank"
 
 
 def test_no_turnover_type_produces_no_event(tmp_path):
