@@ -115,6 +115,7 @@ def test_normalize_uses_fixed_constants_and_clips():
         "period_time_left": np.array([720.0, 0.0, 0.0], dtype=np.float32),
         "team_fouls_home": np.array([6.0, 0.0, 99.0], dtype=np.float32),
         "team_fouls_away": np.array([6.0, 0.0, 0.0], dtype=np.float32),
+        "poss_clock": np.array([24.0, 0.0, 90.0], dtype=np.float32),
     }
     out = gs.normalize_game_state(raw)
     assert np.isclose(out["score_diff"][0], 1.0)
@@ -125,8 +126,154 @@ def test_normalize_uses_fixed_constants_and_clips():
     assert np.isclose(out["period_time_left"][0], 1.0)
     assert np.isclose(out["team_fouls_home"][0], 1.0)
     assert np.isclose(out["team_fouls_home"][2], 12.0 / 6.0)  # clipped at 12
+    assert np.isclose(out["poss_clock"][0], 1.0)
+    assert np.isclose(out["poss_clock"][2], 1.0)              # clipped at the 24s clock
     for k in gs.GAME_STATE_KEYS:
         assert out[k].dtype == np.float32
+
+
+# ---------------------------------------------------------------------------
+# poss_clock — the derived shot-clock proxy
+# ---------------------------------------------------------------------------
+
+def _clock(rows):
+    return list(gs.derive_game_state(rows)["poss_clock"])
+
+
+def test_the_clock_runs_from_the_start_of_the_possession():
+    rows = [
+        _row("start", "start", 0.0),
+        _row("shot", "H1", 8.0, type="paint", result="missed"),
+        _row("rebound", "H2", 10.0, type="offensive", result="null"),
+    ]
+    assert _clock(rows)[:2] == [0.0, 8.0]
+
+
+def test_a_made_field_goal_ends_the_possession():
+    rows = [
+        _row("shot", "H1", 10.0, type="paint", result="made"),
+        _row("shot", "A1", 22.0, type="top3", result="missed"),
+    ]
+    # The made shot reports its own possession's length; the next possession starts at 0 and the
+    # away miss is 12s into it.
+    assert _clock(rows) == [10.0, 12.0]
+
+
+def test_a_defensive_rebound_ends_the_possession():
+    rows = [
+        _row("shot", "H1", 10.0, type="paint", result="missed"),
+        _row("rebound", "A1", 12.0, type="defensive", result="cop"),
+        _row("shot", "A2", 20.0, type="rim", result="missed"),
+    ]
+    assert _clock(rows) == [10.0, 12.0, 8.0]
+
+
+def test_an_offensive_rebound_resets_the_clock_without_changing_hands():
+    rows = [
+        _row("shot", "H1", 10.0, type="paint", result="missed"),
+        _row("rebound", "H2", 12.0, type="offensive", result="null"),
+        _row("shot", "H3", 18.0, type="rim", result="missed"),
+    ]
+    # The real 14-second reset: same offense, fresh clock. The second shot is 6s into it.
+    assert _clock(rows) == [10.0, 12.0, 6.0]
+
+
+def test_a_turnover_ends_the_possession():
+    rows = [
+        _row("turnover", "H1", 14.0, type="steal", result="cop", ),
+        _row("shot", "A1", 20.0, type="rim", result="made"),
+    ]
+    assert _clock(rows) == [14.0, 6.0]
+
+
+def test_a_made_free_throw_ends_the_possession():
+    rows = [
+        _row("foul", "A1", 10.0, type="shooting 2pt", result="free throw"),
+        _row("shot", "H1", 12.0, type="free throw", result="made"),
+        _row("shot", "A2", 20.0, type="rim", result="missed"),
+    ]
+    # The foul leaves the possession running; the made free throw ends it.
+    assert _clock(rows) == [10.0, 12.0, 8.0]
+
+
+def test_a_missed_free_throw_leaves_the_rebound_to_decide():
+    rows = [
+        _row("shot", "H1", 12.0, type="free throw", result="missed"),
+        _row("rebound", "A1", 14.0, type="defensive", result="cop"),
+        _row("shot", "A2", 20.0, type="rim", result="missed"),
+    ]
+    assert _clock(rows) == [12.0, 14.0, 6.0]
+
+
+def test_a_defensive_foul_does_not_end_the_possession():
+    rows = [
+        _row("shot", "H1", 5.0, type="paint", result="missed"),
+        _row("rebound", "H2", 7.0, type="offensive", result="null"),
+        _row("foul", "A1", 12.0, type="personal", result="nothing"),
+        _row("shot", "H3", 15.0, type="rim", result="made"),
+    ]
+    # Only the offensive rebound restarts the clock; the common foul leaves it running.
+    assert _clock(rows) == [5.0, 7.0, 5.0, 8.0]
+
+
+def test_an_offensive_foul_ends_the_possession():
+    rows = [
+        _row("foul", "H1", 10.0, type="offensive", result="cop"),
+        _row("shot", "A1", 18.0, type="rim", result="made"),
+    ]
+    assert _clock(rows) == [10.0, 8.0]
+
+
+def test_a_period_boundary_starts_a_new_possession():
+    rows = [
+        _row("shot", "H1", 700.0, type="paint", result="missed"),
+        _row("rebound", "H2", 715.0, type="offensive", result="null"),
+        _row("shot", "H3", 725.0, type="rim", result="missed"),   # Q2
+    ]
+    # The Q2 row does not carry the tail of a Q1 possession across the buzzer.
+    assert _clock(rows) == [700.0, 715.0, 5.0]
+
+
+def test_the_boundary_rule_classifies_each_cleaned_row_shape():
+    end, reset = gs.POSSESSION_END, gs.POSSESSION_RESET
+    cases = [
+        (("shot", "paint", "made"), end),
+        (("shot", "free throw", "made"), end),
+        (("turnover", "steal", "cop"), end),
+        (("rebound", "defensive", "cop"), end),
+        (("rebound", "team defensive", "cop"), end),
+        (("foul", "offensive", "cop"), end),
+        (("rebound", "offensive", "null"), reset),
+        (("rebound", "team offensive", "null"), reset),
+        (("shot", "paint", "missed"), None),
+        (("shot", "paint", "blocked"), None),
+        (("shot", "free throw", "missed"), None),
+        (("block", "paint", "block"), None),
+        (("assist", "paint", "score"), None),
+        (("foul", "shooting 2pt", "free throw"), None),
+        (("foul", "personal take", "free throw op"), None),
+        (("foul", "personal", "nothing"), None),
+        (("foul", "loose ball", "op"), None),
+        (("timeout", "home", "none"), None),
+        (("substitution", "none", "substitution"), None),
+    ]
+    for (event, etype, result), expected in cases:
+        assert gs.possession_boundary(event, etype, result) == expected, (event, etype, result)
+
+
+def test_the_incremental_scan_matches_the_batch_derivation():
+    """The simulator feeds rows one at a time; preprocessing feeds a whole game."""
+    rows = [
+        _row("start", "start", 0.0),
+        _row("shot", "H1", 9.0, type="paint", result="missed"),
+        _row("rebound", "H2", 11.0, type="offensive", result="null"),
+        _row("shot", "H3", 19.0, type="rim", result="made"),
+        _row("turnover", "A1", 26.0, type="bad pass", result="cop"),
+        _row("shot", "H4", 31.0, type="top3", result="made"),
+    ]
+    scan = gs.GameStateScan()
+    incremental = [scan.step(r)[-1] for r in rows]
+    assert incremental == _clock(rows)
 
 
 # ---------------------------------------------------------------------------
