@@ -17,12 +17,28 @@
    **Gate A is the last point where an end-to-end sim run against existing weights says anything.**
    After it, verification is pytest plus inspection of cleaner output until the 2.0 train.
 
-## START HERE (as of 2026-09-07)
+## START HERE (as of 2026-09-08)
 
-**Phase 1 and Phase 2 are code-complete and merged into `feature/version2`. The next thing to
-do is Gate B — the re-clean and vocab rebuild.** Nothing has been re-cleaned yet, so no 2.0
-cleaned data exists on disk: `data/season*.csv` is still the v1.0 output and `encoder/vocabs/`
-is still the v1.0 frozen vocab.
+**Phases 1 and 2, Gate B, and all of §9 are done and merged into `feature/version2`. The next
+thing to do is workstream 11, `feature/rotation-model`** — the largest branch in the programme,
+and the one §8 flags as possibly needing its own train. A smaller version is specified if it
+proves too much for one.
+
+2.0 cleaned data is on disk and the vocabularies are frozen and committed (`0ab3956`). The full
+suite is **685 green**. `data/processed` was written by the same run, so it already carries the
+seventh game-state key.
+
+Two things to carry into workstream 11, both learned the expensive way at Gate B:
+
+1. **Unit tests found neither real bug this stage.** The jump-ball collapse survived 663 green
+   tests because every timeout test bound team abbreviations from shot rows; the possession
+   over-count survived 26 tests written specifically for it. Both were caught by comparing one
+   number against an independent source. Workstream 11 owns player minutes — the single largest
+   box-score error — so decide now what its independent number is, and it is not a unit test.
+2. **A loose gate is close to no gate.** The first pace band was drawn from published NBA pace,
+   which is normalized per 48 minutes and excludes playoffs, so it had to be wide enough that
+   109.4 only just failed and 104.0 would have passed silently. Prefer a reference computed
+   from the same file by an independent route.
 
 The workstream 8 caveat is closed: the full suite was run on 2026-09-07 after the merge and
 came back **634 passed / 1 failed**, the failure being the pre-existing correction G test-
@@ -90,7 +106,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | 6 | `feature/fouled-player` | 2 | §5 | [x] | 715cedb |
 | 7 | `feature/timeouts-team-rebounds` | 2 | §6 | [x] | b54685f |
 | 8 | `feature/schema-cleanup` | 2 | §7 | [x] | 0605a35 |
-| — | **Gate B — the re-clean + vocab rebuild** | 2 | | [ ] | |
+| — | **Gate B — the re-clean + vocab rebuild** | 2 | | [x] | 0ab3956 |
 | 9 | `feature/shared-backbone` | 3 | §9 pre | [x] | b9ff4ea |
 | 10a | `feature/local-attention` | 3 | §9 | [x] | f402341 |
 | 10b | `feature/possession-clock` | 3 | §9 | [x] | bfb52c1 |
@@ -508,7 +524,28 @@ reads the RAW files, so it validates the geometry independently of whatever the 
    rows carrying a fouled player for every non-technical.
 5. **`encoder/vocabs/*.json` gets committed** after the clean, so a cloud clone matches.
 
-**Result:** **Run once, failed check 4, fixed, needs re-running.** The clean completed over all
+**Result:** **PASSED**, on the third run. The first two failed check 4 on timeouts (the second
+reproduced the first exactly, because the fix had not been merged when it started); the third
+ran with `fix/jump-ball-team-binding` in the tree and passes every check.
+
+| check | outcome |
+|---|---|
+| 1. the clean completes | 21 seasons, no traceback — neither guard fired |
+| 2. zone table | all gates, all three eras, matching workstream 3 to a rounding step |
+| 3. vocabs | PASS — fifteen zones, both shooting tokens, team rebounds, `home`/`away`, `timeout`; no `2pt`/`3pt`/bare `shooting`; `steal` gone as a result |
+| 4. spot-check | all five match (see below) |
+| 5. vocabs committed | `0ab3956` |
+
+| 2022-23 | measured at build | after the clean |
+|---|---|---|
+| shooting fouls | ~27,708, 96.4% / 3.6% | 27,708, 96.4% / 3.6% |
+| team rebounds | ~11,884 typed + ~909 bare | 12,793 |
+| timeouts | ~14,477 | 14,477, split away 7,287 / home 7,190 |
+| steals | one row, stealer named | 19,167, 100% named; `steal` as a result: 0 |
+| fouled player | 100% of non-technicals | 99.86% |
+
+**Below is the record of the first run, kept because correction L came out of it.** The clean
+completed over all
 21 seasons with no traceback, so neither guard fired. The vocab check passes outright: all
 fifteen zones, `shooting 2pt`/`shooting 3pt`, `team offensive`/`team defensive`, `home`/`away`
 and `free throw` are present; `2pt`, `3pt` and bare `shooting` are gone; `timeout` is in the
@@ -1044,3 +1081,4 @@ Append one line per merge. Newest last.
 | 2026-09-07 | `fix/jump-ball-team-binding` | fac7095 | Gate B found it: ~47% of games bound both sides to one abbreviation (correction L) |
 | 2026-09-07 | `feature/possession-clock` | 53224b3 | merged ahead of its run so one clean could settle data, arrays and code together |
 | 2026-09-07 | `fix/free-throw-possessions` | bfb52c1 | pace gate caught a 12% over-count; free throws resolve by trip now (correction M) |
+| 2026-09-08 | **Gate B** | 0ab3956 | passed on the third clean; vocabs frozen and committed; 685 green |
