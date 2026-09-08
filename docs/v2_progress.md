@@ -93,7 +93,8 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | — | **Gate B — the re-clean + vocab rebuild** | 2 | | [ ] | |
 | 9 | `feature/shared-backbone` | 3 | §9 pre | [x] | b9ff4ea |
 | 10a | `feature/local-attention` | 3 | §9 | [x] | f402341 |
-| 10b | `feature/possession-clock` | 3 | §9 | [ ] | |
+| 10b | `feature/possession-clock` | 3 | §9 | [~] | 53224b3 |
+| — | `fix/jump-ball-team-binding` | 2 | — | [x] | fac7095 |
 | 11 | `feature/rotation-model` | 3 | §8 | [ ] | |
 | 12 | `feature/training-changes` | 3 | §10 | [ ] | |
 | 13 | `feature/quarter-eval-splits` | 4 | §11 | [ ] | |
@@ -507,9 +508,37 @@ reads the RAW files, so it validates the geometry independently of whatever the 
    rows carrying a fouled player for every non-technical.
 5. **`encoder/vocabs/*.json` gets committed** after the clean, so a cloud clone matches.
 
-**Result:**
+**Result:** **Run once, failed check 4, fixed, needs re-running.** The clean completed over all
+21 seasons with no traceback, so neither guard fired. The vocab check passes outright: all
+fifteen zones, `shooting 2pt`/`shooting 3pt`, `team offensive`/`team defensive`, `home`/`away`
+and `free throw` are present; `2pt`, `3pt` and bare `shooting` are gone; `timeout` is in the
+event vocab; `steal` is gone from the result vocab and survives only as a type. The 2022-23
+spot-check matched the build-time measurements **exactly** on three of four counts:
 
-**Notes:**
+| | measured at build | after the re-clean |
+|---|---|---|
+| shooting fouls | ~27,708, 96.4% / 3.6% | 27,708, 96.4% / 3.6% |
+| team rebounds | ~11,884 typed + ~909 bare | 12,793 (= 11,884 + 909) |
+| steals | one row, stealer named | 100% named; `steal` as a result: 0 |
+| fouled player | 100% of non-technicals | 99.9% (technicals 100% `none`) |
+| **timeouts** | **~14,477, ~12/game** | **11,134, 8.4/game, split 65/35 home** |
+
+The timeout line is a real bug, not a measurement artefact - see correction L. Fixed on
+`fix/jump-ball-team-binding`; **the clean has to run again**, since everything in `./data` was
+produced by the broken binding.
+
+**Notes:** The zone table (check 2) reads raw files and is unaffected by the cleaner bug, but
+it has not been re-run since workstream 3.
+
+A process note worth keeping: the re-clean was run twice, and the second run reproduced the
+first exactly because the fix had not been merged when it started. Check that the fix is in the
+working tree - `grep -c _TEAM_AGNOSTIC_EVENTS data_cleaner.py` - before spending half an hour
+on a clean.
+
+The preprocess bundled into the clean writes `data/processed` from whatever the tree says, so
+the branch checked out at clean time decides how many game-state keys land on disk. Both the
+cleaner fix and workstream 10b are merged now, so one more clean brings data, arrays and code
+into agreement.
 
 ## Phase 3 — Model
 
@@ -921,6 +950,37 @@ mechanism for exactly this ("a mismatch means the weights will not load") and do
 today, so `LOCAL_ATTENTION_HEADS` and `LOCAL_ATTENTION_WINDOW` go in it. They stay out of
 `_TUNING_KEYS`: nothing at sim time reads them, and they are not A/B-able without a retrain.
 
+**L. A jump ball's `team` column is the team that WON THE TIP, not the team of the player it
+names.** `_update_teams` bound each side's abbreviation from the first row whose actor sat in
+that side's five, taking the row's `team` as that side's id. The two jumpers are opponents by
+definition, so about half the time a jump ball pairs an away player with the home abbreviation -
+and it is the first action row of nearly every game, so it bound first. In game 5084 the jump
+ball names Joel Embiid (PHI) with `team=BOS`, setting `away_team=BOS`; Marcus Smart's shot then
+set `home_team=BOS` too.
+
+Both sides collapsed onto one abbreviation in **~47% of games in every era** - 615/1320 in
+2022-23, 572/1277 in 2002-03, 638/1314 in 2012-13. Two consequences, the second worse than the
+first: every timeout by the unbound team was dropped, and every timeout that survived in a
+collapsed game was labelled `home`, because `_side_of_team` tests home first. **3,391 of the
+11,134 kept in 2022-23 were mislabelled by construction**, about half of them wrongly - and that
+is the exact field the new `timeout_team` head trains on. In the 705 uncollapsed games the split
+is 3,944 away / 3,799 home, the 51/49 a timeout should be. The `home_team` / `away_team` context
+columns carried the same collapse.
+
+Fix: jump balls do not bind, plus a guard that the two sides cannot share an abbreviation.
+Validated through the real `DataCleaner` methods over three eras: 0 collapsed, 0 unresolved, and
+the bound home abbreviation matches the majority abbreviation over shot rows by home players in
+all 3,911 games. Timeouts kept now equals timeouts attributable - 14,477 of 14,477 in 2022-23;
+the ~2,400 still dropped in the older files carry `team=nan` with raw type `unknown` and have no
+side to attribute.
+
+`_label_team_rebounds` compares raw `team` values to each other rather than to the bound
+abbreviations, so correction J's work is unaffected - which is why its counts matched exactly.
+
+**Why 663 green tests missed it:** every existing timeout test bound from shot rows, so nothing
+in the suite reached the jump-ball path. This is the case for Gate B's step 4 existing at all -
+no unit test was going to find it, and a spot-check against a known real-world quantity did.
+
 ---
 
 ## Log
@@ -939,3 +999,5 @@ Append one line per merge. Newest last.
 | 2026-09-07 | `feature/schema-cleanup` | 0605a35 | merged on instruction, verified after: 634 green; Phase 2 complete |
 | 2026-09-07 | `feature/shared-backbone` | b9ff4ea | layer-name diff clean; correction G closed; workstream 10 split into 10a/10b |
 | 2026-09-07 | `feature/local-attention` | f402341 | 663 green; switch-off parity pinned; ARCH_KEYS entry added (correction K) |
+| 2026-09-07 | `fix/jump-ball-team-binding` | fac7095 | Gate B found it: ~47% of games bound both sides to one abbreviation (correction L) |
+| 2026-09-07 | `feature/possession-clock` | 53224b3 | **tests not yet run** - merged so one clean can settle data, arrays and code together |
