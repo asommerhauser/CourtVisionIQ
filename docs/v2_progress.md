@@ -40,47 +40,59 @@ Two things to carry into workstream 11, both learned the expensive way at Gate B
    109.4 only just failed and 104.0 would have passed silently. Prefer a reference computed
    from the same file by an independent route.
 
-The workstream 8 caveat is closed: the full suite was run on 2026-09-07 after the merge and
-came back **634 passed / 1 failed**, the failure being the pre-existing correction G test-
-isolation bug. Every branch in Phase 2 is now verified by a real pytest run.
+### Where the tree stands
 
-**Workstream 9 was built ahead of Gate B and is merged.** Phase 3's §9 work touches neither
-the cleaner nor the vocabularies, so it does not wait on the clean; workstream 10a can start
-the same way. Only 10b (the possession clock) needs Gate B's output, and only to *measure* --
-it reads cleaned rows, and the ones on disk are still v1.0 shaped.
+| | |
+|---|---|
+| branch | `feature/version2`, clean tree |
+| cleaned data | 2.0, all 21 seasons, from the clean that passed Gate B |
+| vocabularies | frozen and committed, `0ab3956` |
+| `data/processed` | written by the same run, so it carries all seven game-state keys |
+| suite | 685 passed, 0 failed |
+| weights | **none usable** — see below |
 
-### What Gate B is actually testing
+**There is no loadable model.** `artifacts/v1.0`, full2 and full3 are all dead: the vocab
+rebuild gave them tokens they have never seen, and workstream 10b widened the fusion concat by
+16, so `fusion_projection`'s kernel no longer matches either. Nothing can be evaluated,
+smoke-run or sim-tested until the 2.0 train. **pytest plus TF-free measurement passes are the
+entire verification surface from here to Gate C** — which is why workstreams 11-13 each need to
+bring their own measurement, not just tests.
 
-Five branches changed the cleaned-data schema and the token vocabulary before a single clean
-was run. Gate B is the first end-to-end exercise of all of it at once:
+### Two standing guards
 
-| Change | From | To |
-|---|---|---|
-| Shot / assist / block `type` | `2pt` / `3pt` | fifteen zone tokens (`rim` … `heave`) |
-| Shooting foul `type` | `shooting` | `shooting 2pt` / `shooting 3pt` |
-| Foul `secondary_player` | always `none` | the fouled player (raw `opponent`) |
-| Rebound `type` | `offensive` / `defensive` | plus `team offensive` / `team defensive` |
-| Steal | two turnover rows | one row, stealer in `secondary_player` |
-| Offensive foul | foul row + turnover row | foul row only |
-| Standalone technicals | dropped entirely | emitted as technical foul rows |
-| New event | — | `timeout`, with `type` = `home` / `away` |
-| Result token `steal` | existed | **gone** (survives only as a type) |
-| Kept raw columns | — | `outof`, `opponent`, `converted_x/y`, `shot_distance` |
-
-### The two guards that will fire loudly if something is wrong
-
-Both are deliberate, and a failure from either is the system working, not a bug to route around:
+Neither fired at Gate B. A failure from either is the system working, not a bug to route around:
 
 1. **`zones.points_for_shot` raises** on any shot `type` that is neither a zone nor
    `free throw`. A stray token aborts the preprocess instead of silently scoring it as two.
 2. **`DataCleaner._check_schema` raises** if any emitted event's keys differ from
    `OUTPUT_COLUMNS`. A missing key would otherwise become a silent all-NaN column.
 
-### After Gate B
+### The line numbers in workstreams 11 and 12 were stale
 
-`artifacts/v1.0` becomes unusable for any meaningful sim — those heads have never seen a zone
-token, a split shooting foul, or a timeout. Do not read a v1.0 eval after this point as
-evidence of anything. Workstreams 9-13 and Gate C remain; none of them touch the cleaner.
+The backbone extraction removed ~24 lines from each of the six model files, and Phase 1/2 grew
+the controller, so anchors written before the build had all drifted. Re-measured 2026-09-08:
+
+| Anchor | doc said | actual |
+|---|---|---|
+| `apply_recency` in `event_time_model.py` | 687 | **618** |
+| `apply_recency` in `player_model.py` | 463 | **438** |
+| `apply_recency` in `conditional_type_model.py` | 557 | **538** |
+| `apply_recency` in `substitution_model.py` | 597 | **572** |
+| `apply_recency` in `stint_length_model.py` | 493 | **468** |
+| `apply_recency` in `conditional_time_model.py` | 377 | **352** |
+| `controller._fatigue_bias` | 389 | **516** |
+| `controller._schedule_stint` | 411 | **538** |
+| `controller._process_scheduled_subs` | 420 | **547** |
+| `controller._maybe_force_sub` | 447 | **577** |
+| `RosterEncoderParams.get_config` / `from_config` | 131-146, 148-153 | **131, 149** |
+| `registry.MODEL_REGISTRY` / `STAGE_MODEL_KEYS` | 23, 41 | 23, 41 (unchanged) |
+| `roster_set_encoder.rest_proj` | 71, 102, 120 | 71, 102, 120 (unchanged) |
+
+Workstream 13's anchors were not touched this stage and still land: `_accuracy_section` at
+`reporting/eval_report.py:412`, the parquet writes around `:768`, `compare_holdout` at
+`simulation/diagnostics.py:144`.
+
+**Grep for the symbol rather than trusting any of these.** That is the lesson, not the table.
 
 ## Working pattern, per feature
 
@@ -111,6 +123,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | 10a | `feature/local-attention` | 3 | §9 | [x] | f402341 |
 | 10b | `feature/possession-clock` | 3 | §9 | [x] | bfb52c1 |
 | — | `fix/jump-ball-team-binding` | 2 | — | [x] | fac7095 |
+| — | `fix/free-throw-possessions` | 3 | §9 | [x] | bfb52c1 |
 | 11 | `feature/rotation-model` | 3 | §8 | [ ] | |
 | 12 | `feature/training-changes` | 3 | §10 | [ ] | |
 | 13 | `feature/quarter-eval-splits` | 4 | §11 | [ ] | |
@@ -784,8 +797,8 @@ the fatigue nudge retire.
   since they sat, minutes played, fouls, and whether they have played.
 - A new `models/sub_decision_model.py`, registered in `models/registry.py:23,41`, asked only at dead
   balls: per team, how many substitutions follow before the ball is live (`0 / 1 / 2 / 3+`).
-- Retire `_schedule_stint` (`controller.py:411`), `_process_scheduled_subs` (`:420`), `_fatigue_bias`
-  (`:389`) and `models/stint_length_model.py`. `_maybe_force_sub` (`:447`) stays as the single
+- Retire `_schedule_stint` (`controller.py:538`), `_process_scheduled_subs` (`:547`), `_fatigue_bias`
+  (`:516`) and `models/stint_length_model.py`. `_maybe_force_sub` (`:577`) stays as the single
   backstop. `STINT_SAMPLE_SIGMA`, `STINT_LENGTH_SCALE`, `STINT_MAX_SECONDS` and `SUB_FATIGUE_WEIGHT`
   leave `_TUNING_KEYS`.
 
@@ -823,12 +836,12 @@ Call sites (the spec's line numbers are stale by up to 12 lines; these are curre
 
 | File | `apply_recency` call |
 |---|---|
-| `models/event_time_model.py` | `:687` |
-| `models/player_model.py` | `:463` |
-| `models/conditional_type_model.py` | `:557` |
-| `models/substitution_model.py` | `:597` |
-| `models/stint_length_model.py` | `:493` |
-| `models/conditional_time_model.py` | `:377` |
+| `models/event_time_model.py` | `:618` |
+| `models/player_model.py` | `:438` |
+| `models/conditional_type_model.py` | `:538` |
+| `models/substitution_model.py` | `:572` |
+| `models/stint_length_model.py` | `:468` |
+| `models/conditional_time_model.py` | `:352` |
 
 Two call shapes exist — mask built first then wrapped (`event_time`, `conditional_time`), and wrapped
 inline (the other four) — both ending at `sample_weights = {<output_name>: mask}`.
@@ -929,8 +942,11 @@ same rule: the exclusion form counts an unknown token as a team foul, the inclus
 Pick a direction deliberately, and put the shared constant where both a TF-free sim module and a
 model module can import it — the same reasoning that puts `zones.py` at root level.
 
-**B. §10's `_make_dataset` line numbers are stale** by up to 12 lines. Current values are in the §12
-table above; only `player_model.py:463` still lands exactly.
+**B. §10's `_make_dataset` line numbers are stale, and went stale a second time.** They were
+already off by up to 12 lines when the spec was written; the backbone extraction (workstream 9)
+then removed ~24 lines from each of the six model files and moved every one of them again. The
+§12 table carries the values measured on 2026-09-08. **Treat any line number in either document
+as a hint and grep for the symbol** — this is the second time these particular ones drifted.
 
 **C. §8 omits `models/norm_stats_io.py`.** `norm_stats.json` carries exactly one per-player pair
 (`rest_mean` / `rest_std`), matching the single scalar in `RosterSetEncoder`. The three new
