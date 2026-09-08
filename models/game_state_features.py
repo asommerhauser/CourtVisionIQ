@@ -79,6 +79,16 @@ POSSESSION_END = "end"      # the ball changes hands; a new possession starts on
 POSSESSION_RESET = "reset"  # same offense, fresh clock (an offensive rebound)
 
 
+# Fouls whose free throws leave the ball with the shooting team: a technical, and the
+# "free throw op" family (personal take, transition take, flagrant-1). The trip does not end a
+# possession, and the shot clock resumes rather than restarting.
+_RETAINING_FOUL_RESULTS = {"free throw op"}
+_RETAINING_FOUL_TYPES = {"technical"}
+# Events that count as live play when deciding whether a foul was drawn on a made basket.
+# Substitutions, timeouts and the game sentinels can sit between the basket and the foul.
+_LIVE_EVENTS = {"shot", "rebound", "turnover", "block", "assist"}
+
+
 def possession_boundary(event: str, etype: str, result: str):
     """Whether a cleaned row ends the possession, only resets the clock, or neither.
 
@@ -88,23 +98,22 @@ def possession_boundary(event: str, etype: str, result: str):
 
       * ``cop`` — change of possession. A turnover, a defensive or team-defensive rebound, or an
         offensive foul (``determine_foul_result`` maps it there). Ends the possession.
-      * a made shot — ``event="shot", result="made"``. Ends it. Free throws are normalized under
-        ``shot`` too, so a made free throw ends it as well.
+      * a made field goal — ``event="shot", result="made"`` with a zone type. Ends it.
       * a rebound that is not ``cop`` — an offensive or team-offensive board. The offense keeps
         the ball but the shot clock restarts, so the clock resets without the possession ending.
 
     A defensive foul (``free throw`` / ``free throw op``), a common foul (``nothing``), a loose
     ball foul (``op``), a missed shot, a block and an assist all leave the possession running.
 
-    **Known inaccuracy.** The cleaned data carries no free-throw index — ``num``/``outof`` are a
-    v3 item — so a made *first* free throw of a two-shot trip is read as ending the possession,
-    and the second free throw's clock reads ~0. It is confined to free-throw rows, where the shot
-    clock is off and the value means nothing; live play resumes correctly either way, because the
-    last made free throw ends the possession and a missed one leaves the rebound to decide.
+    **Free throws are deliberately not decided here.** A made free throw usually does end a
+    possession, but three cases say otherwise and none of them is visible in a single row, so
+    :class:`GameStateScan` resolves the trip as a whole — see ``_resolve_free_throws``. Reading
+    the shot row alone over-counted possessions by 12%: 109.4 per team per game in 2022-23,
+    against 99.4 by the standard formula on the same file.
     """
     if result == "cop":
         return POSSESSION_END
-    if event == "shot" and result == "made":
+    if event == "shot" and result == "made" and etype != "free throw":
         return POSSESSION_END
     if event == "rebound":
         return POSSESSION_RESET
@@ -170,7 +179,8 @@ class GameStateScan:
     convention. State is inclusive of the row just fed.
     """
 
-    __slots__ = ("home_pts", "away_pts", "fouls_home", "fouls_away", "cur_period", "poss_start")
+    __slots__ = ("home_pts", "away_pts", "fouls_home", "fouls_away", "cur_period", "poss_start",
+                 "ft_made_at", "ft_retains", "ft_after_basket", "prev_live", "poss_ends")
 
     def __init__(self) -> None:
         self.home_pts = 0
@@ -181,6 +191,60 @@ class GameStateScan:
         # Always overwritten on the first row (period -1 never matches a real period), but a
         # number rather than None so a misuse is a wrong value, not a TypeError.
         self.poss_start = 0.0
+        # Open free-throw trip (see _resolve_free_throws).
+        self.ft_made_at = None          # time of the latest made free throw in the open trip
+        self.ft_retains = False         # technical / flagrant / take: the shooting team keeps it
+        self.ft_after_basket = False    # an and-1: the basket it followed already ended it
+        self.prev_live = None           # (event, type, result) of the last live-play row
+        # Possessions completed so far. Not a feature -- it is what the pace check counts, and it
+        # lives here so the check counts the same events the clock resets on, by construction.
+        self.poss_ends = 0
+
+    def _track_free_throws(self, event, etype, result, t) -> None:
+        """Accumulate what the open free-throw trip will need when it resolves.
+
+        A foul row opens the bookkeeping: whether its free throws leave the ball with the
+        shooting team, and whether it followed a made basket (an and-1). Each made free throw
+        then records its time; the latest one is where the next possession starts, so a trip
+        resolves once whatever its length, with no need for the ``num``/``outof`` index the
+        cleaned data does not carry.
+
+        A missed free throw clears the pending time: the trip's outcome is no longer settled by
+        the trip, it is settled by the rebound that follows, which decides on its own.
+        """
+        if event == "foul":
+            self.ft_retains = (result in _RETAINING_FOUL_RESULTS
+                               or etype in _RETAINING_FOUL_TYPES)
+            prev = self.prev_live
+            self.ft_after_basket = bool(
+                prev and prev[0] == "shot" and prev[1] != "free throw" and prev[2] == "made")
+            return
+        if event == "shot" and etype == "free throw":
+            self.ft_made_at = t if result == "made" else None
+            return
+        if event in _LIVE_EVENTS:
+            self.prev_live = (event, etype, result)
+
+    def _resolve_free_throws(self) -> None:
+        """Close an open free-throw trip, moving the possession start if the ball changed hands.
+
+        Three trips do NOT end a possession, and each was measured over the 2022-23 file:
+
+          * a trip that is not over -- the next row is another of its free throws. Ending on each
+            made attempt counted a two-shot trip twice (~5.7 possessions per team per game).
+          * an and-1. The made basket already ended the possession; counting the bonus shot again
+            double-counted it (3.52 per team per game).
+          * a technical, flagrant or take foul, where the shooting team keeps the ball and the
+            shot clock resumes rather than restarting (0.86 per team per game).
+
+        Together those were the whole 12% over-count.
+        """
+        if self.ft_made_at is not None and not (self.ft_retains or self.ft_after_basket):
+            self.poss_start = self.ft_made_at
+            self.poss_ends += 1
+        self.ft_made_at = None
+        self.ft_retains = False
+        self.ft_after_basket = False
 
     def step(self, row) -> tuple:
         """Fold one event row in; return its raw state values in ``GAME_STATE_KEYS`` order."""
@@ -191,11 +255,20 @@ class GameStateScan:
             self.cur_period = period
             # A new period starts a new possession, anchored at the buzzer rather than at
             # whenever the first event of the period happens to land. Covers the game's first
-            # row too, since period -1 never matches.
+            # row too, since period -1 never matches. Not counted as a possession end: nobody
+            # completed a trip, the clock simply restarts.
             self.poss_start = _period_start(t)
+            self.ft_made_at = None
+            self.ft_retains = False
+            self.ft_after_basket = False
 
         boundary = None
         event = _norm(row.get("event"))
+        etype_raw = _norm(row.get("type"))
+        # A trip resolves on the first row that is not one of its own free throws, so its outcome
+        # is known (last shot seen, foul kind, what preceded it) before this row's clock is read.
+        if not (event == "shot" and etype_raw == "free throw"):
+            self._resolve_free_throws()
         if event not in _SKIP_EVENTS:
             player = _norm(row.get("player"))
             home_roster = _roster(row.get("roster_home"))
@@ -205,6 +278,7 @@ class GameStateScan:
             etype = _norm(row.get("type"))
             result = _norm(row.get("result"))
             boundary = possession_boundary(event, etype, result)
+            self._track_free_throws(event, etype, result, t)
             if event == "shot" and result == "made":
                 # Through zones.points_for_shot, which simulation/box_score.py also calls, so
                 # the trained score feature and the box score cannot drift apart.
@@ -224,6 +298,8 @@ class GameStateScan:
         poss_clock = t - self.poss_start
         if boundary is not None:
             self.poss_start = t
+            if boundary == POSSESSION_END:
+                self.poss_ends += 1
 
         return (self.home_pts - self.away_pts,
                 self.home_pts + self.away_pts,
@@ -350,10 +426,13 @@ def game_state_projections(inputs: dict) -> list:
 #
 #     python -m models.game_state_features --seasons 2003,2013,2023
 
-# NBA pace has ranged roughly 89-101 possessions per team per game across the 21 cleaned seasons
-# (slowest in the mid-2010s, fastest in the early 2020s). A derivation landing outside this band
-# is not a pace observation -- it means the rule is counting the wrong rows.
-PACE_GATE = (85.0, 108.0)
+# How far the derived count may sit from the box-score formula on the same file, in possessions
+# per team per game. The two measure the same quantity by different routes -- one walks the event
+# stream, the other is FGA - OREB + TOV + 0.44*FTA -- so they should agree closely; the 0.44
+# coefficient is itself an approximation of free-throw trips, which is most of the slack here.
+# A gate against published pace was the first attempt and was worse: those figures are normalized
+# per 48 minutes and exclude playoffs, so the band had to be loose enough to hide real errors.
+PACE_TOLERANCE = 3.0
 
 
 def _percentile(values, q):
@@ -365,29 +444,44 @@ def _percentile(values, q):
 
 
 def _scan_season(path):
-    """Per-game possession counts and per-possession durations for one cleaned season file."""
+    """Per-game possession counts, durations, and the formula's estimate, for one season file."""
     import pandas as pd
 
     df = pd.read_csv(path)
     per_game_ends, lengths, clipped, rows = [], [], 0, 0
     for _, game in df.groupby("game_id", sort=False):
-        records = game.to_dict("records")
         scan = GameStateScan()
-        ends = 0
-        for row in records:
+        before = 0
+        for row in game.to_dict("records"):
             *_, clock = scan.step(row)
             rows += 1
             if clock > 24.0:
                 clipped += 1
-            event = _norm(row.get("event"))
-            if event in _SKIP_EVENTS:
-                continue
-            if possession_boundary(event, _norm(row.get("type")),
-                                   _norm(row.get("result"))) == POSSESSION_END:
-                ends += 1
+            if scan.poss_ends != before:      # this row completed a possession
                 lengths.append(clock)
-        per_game_ends.append(ends)
-    return per_game_ends, lengths, clipped, rows
+                before = scan.poss_ends
+        per_game_ends.append(scan.poss_ends)
+    return per_game_ends, lengths, clipped, rows, _formula_possessions(df)
+
+
+def _formula_possessions(df) -> float:
+    """Possessions per team per game by the standard box-score estimate.
+
+    ``FGA - OREB + TOV + 0.44 * FTA`` -- the accepted approximation, and the only reference the
+    check needs that does not come from the rule being checked. Computed on the same file, so it
+    tracks era, pace and this data's own quirks; published pace figures are normalized per 48
+    minutes and exclude playoff games, so they are an anchor rather than a target. On 2022-23 this
+    lands at 99.4 against a published 99.2.
+    """
+    shots = df[df["event"] == "shot"]
+    fga = int((shots["type"] != "free throw").sum())
+    fta = int((shots["type"] == "free throw").sum())
+    rebounds = df[df["event"] == "rebound"]
+    oreb = int(rebounds["type"].isin(("offensive", "team offensive")).sum())
+    tov = int((df["event"] == "turnover").sum()) + int(
+        ((df["event"] == "foul") & (df["type"] == "offensive")).sum())
+    games = df["game_id"].nunique()
+    return (fga - oreb + tov + 0.44 * fta) / games / 2.0
 
 
 def _main(argv=None) -> int:
@@ -412,32 +506,32 @@ def _main(argv=None) -> int:
             print(f"WARNING: no cleaned file at {path}")
             continue
         print(f"scanning {label}: {path} ...", flush=True)
-        ends, lengths, clipped, n = _scan_season(path)
+        ends, lengths, clipped, n, formula = _scan_season(path)
         if not ends:
             failures.append(f"{label}: no games found")
             continue
         games = len(ends)
         per_team = sum(ends) / games / 2.0     # both teams' possessions end; pace is per team
-        rows.append((label, games, per_team,
+        rows.append((label, games, per_team, formula,
                      sum(lengths) / len(lengths) if lengths else float("nan"),
                      _percentile(lengths, 0.50), _percentile(lengths, 0.95),
                      100.0 * clipped / n if n else 0.0))
-        lo, hi = PACE_GATE
-        if not lo <= per_team <= hi:
+        if abs(per_team - formula) > PACE_TOLERANCE:
             failures.append(
-                f"{label}: {per_team:.1f} possessions per team per game, outside {lo}-{hi} "
-                "-- the boundary rule is counting the wrong rows")
+                f"{label}: {per_team:.1f} possessions per team per game against {formula:.1f} "
+                f"by the box-score formula, a gap of {per_team - formula:+.1f} "
+                f"(tolerance {PACE_TOLERANCE}) -- the boundary rule is counting the wrong rows")
 
     if not rows:
         print("Nothing scanned.")
         return 1
 
     print()
-    print(f"{'season':>8} {'games':>7} {'poss/team':>10} {'mean s':>8} {'p50 s':>7} "
-          f"{'p95 s':>7} {'>24s':>7}")
-    for label, games, per_team, mean, p50, p95, pct in rows:
-        print(f"{label:>8} {games:>7} {per_team:>10.1f} {mean:>8.1f} {p50:>7.1f} "
-              f"{p95:>7.1f} {pct:>6.1f}%")
+    print(f"{'season':>8} {'games':>7} {'poss/team':>10} {'formula':>8} {'gap':>6} "
+          f"{'mean s':>8} {'p50 s':>7} {'p95 s':>7} {'>24s':>7}")
+    for label, games, per_team, formula, mean, p50, p95, pct in rows:
+        print(f"{label:>8} {games:>7} {per_team:>10.1f} {formula:>8.1f} {per_team-formula:>+6.1f} "
+              f"{mean:>8.1f} {p50:>7.1f} {p95:>7.1f} {pct:>6.1f}%")
 
     print()
     if failures:
