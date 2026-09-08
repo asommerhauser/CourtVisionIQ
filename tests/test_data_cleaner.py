@@ -478,6 +478,47 @@ def test_a_timeout_from_an_unknown_team_is_dropped(tmp_path):
     assert cleaned[cleaned["event"] == "timeout"].empty
 
 
+def test_a_jump_ball_does_not_bind_a_side(tmp_path):
+    """A jump-ball row credits the team that WON the tip while naming one of the two jumpers.
+
+    The jumpers are opponents by definition, so about half the time the row pairs an away
+    player with the home abbreviation. Binding from it put both sides on one string in ~47% of
+    real games in every era, which dropped every timeout by the unbound team and labelled every
+    surviving one "home". The existing timeout tests bound from shot rows, so none of them
+    reached this path.
+
+    Here Frank is away and the tip went to LAL (home): the jump ball must bind nothing, leaving
+    the two shot rows to resolve LAL=home and BOS=away.
+    """
+    cleaned = _parse(tmp_path, [
+        {"event_type": "jump ball", "player": "Frank", "team": "LAL", "result": None},
+        {"event_type": "shot", "player": "Alice", "team": "LAL", "result": "made"},
+        {"event_type": "shot", "player": "Frank", "team": "BOS", "result": "missed"},
+        {"event_type": "timeout", "player": None, "team": "LAL", "type": "timeout: regular",
+         "result": None},
+        {"event_type": "timeout", "player": None, "team": "BOS", "type": "timeout: regular",
+         "result": None},
+    ])
+    tos = cleaned[cleaned["event"] == "timeout"]
+    assert list(tos["type"]) == ["home", "away"]
+    # The context columns fill in as each side resolves (null until then, never backfilled),
+    # so read the first resolved value of each rather than row 0.
+    assert cleaned["home_team"].dropna().iloc[0] == "LAL"
+    assert cleaned["away_team"].dropna().iloc[0] == "BOS"
+
+
+def test_the_two_sides_never_share_an_abbreviation(tmp_path):
+    """The guard behind the fix: a binding that would collapse the sides is refused."""
+    cleaned = _parse(tmp_path, [
+        # A malformed pair crediting one abbreviation to both sides. Home binds; away must not.
+        {"event_type": "shot", "player": "Alice", "team": "LAL", "result": "made"},
+        {"event_type": "shot", "player": "Frank", "team": "LAL", "result": "missed"},
+        {"event_type": "shot", "player": "Grace", "team": "BOS", "result": "missed"},
+    ])
+    assert cleaned["home_team"].dropna().iloc[0] == "LAL"
+    assert cleaned["away_team"].dropna().iloc[0] == "BOS"
+
+
 # ---------------------------------------------------------------------------
 # Team rebounds
 # ---------------------------------------------------------------------------
