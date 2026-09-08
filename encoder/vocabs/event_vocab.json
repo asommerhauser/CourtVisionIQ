@@ -11,7 +11,8 @@
     "turnover": 8,
     "block": 9,
     "foul": 10,
-    "substitution": 11
+    "substitution": 11,
+    "timeout": 12
   },
   "token_to_string": {
     "0": "PAD",
@@ -25,8 +26,9 @@
     "8": "turnover",
     "9": "block",
     "10": "foul",
-    "11": "substitution"
+    "11": "substitution",
+    "12": "timeout"
   },
-  "next_token": 12,
-  "frozen": true
+  "next_token": 13,
+  "frozen": false
 }

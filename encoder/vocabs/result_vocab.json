@@ -13,12 +13,11 @@
     "blocked": 10,
     "block": 11,
     "nothing": 12,
-    "steal": 13,
-    "free throw": 14,
-    "op": 15,
-    "substitution": 16,
-    "free throw op": 17,
-    "ejection": 18
+    "free throw": 13,
+    "op": 14,
+    "substitution": 15,
+    "free throw op": 16,
+    "ejection": 17
   },
   "token_to_string": {
     "0": "PAD",
@@ -34,13 +33,12 @@
     "10": "blocked",
     "11": "block",
     "12": "nothing",
-    "13": "steal",
-    "14": "free throw",
-    "15": "op",
-    "16": "substitution",
-    "17": "free throw op",
-    "18": "ejection"
+    "13": "free throw",
+    "14": "op",
+    "15": "substitution",
+    "16": "free throw op",
+    "17": "ejection"
   },
-  "next_token": 19,
-  "frozen": true
+  "next_token": 18,
+  "frozen": false
 }
