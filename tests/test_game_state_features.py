@@ -140,6 +140,14 @@ def _clock(rows):
     return list(gs.derive_game_state(rows)["poss_clock"])
 
 
+def _ends(rows):
+    """Possessions completed over ``rows`` -- what the pace check counts."""
+    scan = gs.GameStateScan()
+    for r in rows:
+        scan.step(r)
+    return scan.poss_ends
+
+
 def test_the_clock_runs_from_the_start_of_the_possession():
     rows = [
         _row("start", "start", 0.0),
@@ -186,14 +194,65 @@ def test_a_turnover_ends_the_possession():
     assert _clock(rows) == [14.0, 6.0]
 
 
-def test_a_made_free_throw_ends_the_possession():
+def test_a_made_free_throw_trip_ends_the_possession():
     rows = [
         _row("foul", "A1", 10.0, type="shooting 2pt", result="free throw"),
         _row("shot", "H1", 12.0, type="free throw", result="made"),
         _row("shot", "A2", 20.0, type="rim", result="missed"),
     ]
-    # The foul leaves the possession running; the made free throw ends it.
+    # The foul leaves the possession running; the trip ends it, at the made attempt's time.
     assert _clock(rows) == [10.0, 12.0, 8.0]
+
+
+def test_a_two_shot_trip_is_one_possession_not_two():
+    rows = [
+        _row("foul", "A1", 10.0, type="shooting 2pt", result="free throw"),
+        _row("shot", "H1", 12.0, type="free throw", result="made"),
+        _row("shot", "H1", 15.0, type="free throw", result="made"),
+        _row("shot", "A2", 22.0, type="rim", result="missed"),
+    ]
+    # Ending on each made attempt counted the trip twice and read the second at ~0. The trip
+    # resolves once, at the LAST made attempt, so the next possession is 22 - 15 = 7s along.
+    assert _clock(rows) == [10.0, 12.0, 15.0, 7.0]
+    assert _ends(rows) == 1
+
+
+def test_an_and_one_does_not_end_the_possession_twice():
+    rows = [
+        _row("shot", "H1", 10.0, type="rim", result="made"),
+        _row("foul", "A1", 10.0, type="shooting 2pt", result="free throw"),
+        _row("shot", "H1", 14.0, type="free throw", result="made"),
+        _row("shot", "A2", 20.0, type="rim", result="missed"),
+    ]
+    # The basket already ended it, so the foul and the bonus shot are measured from the basket
+    # (0s and 4s), and the away team's next possession is dated from the basket too: 10s, not
+    # the 6s it would read if the free throw had ended the possession a second time.
+    assert _ends(rows) == 1
+    assert _clock(rows) == [10.0, 0.0, 4.0, 10.0]
+
+
+def test_a_technical_trip_leaves_the_ball_where_it_was():
+    rows = [
+        _row("shot", "H1", 5.0, type="rim", result="missed"),
+        _row("rebound", "H2", 7.0, type="offensive", result="null"),
+        _row("foul", "A1", 10.0, type="technical", result="free throw"),
+        _row("shot", "H1", 12.0, type="free throw", result="made"),
+        _row("shot", "H3", 18.0, type="rim", result="missed"),
+    ]
+    # The shooting team keeps the ball and the shot clock resumes, so the possession that
+    # started at the offensive rebound is still running: 18 - 7 = 11s.
+    assert _ends(rows) == 0
+    assert _clock(rows) == [5.0, 7.0, 3.0, 5.0, 11.0]
+
+
+def test_a_take_foul_trip_leaves_the_ball_where_it_was():
+    rows = [
+        _row("foul", "A1", 10.0, type="personal take", result="free throw op"),
+        _row("shot", "H1", 12.0, type="free throw", result="made"),
+        _row("shot", "H2", 18.0, type="rim", result="missed"),
+    ]
+    assert _ends(rows) == 0
+    assert _clock(rows) == [10.0, 12.0, 18.0]
 
 
 def test_a_missed_free_throw_leaves_the_rebound_to_decide():
@@ -238,7 +297,6 @@ def test_the_boundary_rule_classifies_each_cleaned_row_shape():
     end, reset = gs.POSSESSION_END, gs.POSSESSION_RESET
     cases = [
         (("shot", "paint", "made"), end),
-        (("shot", "free throw", "made"), end),
         (("turnover", "steal", "cop"), end),
         (("rebound", "defensive", "cop"), end),
         (("rebound", "team defensive", "cop"), end),
@@ -247,6 +305,9 @@ def test_the_boundary_rule_classifies_each_cleaned_row_shape():
         (("rebound", "team offensive", "null"), reset),
         (("shot", "paint", "missed"), None),
         (("shot", "paint", "blocked"), None),
+        # Free throws are resolved by the trip, not the row -- three cases say a made one does
+        # not end a possession, and none is visible here. See GameStateScan._resolve_free_throws.
+        (("shot", "free throw", "made"), None),
         (("shot", "free throw", "missed"), None),
         (("block", "paint", "block"), None),
         (("assist", "paint", "score"), None),
