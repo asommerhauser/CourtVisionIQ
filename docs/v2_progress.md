@@ -93,7 +93,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | — | **Gate B — the re-clean + vocab rebuild** | 2 | | [ ] | |
 | 9 | `feature/shared-backbone` | 3 | §9 pre | [x] | b9ff4ea |
 | 10a | `feature/local-attention` | 3 | §9 | [x] | f402341 |
-| 10b | `feature/possession-clock` | 3 | §9 | [~] | 53224b3 |
+| 10b | `feature/possession-clock` | 3 | §9 | [x] | bfb52c1 |
 | — | `fix/jump-ball-team-binding` | 2 | — | [x] | fac7095 |
 | 11 | `feature/rotation-model` | 3 | §8 | [ ] | |
 | 12 | `feature/training-changes` | 3 | §10 | [ ] | |
@@ -709,9 +709,31 @@ The measurement entry point follows the `python -m zones` pattern — a cheap TF
 **Possessions per game not near ~95–105 means the reset rule is wrong**, and it is the only
 independent check this feature has before the train.
 
-**Result:**
+**Result:** 26 passed on `test_game_state_features.py`. The pace check **failed on its first
+real run and found a genuine error** - 104.0 / 103.2 / 109.4 possessions per team per game
+against 93.9 / 94.2 / 99.4 by the box-score formula on the same files, ~12% high in every era.
+Fixed on `fix/free-throw-possessions`; now 94.1 / 94.6 / 99.2 against 93.9 / 94.2 / 99.4, gaps
+of +0.2 / +0.4 / -0.2, with 2022-23 landing on the published 99.2 exactly. Mean possession
+13.0-13.4s, median 13-14s. Full suite still to run as part of the Gate B re-verification.
 
-**Notes:**
+**Notes:** See correction M for the free-throw decomposition. The short version: the spec's
+rule ("reset on a change of possession or an offensive rebound") is right about live play and
+silent about free throws, and free throws turned out to be the entire error.
+
+**The gate mattered more than the feature.** The rule passed 26 unit tests and every scenario I
+could think to write, and was still 12% wrong. What caught it was one number with an
+independent source. The gate itself then had to be fixed too: it first compared against a band
+drawn from published pace, which is normalized per 48 minutes and excludes playoffs, so the
+band had to be loose enough to hide real errors - 109.4 only just failed it, and 104.0 passed.
+It now compares against `FGA - OREB + TOV + 0.44*FTA` on the same file: the same quantity by an
+independent route, self-calibrating across eras, tolerance 3.
+
+`GameStateScan` gained a `poss_ends` counter so the check counts the same events the clock
+resets on, by construction rather than through a second copy of the rule in the diagnostic.
+
+Three of my test expectations were wrong against correct code during this branch (the period
+anchor, the and-1 timing, and the first free-throw case). Each is now pinned by a test that
+states the reasoning rather than just the number.
 
 ### 11. `feature/rotation-model` — §8, full version
 
@@ -981,6 +1003,26 @@ abbreviations, so correction J's work is unaffected - which is why its counts ma
 in the suite reached the jump-ball path. This is the case for Gate B's step 4 existing at all -
 no unit test was going to find it, and a spot-check against a known real-world quantity did.
 
+**M. §9's possession-clock rule is silent about free throws, and free throws were the whole
+error.** The spec says the clock resets "on a change of possession or an offensive rebound",
+which is right for live play. Reading a made free throw as a change of possession - the obvious
+reading, since the cleaner normalizes free throws under `shot` - over-counted possessions by
+12% in every era. Three causes, each measured over the 2022-23 file, together 4.38 per team per
+game against a 4.3 residual:
+
+| | per team per game |
+|---|---|
+| a two-shot trip ended on each made attempt, counting twice | ~5.7 |
+| an and-1 ended it again, after the made basket that drew the foul already had | 3.52 |
+| a technical, flagrant or take foul ended it at all, when the shooting team keeps the ball | 0.86 |
+
+None of the three is visible in a single row, so `possession_boundary` no longer decides free
+throws. `GameStateScan` carries the open trip: the foul row records whether it retains
+possession and whether it followed a made basket, each made attempt records its time, and the
+trip resolves on the first row that is not one of its own free throws. That needs no
+`num`/`outof` index - which the cleaned data does not carry, and which §4 deferred to v3 - and
+it dates the next possession from the LAST made attempt rather than the first.
+
 ---
 
 ## Log
@@ -1000,4 +1042,5 @@ Append one line per merge. Newest last.
 | 2026-09-07 | `feature/shared-backbone` | b9ff4ea | layer-name diff clean; correction G closed; workstream 10 split into 10a/10b |
 | 2026-09-07 | `feature/local-attention` | f402341 | 663 green; switch-off parity pinned; ARCH_KEYS entry added (correction K) |
 | 2026-09-07 | `fix/jump-ball-team-binding` | fac7095 | Gate B found it: ~47% of games bound both sides to one abbreviation (correction L) |
-| 2026-09-07 | `feature/possession-clock` | 53224b3 | **tests not yet run** - merged so one clean can settle data, arrays and code together |
+| 2026-09-07 | `feature/possession-clock` | 53224b3 | merged ahead of its run so one clean could settle data, arrays and code together |
+| 2026-09-07 | `fix/free-throw-possessions` | bfb52c1 | pace gate caught a 12% over-count; free throws resolve by trip now (correction M) |
