@@ -246,10 +246,19 @@ class LineupScan:
 # --- Sub decisions ---
 # =====================
 #
-# The sub-decision head is asked one question, at dead balls only: per team, how many
-# substitutions follow before the ball is live again. Both halves of that -- WHERE it is asked
-# and WHAT the answer is -- have to be read off cleaned rows, because the dead ball is a
-# controller concept that section 2 deliberately never writes into the data.
+# The sub-decision head is asked one question, and only where the rules permit a substitution:
+# per team, how many follow before play resumes. Both halves -- WHERE it is asked and WHAT the
+# answer is -- come off cleaned rows, because substitution eligibility is nowhere in the data.
+#
+# The eligibility rule is NBA Rule 3, Section V, not a guess. It is narrower than the dead-ball
+# state section 2 tracks, and the difference matters: clause 10 forbids a substitution after a
+# made field goal ANYWHERE in the game, while the clock stops after one late in a period. Dead
+# ball and "may substitute" are two predicates, and conflating them adds ~24 opportunities a
+# game at which no substitution is legal.
+#
+# Asking only where a substitution is legal is also what lets the head learn the right RATE.
+# Over every row the rate is ~1%, and the head would learn that substitutions are rare; over
+# legal opportunities it is ~24%, which is the real answer to "does anyone come off here".
 
 # How many substitutions the head distinguishes. Three is "three or more": beyond that the count
 # stops mattering and the tail is thin.
@@ -267,13 +276,12 @@ def dead_ball_after(event: str, etype: str, result: str, *,
                     period_idx: int, seconds_left: float, ends_free_throws: bool) -> bool:
     """Whether the ball is dead after this cleaned row -- the data-side reading of section 2.
 
-    Mirrors the table in ``docs/v2_planned_changes.md`` §2 and the assignments in
-    ``GameController``: dead after any foul, a non-steal turnover, a made last free throw, a team
-    rebound, a timeout or a period boundary, and after a made basket only when the clock stops.
-    Live after a missed or blocked shot, a live rebound, a steal, and a missed last free throw.
+    Dead after any foul, a non-steal turnover, a made last free throw, a team rebound, a timeout
+    or a period boundary, and after a made basket when the clock stops. Live after a missed or
+    blocked shot, a live rebound, a steal, and a missed last free throw.
 
-    ``ends_free_throws`` says this row is the last attempt of its trip, which a single row cannot
-    know -- :class:`SubDecisionScan` resolves it the way ``GameStateScan`` resolves possessions.
+    This is the CLOCK notion, which is what timeouts and the play-boundary logic want. It is not
+    the same as :func:`can_substitute`, and the two part company on exactly one row type.
     """
     if event in ("foul", "timeout"):
         return True
@@ -292,25 +300,63 @@ def dead_ball_after(event: str, etype: str, result: str, *,
     return False
 
 
-def derive_sub_decisions(rows) -> dict[str, np.ndarray]:
-    """Per-row ``(dead_ball, subs_home, subs_away)`` for one game's ordered rows.
+def can_substitute(event: str, etype: str, result: str, *, ends_free_throws: bool) -> bool:
+    """Whether NBA Rule 3, Section V permits a substitution after this cleaned row.
 
-    ``dead_ball`` is 1.0 where the head may be asked -- a dead ball on a row that is not itself a
-    substitution. ``subs_home`` / ``subs_away`` count the substitutions in the run that
-    immediately follows, clipped at ``SUB_COUNT_CLASSES - 1`` because past three the count stops
-    mattering and the tail is thin.
+    Quoting the rule, because the difference from :func:`dead_ball_after` is one clause and it is
+    easy to lose:
 
-    Reading the count off the following run needs no dead-ball notion at all and is exact. The
-    dead-ball mask is the part that has to mirror the controller, and it exists so the head is
-    never asked anywhere it did not learn -- the same discipline §10 applies to the event and
-    time heads.
+      * clause 10 -- "No substitutes may enter the game after a successful field goal by either
+        team, unless the ball is dead due to a personal foul, technical foul, timeout, infection
+        control or violation." **There is no last-two-minutes exception**; the exception that
+        does exist there (clause 8) governs how long a substitute has to report, not whether he
+        may. So a made field goal is never a substitution opportunity, even where the clock stops.
+      * clause 9 -- substitutes enter "prior to the final free throw attempt if the ball will
+        remain in play or following the final free throw attempt if it will not". A missed last
+        attempt leaves the ball live, so its window sits before it; in an event stream that is
+        the foul which awarded the trip, an opportunity in its own right. What is left to
+        recognise here is the made last attempt, whose window is after it.
+
+    Everything else follows the dead ball: any foul, a timeout, a violation or other non-steal
+    turnover, a team rebound (the ball went out). Live play -- a live rebound, a steal, a missed
+    or blocked shot -- is never a substitution opportunity. A period boundary is one, and the
+    caller adds it, since a single row cannot see the boundary.
+
+    There is deliberately no possession condition. Rule 3 has none: after a defensive rebound
+    neither team may substitute, because the ball is live, not because of who holds it.
     """
-    from models.game_state_features import _period_end, _period_index
+    if event in ("foul", "timeout"):
+        return True
+    if event == "turnover":
+        return etype not in _LIVE_TURNOVER_TYPES
+    if event == "rebound":
+        return etype in _DEAD_REBOUND_TYPES
+    if event == "shot" and etype == "free throw":
+        return ends_free_throws and result == "made"
+    return False            # clause 10, and every live-ball row
+
+
+def derive_sub_decisions(rows) -> dict[str, np.ndarray]:
+    """Per-row ``(can_sub, subs_home, subs_away)`` for one game's ordered rows.
+
+    ``can_sub`` is 1.0 where Rule 3 permits a substitution -- the positions the head trains on,
+    and the only ones the controller asks about. ``subs_home`` / ``subs_away`` are how many
+    substitutions that opportunity produced per side, capped at ``SUB_COUNT_CLASSES - 1``.
+
+    **Substitutions are attributed to an opportunity, not to the row above them.** They have to
+    be: 13.8% of substitution runs sit at a clock where no row is a legal opportunity, because
+    the raw file appends a stoppage's substitutions after the play that drew the whistle rather
+    than at the moment they happened. Attributing by position would drop those from the target
+    and teach the head a rate well below the truth. Each run is credited to the nearest preceding
+    opportunity instead, so every substitution is counted and every count lands somewhere the
+    controller will actually ask.
+    """
+    from models.game_state_features import _period_index
 
     rows = list(rows)
     n = len(rows)
     out = {k: np.zeros((n,), dtype=np.float32)
-           for k in ("dead_ball", "subs_home", "subs_away")}
+           for k in ("can_sub", "subs_home", "subs_away")}
 
     events = [_norm_str(r.get("event")) for r in rows]
     times = [float(r.get("time") or 0.0) for r in rows]
@@ -326,47 +372,40 @@ def derive_sub_decisions(rows) -> dict[str, np.ndarray]:
     for i, row in enumerate(rows):
         if events[i] == "substitution":
             continue
-        t = times[i]
-        period = _period_index(t)
-        dead = dead_ball_after(
-            events[i], _norm_str(row.get("type")), _norm_str(row.get("result")),
-            period_idx=period, seconds_left=_period_end(t) - t, ends_free_throws=ends_trip[i],
-        )
-        home = away = 0
+        legal = can_substitute(events[i], _norm_str(row.get("type")),
+                               _norm_str(row.get("result")), ends_free_throws=ends_trip[i])
+        # A period boundary is an opportunity however the period ended. The lookahead skips the
+        # substitution run to find it: the buzzer's substitutions carry the buzzer's own
+        # timestamp, so the very next row shows no period change at all.
         nxt = i + 1
         while nxt < n and events[nxt] == "substitution":
-            if _as_int(rows[nxt].get("home/away")) == 1:
+            nxt += 1
+        if nxt < n and _period_index(times[nxt]) != _period_index(times[i]):
+            legal = True
+        out["can_sub"][i] = 1.0 if legal else 0.0
+
+    cap = SUB_COUNT_CLASSES - 1
+    i = 0
+    while i < n:
+        if events[i] != "substitution":
+            i += 1
+            continue
+        start = i
+        home = away = 0
+        while i < n and events[i] == "substitution":
+            if _as_int(rows[i].get("home/away")) == 1:
                 home += 1
             else:
                 away += 1
-            nxt += 1
-
-        # A period boundary is a dead ball however the last play of the period ended. The
-        # lookahead has to skip the substitution run to find it: the buzzer's substitutions carry
-        # the buzzer's own timestamp, so comparing against the very next row sees no period
-        # change at all.
-        if nxt < n and _period_index(times[nxt]) != period:
-            dead = True
-
-        # A substitution that follows is itself proof the ball was dead, whatever the previous
-        # row was, and it has to be taken as such: measured over 400 games of 2022-23, **19.4% of
-        # substitutions follow a row the rule alone calls live**, a third of them a MISSED last
-        # free throw -- which cannot be, since that ball is live for the rebound. The raw file
-        # appends a stoppage's substitutions after the play that drew the whistle rather than at
-        # the moment they happened, and the cleaner preserves that order, so the preceding row is
-        # not a reliable witness to the game state.
-        #
-        # Taking the union rather than trusting the rule is the safe direction: every real
-        # substitution lands in the target, and the positions the controller actually asks about
-        # are a subset of the ones trained on. Trusting the rule would drop a fifth of all
-        # substitutions from the target and bias the head toward predicting none.
-        if home or away:
-            dead = True
-        out["dead_ball"][i] = 1.0 if dead else 0.0
-
-        cap = SUB_COUNT_CLASSES - 1
-        out["subs_home"][i] = min(home, cap)
-        out["subs_away"][i] = min(away, cap)
+            i += 1
+        # Credit the run to the nearest preceding opportunity. The opening lineup has none before
+        # it; SubstitutionModel synthesises that separately and it is not this head's question.
+        j = start - 1
+        while j >= 0 and not out["can_sub"][j]:
+            j -= 1
+        if j >= 0:
+            out["subs_home"][j] = min(out["subs_home"][j] + home, cap)
+            out["subs_away"][j] = min(out["subs_away"][j] + away, cap)
     return out
 
 

@@ -23,6 +23,7 @@ from models.rotation_features import (
     LineupScan,
     _fold_subs,
     _scan_game,
+    can_substitute,
     dead_ball_after,
     derive_lineup_state,
     derive_sub_decisions,
@@ -370,17 +371,52 @@ def test_the_dead_ball_rule_matches_the_table_in_section_2():
     assert dead_ball_after("rebound", "team defensive", "cop", **early)
     assert not dead_ball_after("rebound", "defensive", "cop", **early), "a live board"
     assert not dead_ball_after("shot", "rim", "missed", **early)
-    # A made basket stops the clock only late in the period.
+    # The clock stops after a made basket only late in the period.
     assert not dead_ball_after("shot", "rim", "made", **early)
     assert dead_ball_after("shot", "rim", "made", **late)
+    # Mid-trip a free throw leaves the ball dead: the shooter simply shoots again.
+    assert dead_ball_after("shot", "free throw", "missed",
+                           period_idx=0, seconds_left=400.0, ends_free_throws=False)
 
 
-def test_a_free_throw_is_dead_until_the_trip_is_over():
-    mid = dict(period_idx=0, seconds_left=400.0, ends_free_throws=False)
-    last = dict(period_idx=0, seconds_left=400.0, ends_free_throws=True)
-    assert dead_ball_after("shot", "free throw", "missed", **mid), "he shoots again"
-    assert dead_ball_after("shot", "free throw", "made", **last)
-    assert not dead_ball_after("shot", "free throw", "missed", **last), "live for the rebound"
+def test_a_made_field_goal_is_a_dead_ball_but_never_a_substitution_opportunity():
+    """NBA Rule 3 Section V clause 10, which has no last-two-minutes exception.
+
+    The one row type where the clock notion and the substitution notion part company. Conflating
+    them adds ~24 opportunities a game at which no substitution is legal.
+    """
+    assert dead_ball_after("shot", "rim", "made",
+                           period_idx=3, seconds_left=30.0, ends_free_throws=True)
+    assert not can_substitute("shot", "rim", "made", ends_free_throws=True)
+
+
+def test_the_substitution_rule_permits_exactly_what_clause_10_allows():
+    """Clause 10 names the exceptions: personal foul, technical foul, timeout, violation."""
+    assert can_substitute("foul", "personal", "free throw", ends_free_throws=True)
+    assert can_substitute("foul", "technical", "free throw", ends_free_throws=True)
+    assert can_substitute("timeout", "home", "none", ends_free_throws=True)
+    assert can_substitute("turnover", "violation", "cop", ends_free_throws=True)
+    assert can_substitute("rebound", "team defensive", "cop", ends_free_throws=True)
+    # Live play is never an opportunity, whoever has the ball.
+    assert not can_substitute("turnover", "steal", "cop", ends_free_throws=True)
+    assert not can_substitute("shot", "rim", "missed", ends_free_throws=True)
+
+
+def test_there_is_no_possession_condition_on_substituting():
+    """Rule 3 has none. After a defensive rebound neither team may substitute -- because the
+    ball is live, not because of who holds it."""
+    for side in ("defensive", "offensive"):
+        assert not can_substitute("rebound", side, "cop", ends_free_throws=True)
+
+
+def test_the_free_throw_window_follows_clause_9():
+    """Substitutes enter prior to the final attempt if the ball will remain in play, or after it
+    if it will not."""
+    assert can_substitute("shot", "free throw", "made", ends_free_throws=True)
+    # A missed last attempt leaves the ball live, so clause 9 puts its window BEFORE it -- which
+    # in an event stream is the foul that awarded the trip.
+    assert not can_substitute("shot", "free throw", "missed", ends_free_throws=True)
+    assert not can_substitute("shot", "free throw", "made", ends_free_throws=False)
 
 
 def test_the_target_counts_the_substitution_run_that_follows_per_side():
@@ -391,11 +427,11 @@ def test_the_target_counts_the_substitution_run_that_follows_per_side():
         _row(320),
     ]
     out = derive_sub_decisions(rows)
-    assert out["dead_ball"][1] == 1.0
+    assert out["can_sub"][1] == 1.0
     assert out["subs_home"][1] == 1.0
     assert out["subs_away"][1] == 2.0
     # The substitution rows themselves are never query positions.
-    assert out["dead_ball"][2] == 0.0
+    assert out["can_sub"][2] == 0.0
 
 
 def test_the_count_is_capped_at_the_last_class():
@@ -407,24 +443,29 @@ def test_the_count_is_capped_at_the_last_class():
     assert out["subs_home"][1] == SUB_COUNT_CLASSES - 1
 
 
-def test_a_substitution_run_makes_its_position_a_query_position():
-    """The rule alone calls a missed last free throw live, and it is -- but 19.4% of real
-    substitutions follow one, because the raw file appends a stoppage's substitutions after the
-    play that drew the whistle. Trusting the rule would drop a fifth of them from the target."""
+def test_substitutions_are_credited_to_an_opportunity_not_to_the_row_above_them():
+    """13.8% of substitution runs sit where no row is a legal opportunity, because the raw file
+    appends a stoppage's substitutions after the play that drew the whistle. Attributing by
+    position would drop those from the target and teach a rate well below the truth."""
     rows = [
         _row(0, event="start", player="start"),
+        _row(200, event="foul", player="Bob", etype="personal", result="free throw"),
         _row(300, event="shot", player="Frank", etype="free throw", result="missed"),
         _sub(300, "home"),
         _row(320),
     ]
     out = derive_sub_decisions(rows)
-    assert out["dead_ball"][1] == 1.0
+    # The missed last free throw is live, so it is not an opportunity ...
+    assert out["can_sub"][2] == 0.0
+    assert out["subs_home"][2] == 0.0
+    # ... and the substitution is credited back to the foul, which is one.
+    assert out["can_sub"][1] == 1.0
     assert out["subs_home"][1] == 1.0
 
 
-def test_a_live_row_with_no_substitutions_is_not_a_query_position():
+def test_a_live_row_is_never_a_query_position():
     rows = [_row(0, event="start", player="start"),
             _row(300, event="shot", player="Alice", etype="rim", result="missed"),
             _row(320)]
     out = derive_sub_decisions(rows)
-    assert out["dead_ball"][1] == 0.0
+    assert out["can_sub"][1] == 0.0

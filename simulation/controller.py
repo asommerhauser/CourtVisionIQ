@@ -172,6 +172,15 @@ class GameController:
         # after a made basket, a live steal and a live offensive rebound as equally substitutable,
         # which is why rotations landed at the wrong moments. Starts True (pre-tip).
         self.ball_dead: bool = True
+        # Whether NBA Rule 3, Section V permits a substitution right now. NOT the same as
+        # ball_dead, and the gap is one clause: clause 10 forbids a substitution after a made
+        # field goal by either team, with no last-two-minutes exception, while the clock does
+        # stop after one late in a period. So a made basket is a dead ball -- timeouts may be
+        # called, the play boundary is real -- and never a substitution opportunity.
+        # models.rotation_features.can_substitute is the same rule on the data side, and labels
+        # the positions the rotation heads are trained on. The two must agree or the heads are
+        # asked a question they did not learn.
+        self.can_sub: bool = True
         self.finished: bool = False
 
         # --- Minutes / rotation bookkeeping (the model never sees these) ---
@@ -234,6 +243,7 @@ class GameController:
                                        greedy_starters=True, season_context=season_context)
         self.possession = possession
         self.ball_dead = False              # the opening tip puts the ball in play
+        self.can_sub = False                # ... and no substitution window with it
         # Rebuild from this game's rosters, now that the simulator has been seeded.
         self._build_team_map(home_full, away_full)
         # Every starter begins a stint at tip-off (clock 0); used by the fatigue nudge.
@@ -353,6 +363,7 @@ class GameController:
             self._score(offense, points_for_shot(stype))
             self.possession = self._other(offense)      # made FG → other team inbounds
             self.ball_dead = self._made_basket_stops_clock()
+            self.can_sub = False        # clause 10: never after a made field goal
         elif result == "blocked":
             # Block → the shot is a missed FGA; the blocker is an opposing on-court player and
             # the block row carries the blocked shooter as secondary_player (data_cleaner.py:285).
@@ -362,9 +373,11 @@ class GameController:
             self._append("block", blocker, stype, "block", secondary=shooter)
             self.pending_rebound = True
             self.ball_dead = False          # the ball is live for the rebound
+            self.can_sub = False
         else:  # missed
             self.pending_rebound = True
             self.ball_dead = False
+            self.can_sub = False
 
     def _shot_result_bias(self, offense: str, zone: str | None = None) -> dict[str, float] | None:
         """Per-shot result-logit bias: SHOT_RESULT_BIAS, the zone override, and the home nudge.
@@ -409,6 +422,7 @@ class GameController:
         self._score(offense, points_for_shot(atype))
         self.possession = self._other(offense)
         self.ball_dead = self._made_basket_stops_clock()
+        self.can_sub = False            # clause 10: never after a made field goal
 
     def _do_turnover(self, delta: float) -> None:
         """Turnover by the offense; a steal is encoded as two rows (data_cleaner.py:343)."""
@@ -426,9 +440,11 @@ class GameController:
             # ONE row: the ball-loser acts, the stealer rides in secondary_player (data_cleaner).
             self._append("turnover", committer, "steal", "cop", secondary=stealer)
             self.ball_dead = False       # a steal is live — the defense is already going
+            self.can_sub = False
         else:
             self._append("turnover", committer, ttype, "cop")
             self.ball_dead = True        # whistle: out of bounds, travel, offensive foul
+            self.can_sub = True          # a violation is one of clause 10's exceptions
         self.possession = self._other(offense)
 
     def _timeouts_available(self, team: str) -> int:
@@ -465,6 +481,7 @@ class GameController:
         self._append(TIMEOUT_EVENT, "none", team, "none")
         self.timeouts_left[team] -= 1
         self.ball_dead = True
+        self.can_sub = True
 
     def _do_rebound(self, delta: float) -> None:
         """Resolve a rebound after a miss: pick the off/def type, then the rebounder on that team.
@@ -489,6 +506,7 @@ class GameController:
             rebounder = "none"                         # nobody is credited; skip the pick
             self._advance_clock(delta)
             self.ball_dead = True                      # out of bounds: the ball is inbounded
+            self.can_sub = True
         else:
             five = self._offense_five() if offensive else self._defense_five()
             rebounder = self.sim.predict_player("rebound", five,
@@ -496,6 +514,7 @@ class GameController:
                                                 temperature=self.player_temp)
             self._advance_for("rebound", rebounder, delta)
             self.ball_dead = False                     # a live rebound: play continues
+            self.can_sub = False
 
         self._append("rebound", rebounder, rtype, "null" if offensive else "cop")
         if not offensive:                              # defensive board — possession flips
@@ -552,10 +571,15 @@ class GameController:
         let the substitution head pick the bench replacement. Foul-outs/ejections still pull
         players immediately elsewhere; this only governs ordinary rotation timing.
 
-        The dead-ball test is ``self.ball_dead``, not "no rebound pending" — the old proxy let
-        subs land after a live steal or an inbound following a made basket.
+        The test is ``self.can_sub``, not ``self.ball_dead`` and certainly not the pre-2.0 "no
+        rebound pending" proxy: a made field goal is a dead ball and is never a substitution
+        opportunity (Rule 3, Section V, clause 10).
+
+        Clause 4 -- a substitute may not replace a free-throw shooter -- needs no code here. A
+        foul and its whole trip resolve inside :meth:`_do_foul` before :meth:`_step` reaches the
+        rotation, so there is no point at which a substitution can land mid-trip.
         """
-        if not self.ball_dead or self.finished:
+        if not self.can_sub or self.finished:
             return
         for team in (HOME, AWAY):
             five = self._five_of(team)
@@ -581,7 +605,7 @@ class GameController:
         Fires only at a real dead ball and reuses the model's sub sampling — a starved team
         therefore waits for the next whistle rather than being subbed mid-play.
         """
-        if not self.ball_dead or self.finished:
+        if not self.can_sub or self.finished:
             return
         for team in (HOME, AWAY):
             if self.clock - self.last_sub_clock[team] <= self.sub_max_gap:
@@ -646,6 +670,7 @@ class GameController:
         self._append("foul", fouler, ftype, result, secondary=fouled)
         self._charge_foul(fouler, ftype)
         self.ball_dead = True          # every foul is a whistle; _free_throws may revive it
+        self.can_sub = True            # clause 10 names a personal/technical foul explicitly
 
         if ftype == "offensive":
             # Offensive foul = turnover: the offense loses the ball (no FTs). Only reachable from
@@ -724,6 +749,7 @@ class GameController:
         self._append("foul", fouler, ftype, "free throw", secondary=fouled)
         self._charge_foul(fouler, ftype)
         self.ball_dead = True          # whistle; _free_throws decides the state after the trip
+        self.can_sub = True
         self._count_team_foul(fouler_team)             # always a defensive team foul
         self._free_throws(fouled, shooting_team, n_ft, live_last=True, retain=False)
 
@@ -793,9 +819,11 @@ class GameController:
             self.possession = shooting_team           # missed last FT → live rebound for offense
             self.pending_rebound = True
             self.ball_dead = False                    # the miss is live
+            self.can_sub = False                      # clause 9 put the window before it
         else:
             self.possession = self._other(shooting_team)  # made last FT → other team inbounds
             self.ball_dead = True
+            self.can_sub = True                       # clause 9: the window is after it
 
     # ===================================================================== #
     # --- Clock / period / bonus bookkeeping                               --
@@ -825,6 +853,7 @@ class GameController:
             self.team_fouls = {HOME: 0, AWAY: 0}
             self.team_fouls_window = {HOME: 0, AWAY: 0}
             self.ball_dead = True           # a period break is a dead ball
+            self.can_sub = True             # ... and a substitution opportunity
             if period >= 4:                 # entering an overtime: two more timeouts each
                 for team in (HOME, AWAY):
                     self.timeouts_left[team] += TIMEOUTS_PER_OT
