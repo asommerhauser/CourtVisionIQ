@@ -380,7 +380,14 @@ class DataCleaner:
             elif event == "substitution":
                 out, inc = cols["left"][i], cols["entered"][i]
                 placed = False
-                if pd.notna(out) and pd.notna(inc):
+                # A substitution is only applicable if the outgoing player is on the floor and
+                # the incoming one is not. The second half is not pedantry: 2002-03 has rows like
+                # "Gerald Wallace out, Jim Jackson in" where Jim Jackson is already playing and
+                # the snapshot shows the real arrival was Doug Christie -- the `entered` column
+                # simply names the wrong man. Applied blindly it puts one player in two slots,
+                # and every later comparison is done by membership, so the five then grows to six
+                # and never recovers: 12 games in 2002-03, one of them for 148 rows.
+                if pd.notna(out) and pd.notna(inc) and inc not in run_home and inc not in run_away:
                     for five in (run_home, run_away):
                         if out in five:
                             five[five.index(out)] = inc
@@ -389,10 +396,9 @@ class DataCleaner:
                             placed = True
                             break
                 if not placed:
-                    # The row names a player who is not on the floor, so its pairing cannot be
-                    # trusted. Take the snapshot and describe the transition it implies; the
-                    # caller drops the raw pairing in favour of these, or the same change is
-                    # told twice, once wrongly.
+                    # The row contradicts the floor, so its pairing cannot be trusted. Take the
+                    # snapshot and describe the transition it implies; the caller drops the raw
+                    # pairing in favour of these, or the same change is told twice, once wrongly.
                     resync(run_home, here[0], "home", now_at, subs)
                     resync(run_away, here[1], "away", now_at, subs)
             else:

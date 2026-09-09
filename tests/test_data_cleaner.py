@@ -1076,6 +1076,30 @@ def test_a_lineup_that_loses_a_player_emits_a_substitution_with_no_incoming(tmp_
     assert len(_roster_list(cleaned.iloc[-2]["roster_home"])) == 4
 
 
+def test_a_substitution_naming_someone_already_on_the_floor_is_not_applied(tmp_path):
+    """2002-03 has rows like "Gerald Wallace out, Jim Jackson in" where Jim Jackson is already
+    playing, and the lineup shows the real arrival was Doug Christie -- the raw `entered` column
+    names the wrong man.
+
+    Applied blindly it puts one player in two slots. Every later comparison is by membership, so
+    the five then grows to six and never recovers: 12 games in 2002-03, one for 148 rows, which
+    the gate saw as a short-lineup rate five times the source's own.
+    """
+    rows = [
+        {"event_type": "substitution", "elapsed": "0:00:30",
+         "left": "Alice", "entered": "Bob", "h1": "Kate"},
+        {"event_type": "shot", "elapsed": "0:00:40", "player": "Bob", "h1": "Kate"},
+    ]
+    cleaned = _parse(tmp_path, rows)
+    for _, row in cleaned.iterrows():
+        five = _roster_list(row["roster_home"])
+        assert len(five) == len(set(five)), "no player may hold two slots"
+        assert len(five) == 5
+    sub = cleaned[cleaned["event"] == "substitution"].iloc[0]
+    assert sub["player"] == "Alice"
+    assert sub["secondary_player"] == "Kate", "the lineup says who actually came on"
+
+
 def test_player_names_are_trimmed_so_a_lineup_can_match_a_substitution(tmp_path):
     """2002-03 spells Nene as "Nene " in `entered` and "Nene" in the lineup columns.
 

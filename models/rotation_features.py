@@ -210,9 +210,14 @@ SUBS_PER_TEAM_LO, SUBS_PER_TEAM_HI = 15.0, 35.0
 # Rows a side is not five, as a percentage. The source itself omits one half of a handful of
 # substitutions a season -- four null ``entered`` and two null ``left`` in 2002-03, none at all
 # in 2022-23 -- and a lineup the data records as four cannot be repaired without inventing the
-# fifth player. So this is an allowance for a known data defect, kept tight enough that the
-# repair dropping players of its own would fail it.
-SHORT_LINEUP_PCT = 0.05
+# fifth player. So this is an allowance for a known data defect, not slack.
+#
+# Measured after the repair: 0.0021% in 2002-03, 0.0027% in 2012-13, 0.0000% in 2022-23, which
+# is the source's own 9 / 13 / 0 short rows carried a row or two further. The allowance is four
+# times the worst of those and no more. It was 0.05 first, calibrated on an 86-game slice, and
+# the full season came in at 0.0573% -- a real defect that a threshold set from a small sample
+# had very nearly waved through. Widening this is almost never the right response to a failure.
+SHORT_LINEUP_PCT = 0.01
 
 
 def _fold_subs(rows):
@@ -258,10 +263,10 @@ def _as_int(value, default=0) -> int:
 
 
 def _scan_game(rows):
-    """One game: (disagreeing rows, short-lineup rows, substitutions, played seconds, end clock)."""
+    """One game: (disagreeing, short, duplicated, substitutions, played seconds, end clock)."""
     scan = LineupScan()
     folded = _fold_subs(rows)
-    disagree = short = 0
+    disagree = short = duplicated = 0
     for i, row in enumerate(rows):
         scan.step(row)
         home = _roster(row.get("roster_home"))
@@ -270,8 +275,13 @@ def _scan_game(rows):
             disagree += 1
         if len(home) != ROSTER_SIZE or len(away) != ROSTER_SIZE:
             short += 1
+        # A player in two slots at once. Nothing in the raw data does this -- it is what a
+        # substitution applied against the wrong lineup produces, and because every comparison
+        # here is by membership it is invisible until the five silently grows to six.
+        if len(set(home)) != len(home) or len(set(away)) != len(away):
+            duplicated += 1
     subs = sum(1 for r in rows if _norm_str(r.get("event")) == "substitution")
-    return disagree, short, subs, scan.played, float(rows[-1].get("time") or 0.0)
+    return disagree, short, duplicated, subs, scan.played, float(rows[-1].get("time") or 0.0)
 
 
 def _scan_season(path):
@@ -279,7 +289,7 @@ def _scan_season(path):
 
     df = pd.read_csv(path, low_memory=False)
     games = rows_total = 0
-    disagree = short = subs = minute_failures = 0
+    disagree = short = duplicated = subs = minute_failures = 0
     starters, rotation = [], []
     for _, game in df.groupby("game_id", sort=False):
         rows = game.to_dict("records")
@@ -287,9 +297,10 @@ def _scan_season(path):
             continue
         games += 1
         rows_total += len(rows)
-        d, sh, s, played, end = _scan_game(rows)
+        d, sh, dup, s, played, end = _scan_game(rows)
         disagree += d
         short += sh
+        duplicated += dup
         subs += s
         # Ten players on the floor at every instant means total player-seconds is exactly ten
         # times the game's length -- an identity, not a band. It only holds where every lineup
@@ -302,7 +313,8 @@ def _scan_season(path):
         if len(ordered) >= 10:
             starters.extend(v / 60.0 for v in ordered[:10])
         rotation.append(sum(1 for v in played.values() if v >= 600.0) / 2.0)
-    return games, rows_total, disagree, short, subs, minute_failures, starters, rotation
+    return (games, rows_total, disagree, short, duplicated, subs, minute_failures,
+            starters, rotation)
 
 
 def _mean(values):
@@ -330,7 +342,7 @@ def _main(argv=None) -> int:
             print(f"WARNING: no cleaned file at {path}")
             continue
         print(f"scanning {label}: {path} ...", flush=True)
-        (games, rows_total, disagree, short, subs,
+        (games, rows_total, disagree, short, duplicated, subs,
          minute_failures, starters, rotation) = _scan_season(path)
         if not games:
             failures.append(f"{label}: no games found")
@@ -339,7 +351,7 @@ def _main(argv=None) -> int:
         per_team_subs = subs / games / 2.0
         short_pct = 100.0 * short / rows_total if rows_total else 0.0
         rows.append((label, games, per_game_disagree, per_team_subs, minute_failures,
-                     short_pct, _mean(starters), _mean(rotation)))
+                     short_pct, duplicated, _mean(starters), _mean(rotation)))
 
         if per_game_disagree > LINEUP_TOLERANCE:
             failures.append(
@@ -350,6 +362,10 @@ def _main(argv=None) -> int:
             failures.append(
                 f"{label}: {minute_failures} of {games} games have five a side throughout and "
                 f"still do not total ten players' minutes -- the scan is losing time somewhere")
+        if duplicated:
+            failures.append(
+                f"{label}: {duplicated} rows put one player in two slots at once -- a "
+                f"substitution has been applied against a lineup that did not match it")
         if short_pct > SHORT_LINEUP_PCT:
             failures.append(
                 f"{label}: {short_pct:.4f}% of rows carry a side that is not five "
@@ -366,10 +382,10 @@ def _main(argv=None) -> int:
 
     print()
     print(f"{'season':>8} {'games':>7} {'disagree/g':>11} {'subs/team':>10} {'min fails':>10} "
-          f"{'short %':>9} {'top10 min':>10} {'10+ min':>8}")
-    for label, games, disagree, subs, fails, short_pct, top10, depth in rows:
+          f"{'short %':>9} {'dup rows':>9} {'top10 min':>10} {'10+ min':>8}")
+    for label, games, disagree, subs, fails, short_pct, dup, top10, depth in rows:
         print(f"{label:>8} {games:>7} {disagree:>11.2f} {subs:>10.1f} {fails:>10} "
-              f"{short_pct:>9.4f} {top10:>10.1f} {depth:>8.1f}")
+              f"{short_pct:>9.4f} {dup:>9} {top10:>10.1f} {depth:>8.1f}")
     print()
     print("top10 min is the mean of each game's ten highest per-player minutes (starters plus "
           "the first bench unit); 10+ min is players per team over ten minutes. Neither is "

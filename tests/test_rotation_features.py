@@ -170,11 +170,23 @@ def test_folding_the_substitutions_reproduces_the_roster_snapshots():
         assert set(home) == set(row["roster_home"])
         assert set(away) == set(row["roster_away"])
 
-    disagree, short, subs, played, end = _scan_game(rows)
+    disagree, short, duplicated, subs, played, end = _scan_game(rows)
     assert disagree == 0
     assert short == 0
+    assert duplicated == 0
     assert subs == 1
     assert sum(played.values()) == pytest.approx(end * 10.0)
+
+
+def test_a_player_in_two_slots_is_caught():
+    """Nothing in the raw data does this; it is what a substitution applied against the wrong
+    lineup produces, and membership comparisons hide it until the five grows to six."""
+    rows = [
+        _row(0, event="start", player="start"),
+        _row(300, home=["Alice", "Bob", "Charlie", "Dave", "Alice"]),
+    ]
+    _, _, duplicated, *_ = _scan_game(rows)
+    assert duplicated == 1
 
 
 def test_a_lineup_change_with_no_substitution_row_is_caught():
@@ -198,6 +210,7 @@ def test_a_substitution_with_no_incoming_player_shrinks_the_fold_too():
              result="substitution", secondary="none", home=short_five),
         _row(600, home=short_five),
     ]
-    disagree, short, *_ = _scan_game(rows)
+    disagree, short, duplicated, *_ = _scan_game(rows)
     assert disagree == 0
+    assert duplicated == 0
     assert short == 2                              # the two rows a side is four
