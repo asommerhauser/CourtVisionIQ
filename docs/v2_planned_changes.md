@@ -420,6 +420,13 @@ are already plumbed and tested; 2.0 is the first train whose weights consume the
 end-game behavior comes from: leads held, trailing teams fouling, bonus-aware foul value. The only
 code touch is the `ZONE_POINTS` fix in [§3](#3-shot-zones).
 
+> **SUPERSEDED 2026-09-09 — the paragraph below was NOT built.** Clutch weighting was started
+> and dropped: the features it keys on are already model inputs, no train has ever consumed them,
+> so there is no evidence the model under-fits end-game — and the programme is scored on
+> box-score accuracy over whole games, where the great majority of every box score comes from
+> non-clutch rows. See `v2_progress.md` correction S and workstream 12. The rest of §10, the loss
+> masking, IS being built. Text kept as the record of what was planned.
+
 **Clutch weighting.** Rows that are close and late — `period_idx >= 3` and
 `period_time_left <= 300` and `abs(score_diff) <= 8` — count double in every head's loss. Start at
 2.0, not higher; `CLUTCH_LOSS_WEIGHT = 1.0` disables it, which makes an A/B against the same
@@ -436,6 +443,10 @@ play expansion** so the two cannot drift.
 than carried forward. Some of today's values are compensating for the masking artifact.
 
 **Next steps.**
+
+> The first four bullets are the clutch weighting and are **superseded** — see the banner above.
+> The last one (the test gap) still applies to the masking work.
+
 - New `apply_clutch(mask, split)` in `models/game_state_features.py`, as a sibling of
   `apply_recency` (`models/season_features.py:162`) — the single funnel all six heads already call.
 - Call it alongside `apply_recency` at the six `_make_dataset` sites: `event_time_model.py:685`,
@@ -459,11 +470,15 @@ than carried forward. Some of today's values are compensating for the masking ar
 **What it is.** Period-sliced box scores in the eval record and the report, plus a per-zone shot-mix
 diagnostic.
 
-**Why.** [§10](#10-training-changes) says to watch the per-quarter splits for clutch drift. They do
-not exist — every eval record is whole-game, with zero period-aware metrics anywhere in
-`simulation/`, `reporting/` or `evaluate.py`. Without them a Q1 pace or eFG regression from clutch
-weighting hides inside the season average. Build this **before** the train, so the train is
-measurable.
+**Why.** Every eval record is whole-game, with zero period-aware metrics anywhere in
+`simulation/`, `reporting/` or `evaluate.py` — nothing splits by quarter. Build this **before**
+the train, so the train is measurable.
+
+> **Updated 2026-09-09.** This section originally justified itself by §10's clutch weighting — watch
+> the splits for Q1 drift. That weighting was dropped, and the real reason is stronger: per-quarter
+> splits are the only way to see whether the model gets end-game basketball right at all, which is
+> also the evidence that would justify revisiting the weighting. The per-zone shot-mix half was
+> never about clutch.
 
 **How it works.** The per-game record carries period-sliced boxes alongside the whole-game one,
 using the same period constants `GameStateScan` uses. The report gains a per-quarter section that
@@ -491,7 +506,8 @@ nearly free.
    `encoder/vocabs/*.json` before rebuilding** — the vocabs are append-only and would otherwise keep
    the dead tokens. Run the [§3](#3-shot-zones) validation table against the re-clean.
 4. **Phase 3 — model.** Shared backbone builder first, then local heads, the shot-clock proxy, the
-   live-state and bench bundles, the `sub_decision` head, the clutch and boundary masks.
+   live-state and bench bundles, the `sub_decision` head, and the loss masks (boundary and
+   continuation; the clutch mask was dropped — see the banner in §10).
 5. **Controller consumers of the new tokens.** Zones, the free-throw token, team rebounds, timeouts
    and their budget, the fouled player as shooter, the rotation loop at dead balls.
 6. **Phase 4 — per-quarter eval.** Before the train.
@@ -510,15 +526,16 @@ Train 2's availability masking and capacity settings carry forward unchanged.
 - Zone validation table matches [§3](#3-shot-zones) in all three sampled eras.
 - Derived-vs-raw 3pt disagreement under 1% per season.
 
-**Post-train.** Per-zone make rates against the era table; the per-quarter section flat across
-Q1–Q3 (a Q1 regression means `CLUTCH_LOSS_WEIGHT` is too high); an A/B of `CLUTCH_LOSS_WEIGHT` 1.0
-vs 2.0 against the same preprocess; then the dial package from zero, re-keyed per zone.
+**Post-train.** Per-zone make rates against the era table; the per-quarter section read for the
+end-game behaviour the model actually produces; then the dial package from zero, re-keyed per
+zone. (The clutch A/B that stood here is gone with the weighting.)
 
 ## Risks
 
 - **Eleven workstreams land in one retrain and their effects confound.** Phase 1 is the one clean
-  measurement point. If the post-train result is ambiguous, the `CLUTCH_LOSS_WEIGHT = 1.0` A/B and
-  the local-attention config switch are the two cheap ablations available without a re-preprocess.
+  measurement point. If the post-train result is ambiguous, the local-attention config switch is
+  the **only** cheap ablation available without a re-preprocess — dropping clutch weighting removed
+  the other one, which makes this risk larger, not smaller.
 - **[§8](#8-a-rotation-model) and [§9](#9-local-context) are each large enough to be their own
   train.** Both have documented smaller versions; cutting either does not block the rest.
 - **Every dial fitted against full1/full2 is invalidated** by the vocab rebuild. Expect the first

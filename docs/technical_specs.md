@@ -632,7 +632,7 @@ reason. Ids below are the original theory ids; the doc is organized by feature.
 | S6 | Player age (external roster table) | The name-matching join is the real work |
 | S7 | Coach (rolling team style priors + coach embedding) | External table |
 | M1 | Game-state features (score / period / clock / team fouls) | Plumbing built and tested; needs a train that consumes it |
-| M2 | Clutch loss weighting | Rides the existing `sample_weight` masks |
+| M2 | ~~Clutch loss weighting~~ | **Dropped 2026-09-09** — see `v2_progress.md` correction S |
 | M3 | Recency / local-sequence bias in the backbone | Touches all 11 heads |
 | M4 | Play-boundary loss masking | 21.9% of event-head training positions never occur at inference |
 

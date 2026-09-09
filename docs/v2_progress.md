@@ -1144,6 +1144,13 @@ event stream.
 `tests/test_game_state_wiring.py` covers event_time, conditional_type, conditional_time and
 sub_decision but **not** `player` or `substitution`. Close that gap here.
 
+**A candidate for 12's independent number, already measured.** `docs/technical_specs.md` records
+M4 as "Play-boundary loss masking — **21.9% of event-head training positions never occur at
+inference**". That figure predates 2.0 and predates the substitution mask that is already in
+`EventTimeModel._make_dataset`, so it is not the answer — but re-deriving it against the current
+cleaned data gives the branch a number to move: how many rows the event head trains on that the
+controller never asks about, before and after. A masking change with no such number is unfalsifiable.
+
 **A re-preprocess is required** — and this is where the clean owed since correction Q should ride:
 
 ```bash
@@ -1177,8 +1184,14 @@ by dial changes — not game periods. Nothing anywhere splits by quarter.
 - `simulation/diagnostics.py:144` — per-zone shot-mix histogram in `compare_holdout`. It is a
   distribution comparison, not a per-player accuracy stat, so that is the right home.
 
-**Independent of everything else** — it can be pulled forward at any time at no cost if quarter
-splits would help read an earlier smoke run.
+**Why it matters more, not less, now that clutch weighting is dropped.** §11 motivated this as a
+way to watch for clutch-induced Q1 drift, and that reason is gone. The real one is stronger:
+per-quarter splits are the only way to see whether the model gets end-game basketball right at
+all — and that measurement is exactly the evidence that would justify revisiting the weighting
+later (correction S). Without it, "is end-game mis-modelled?" stays unanswerable. The per-zone
+shot-mix half was never about clutch either.
+
+**Independent of everything else** — it can be pulled forward at any time at no cost.
 
 **Verify**
 ```bash
@@ -1205,9 +1218,14 @@ python train.py --full --name full_train_3 --batch-size 64 --clean --rebuild-voc
 
 Train 2's availability masking and capacity settings carry forward unchanged.
 
-**Post-train:** per-zone make rates against the era table; the per-quarter section flat across Q1–Q3
-(a Q1 regression means `CLUTCH_LOSS_WEIGHT` is too high); an A/B of `CLUTCH_LOSS_WEIGHT` 1.0 vs 2.0
-against the same preprocess; then the dial package fitted from zero, re-keyed per zone.
+**Post-train:** per-zone make rates against the era table; the per-quarter section read for what
+end-game behaviour the model actually produces (does a trailing team foul, does it hunt threes);
+then the dial package fitted from zero, re-keyed per zone.
+
+The clutch A/B that used to sit here is gone with the weighting (correction S). **That leaves one
+cheap ablation, not two** — `LOCAL_ATTENTION_HEADS = 0` rebuilds the pre-2.0 graph exactly and is
+now the only knob A/B-able without a re-preprocess. Worth knowing before reading an ambiguous
+result: eleven workstreams land in this train and their effects confound.
 
 **Result:**
 
