@@ -131,7 +131,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | — | `fix/free-throw-possessions` | 3 | §9 | [x] | bfb52c1 |
 | 11a | `fix/roster-snapshot-flicker` | 3 | §8 | [x] | c9c1d2d |
 | 11b | `feature/lineup-state` | 3 | §8 | [x] | 4fa3713 |
-| 11c | `feature/bench-bundle` | 3 | §8 | [ ] | |
+| 11c | `feature/bench-bundle` | 3 | §8 | [~] | |
 | 11d | `feature/sub-decision-head` | 3 | §8 | [ ] | |
 | 12 | `feature/training-changes` | 3 | §10 | [ ] | |
 | 13 | `feature/quarter-eval-splits` | 4 | §11 | [ ] | |
@@ -942,7 +942,48 @@ array, which is where the memo-cache trap would surface.
 
 **Notes:**
 
-### 11c–11d. `feature/rotation-model` — §8, the bench and the head
+### 11c. `feature/bench-bundle` — §8, the bench
+
+**Scope.** Up to ten available players per side who are not on the floor, each carrying seconds
+since he sat down, seconds played, personal fouls, and whether he has played at all, through a
+second set encoder — so "he sat down nine seconds ago" is a learned penalty on the incoming pick
+rather than a dial.
+
+**It goes to the SubstitutionModel and nowhere else**, and the reason is cost, not taste. The
+player head is called on **every event**, so handing it the bench means a full-history scan per
+event — quadratic in game length. The substitution head is asked ~50 times a game, where the same
+scan is free. So `BENCH_KEYS` ride on that head's own `INPUT_KEYS`, not on `_BASE_INPUT_KEYS`,
+which `stint_length` and `conditional_time` share and which decide no rotation. 11d's
+`sub_decision` head is asked only at dead balls and can take the same bundle.
+
+- A **separate** encoder instance (`bench_vec`), not the on-court one reused: `roster_size` is
+  baked into `build()`, so one instance cannot serve a five-slot and a ten-slot set, and the
+  scalars mean different things — seconds since sitting is not seconds into a stint.
+- `config.BENCH_SIZE = 10` is an **`ARCH_KEY`**. A set's size changes mask shapes but no weight
+  shape, so a graph rebuilt with another value loads quietly and pools over the wrong number of
+  slots — correction K's failure mode exactly, which is why 11a folding the two `ARCH_KEYS` lists
+  into one mattered here.
+- `Encoder.encode_roster` takes a `size` so one function serves both set widths.
+
+**One asymmetry, named rather than hidden.** Training reads availability as everyone who reaches
+the floor over the whole game (`game_available`); the simulator reads it off the full rosters
+(`_bench_inputs`, matching `_avail_mask`). A player who never checks in is on the bench at rollout
+and absent in training. That is the compromise `game_available_mask` already makes; this follows
+it rather than inventing a third answer.
+
+**Verify**
+```bash
+python -m pytest tests/test_substitution_model.py tests/test_oncourt_mask.py tests/test_model_persistence.py tests/test_model_naming.py -q
+python -m pytest tests/ -q
+```
+`test_substitution_model.py:196` builds the head's inputs straight from `INPUT_KEYS`, so a bench
+key produced by neither `_build_split` nor the graph fails there first.
+
+**Result:**
+
+**Notes:**
+
+### 11d. `feature/sub-decision-head` — §8, the head
 
 **Scope.** The largest branch. Substitutions move inside the model; the stint-length scheduler and
 the fatigue nudge retire.
