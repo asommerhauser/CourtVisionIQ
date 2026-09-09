@@ -222,7 +222,9 @@ class SubDecisionModel(SubstitutionModel):
             pad[:n] = 1.0
             batches["pad_mask"].append(pad)
 
-        return {k: np.stack(v) for k, v in batches.items()}
+        # A split can be empty (test_frac=0 in the tiny fixtures), and np.stack([]) raises.
+        # Same guard EventTimeModel._build_split uses.
+        return {k: np.stack(v) if v else np.empty((0,)) for k, v in batches.items()}
 
     # _load_processed is inherited: it takes a FILE NAME, and this head passes its own
     # _PROCESSED entries, the way every head with its own npz family does.

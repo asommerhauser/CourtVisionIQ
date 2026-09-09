@@ -25,8 +25,7 @@ from zones import ZONE_TOKENS
 
 HOME_FIVE = ["A", "B", "C", "D", "E"]
 AWAY_FIVE = ["F", "G", "H", "I", "J"]
-REQUIRED_HEADS = {"player", "substitution", "shot_type", "shot_result",
-                  "assist_type", "turnover_type", "foul_type", "rebound_type"}
+REQUIRED_HEADS = config.REQUIRED_HEADS   # one list, so a new head cannot drift
 
 
 class FakeSim:

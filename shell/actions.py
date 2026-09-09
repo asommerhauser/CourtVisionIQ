@@ -17,10 +17,10 @@ from models.artifacts import ModelArtifacts, list_models, model_root, set_active
 from models.manifest import ARCH_KEYS
 from shell.heavy import ensure_tf
 
-# The heads GameController requires to play a game. Checked at LOAD so a missing head fails
-# immediately instead of mid-rollout, hours into an eval.
-REQUIRED_HEADS = ("player", "substitution", "sub_decision", "shot_type", "shot_result",
-                  "assist_type", "turnover_type", "foul_type", "rebound_type")
+# The heads GameController requires to play a game, from config so the shell, the controller
+# and the tests cannot drift. Checked at LOAD so a missing head fails immediately instead of
+# mid-rollout, hours into an eval.
+REQUIRED_HEADS = config.REQUIRED_HEADS
 
 # ARCH_KEYS is imported from models.manifest, not restated here. It used to be a second copy,
 # and the copies drifted: workstream 10a added LOCAL_ATTENTION_HEADS and LOCAL_ATTENTION_WINDOW

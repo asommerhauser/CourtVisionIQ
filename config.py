@@ -413,6 +413,15 @@ HOLDOUT_FRAC = 0.1
 # Filename of the holdout game-id manifest, written under each model's processed_dir.
 HOLDOUT_MANIFEST_NAME = "holdout_games.json"
 
+# The heads GameController needs to play a game. Checked at LOAD (shell/actions.py) so a
+# missing head fails immediately rather than mid-rollout, and again in the controller's own
+# constructor. Defined HERE because three copies of it existed -- the shell's, the
+# controller's, and the FakeSim in tests/test_controller.py -- and adding sub_decision to two
+# of them broke 87 tests that had nothing to do with rotation. config is the one module all
+# three can import without pulling in TensorFlow.
+REQUIRED_HEADS = ("player", "substitution", "sub_decision", "shot_type", "shot_result",
+                  "assist_type", "turnover_type", "foul_type", "rebound_type")
+
 # --- Chronological schedule helpers (training/chronology.py) ---
 # Utilities for contiguous, cumulative training slices + sequential (next-N) holdouts. Retained as
 # building blocks (build_schedule / sequential_partition); the single full train (full_run) is the

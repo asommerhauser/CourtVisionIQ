@@ -130,8 +130,7 @@ class GameController:
             self.sim.rng = np.random.default_rng(seed)
         self.rng = self.sim.rng
 
-        required = {"player", "substitution", "sub_decision", "shot_type", "shot_result",
-                    "assist_type", "turnover_type", "foul_type", "rebound_type"}
+        required = set(config.REQUIRED_HEADS)
         missing = required - set(self.sim.heads)
         if missing:
             raise RuntimeError(
