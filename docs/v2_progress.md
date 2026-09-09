@@ -69,8 +69,10 @@ is pytest plus TF-free measurement until the 2.0 train.
 **Workstream 11 is complete. Phases 1 and 2, Gate B, all of §9 and all of §8 are merged into
 `feature/version2`.** The full suite is green.
 
-**What is left is 12, 13 and Gate C** — and 12's scope changed, so read its section before
-starting it rather than reading §10 in the spec.
+**What is left is 12, 13 and Gate C.** Workstream 12 is **built and awaiting its run** — read its
+section, not §10, and note that its scope grew twice during the build: `ConditionalTimeModel`
+needs the mask too, and unifying the free-throw trip exposed correction T. Nothing in 12 has been
+executed under pytest yet.
 
 ### Where the tree stands
 
@@ -82,18 +84,24 @@ starting it rather than reading §10 in the spec.
 | suite | green (~719) |
 | weights | **none usable** — see standing rule 5 |
 
-**One clean is owed.** `data/` predates correction Q (a substitution naming a player already on
-the floor). Workstream 12 needs a re-preprocess anyway, so that is where the `--clean` should
-ride rather than spending a run of its own:
+**One clean is owed, and workstream 12 is where it rides.** `data/` predates correction Q (a
+substitution naming a player already on the floor), and 12 needs a re-preprocess anyway to write
+the loss-mask arrays. The vocabulary purge decided at Gate B rides here too, so the command is:
 
 ```bash
+rm encoder/vocabs/*.json
 python main.py --clean --rebuild-vocabs --model event_time
 ```
 
-No token changes since the freeze, so the vocabularies must come back byte-identical. There is
-**one** known exception to purge at Gate C: `Nene ` (trailing space) is still a dead token at id
-232 with the real `Nene` at 2152 — `--rebuild-vocabs` appends rather than rebuilding, so only
-deleting `encoder/vocabs/*.json` first removes it. See correction P.
+The `rm` is deliberate and is the **one** intended vocabulary change. `--rebuild-vocabs` appends
+rather than rebuilding, so deleting first is the only way to drop the dead `Nene ` token (trailing
+space, id 232, with the real `Nene` at 2152 — correction P). It renumbers every player id above
+232, which is free while there are no loadable weights (standing rule 5) and stops being free the
+moment train 3 finishes. **Gate C's "the vocabularies must come back byte-identical" therefore
+re-baselines against this clean, not against `0ab3956`** — that check was written before the purge
+was scheduled, and the two cannot both hold.
+
+No other token changes since the freeze, so nothing else should move.
 
 ### Two standing guards
 
@@ -165,7 +173,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | 11b | `feature/lineup-state` | 3 | §8 | [x] | 4fa3713 |
 | 11c | `feature/bench-bundle` | 3 | §8 | [x] | 402c182 |
 | 11d | `feature/sub-decision-head` | 3 | §8 | [x] | 1b48794 |
-| 12 | `feature/training-changes` | 3 | §10† | [ ] | |
+| 12 | `feature/training-changes` | 3 | §10† | [~] | |
 | 13 | `feature/quarter-eval-splits` | 4 | §11 | [ ] | |
 | — | **Gate C — pre-train checklist, then the 2.0 train** | 4 | | [ ] | |
 
@@ -1151,12 +1159,77 @@ inference**". That figure predates 2.0 and predates the substitution mask that i
 cleaned data gives the branch a number to move: how many rows the event head trains on that the
 controller never asks about, before and after. A masking change with no such number is unfalsifiable.
 
-**A re-preprocess is required** — and this is where the clean owed since correction Q should ride:
+**Scope grew by one head, and by one bug found on the way in.**
 
+`ConditionalTimeModel` needs the mask too. The plan above said only `EventTimeModel` did; that
+was wrong. `_advance_for` (`simulation/controller.py`) routes through `predict_delta` whenever
+the conditional head is loaded, so it is the sim's actual clock — and it is called **once per
+sampled play**, never at a continuation row: the block, the assisted shot and every free throw
+are appended with no clock advance at all. It is therefore asked about exactly the positions the
+event head is asked about. Leaving it out would have left the artifact in the head that sets
+pace. Its `_make_dataset` already carried the twin substitution mask, which is the same argument
+applied to substitutions.
+
+**The free-throw trip had a hole, and finding it moved the pace gate.** See correction T. The
+short version: the continuation rule needs to know whether a trip is open, `GameStateScan`
+already tracked one, and two notions of the same thing in one class is corrections N and R for
+the third time. Unifying them exposed that a substitution or timeout inside a trip closed it
+early — ~7,500 trips a season in every era. The fix drops the derived possession count by ~2.1
+per team per game, and the pace gate then failed at -3.1 to -3.7 against a tolerance of 3.0. The
+tolerance was **not** touched; the reference was corrected instead, because `0.44 * FTA` charges
+a fraction of a possession to and-1s and retaining-foul trips that cannot end one.
+
+**The independent number, measured before and after.** Route A is the predicate over cleaned
+rows; route B is the controller's own `_append` ledger, asserted to agree exactly in
+`tests/test_controller.py`. Route A, from the production scan:
+
+```
+  season   positions      sub   contin.   before    after
+    2003     625,528   56,102   130,175     9.0%    29.8%
+    2013     639,521   63,197   129,619     9.9%    30.2%
+    2023     674,703   71,840   140,554    10.6%    31.5%
+```
+
+`docs/technical_specs.md` records M4 as 21.9%, which is neither the before nor the after — it
+predates the substitution mask and is close to the *new* half by coincidence. The masked share
+is stable to about a point across twenty years.
+
+**Why the free-throw arm is a trip question and not a row-pair one.** Two measured reasons,
+either alone fatal to the pairwise form the plan above proposed:
+
+- The foul row does not say whether free throws followed. `determine_foul_result` writes
+  `nothing` on a common foul and the **bonus is the controller's decision** (`_foul_outcome` ->
+  `_in_bonus`). In 2022-23, 3,375 `personal`/`nothing` fouls are followed directly by a free
+  throw, plus 714 `loose ball`/`op` and 100 `away from play`/`nothing`.
+- Substitutions and timeouts sit inside the trip, at depths up to six or more. About one free
+  throw in five is separated from its foul that way, and the position AT the interposed row is
+  one the controller never queries either.
+
+Together those are 13-16% of the whole mask — 17,000 to 21,000 positions a season that a
+pairwise predicate keyed on the foul's result token drops silently.
+
+**The mask is A/B-able without a re-preprocess.** It is written into the npz unconditionally and
+`config.MASK_CONTINUATION_ROWS` switches whether the dataset applies it. That restores the second
+cheap ablation Gate C had lost, alongside `LOCAL_ATTENTION_HEADS = 0`.
+
+**Verify**
 ```bash
-python main.py --clean --rebuild-vocabs --model event_time
+python -m models.game_state_features --seasons 2003,2013,2023
 python -m pytest tests/ -q
 ```
+The first is TF-free and was run here — gate green, table above. The second is the handover: the
+new controller-parity tests and the two new wiring tests have never been executed, because both
+import TensorFlow.
+
+**Then the clean, which is the one owed since correction Q:**
+```bash
+rm encoder/vocabs/*.json
+python main.py --clean --rebuild-vocabs --model event_time
+```
+`rm` first is deliberate and is the **one** intended vocabulary change: `--rebuild-vocabs`
+appends rather than rebuilds, so it is the only way to drop the dead `Nene ` token (correction
+P). It renumbers every player id above 232, which is free now and stops being free the moment
+train 3 finishes. Gate C's "byte-identical" check re-baselines against this clean.
 
 **Result:**
 
@@ -1211,6 +1284,10 @@ The `--report-only` rebuild runs over an existing finished run and starts no new
   the committed encoder artifacts; confirm the freeze came from a real clean, not test residue.
 - Zone table matches §3 in all three sampled eras.
 - Derived-vs-raw 3pt disagreement under 1% per season.
+- **Pace gate green and the mask table populated**, from the one command that prints both:
+  `python -m models.game_state_features --seasons 2003,2013,2023`. The reference changed at
+  workstream 12 (correction T), so a pre-12 number is not comparable. Expect a gap near -1.8 and
+  a masked share near 30%; a masked share back near 10% means the arrays did not reach the npz.
 
 ```bash
 python train.py --full --name full_train_3 --batch-size 64 --clean --rebuild-vocabs
@@ -1222,10 +1299,15 @@ Train 2's availability masking and capacity settings carry forward unchanged.
 end-game behaviour the model actually produces (does a trailing team foul, does it hunt threes);
 then the dial package fitted from zero, re-keyed per zone.
 
-The clutch A/B that used to sit here is gone with the weighting (correction S). **That leaves one
-cheap ablation, not two** — `LOCAL_ATTENTION_HEADS = 0` rebuilds the pre-2.0 graph exactly and is
-now the only knob A/B-able without a re-preprocess. Worth knowing before reading an ambiguous
-result: eleven workstreams land in this train and their effects confound.
+The clutch A/B that used to sit here is gone with the weighting (correction S), but workstream 12
+put a second one back. **Two cheap ablations, both against the same preprocess:**
+
+- `LOCAL_ATTENTION_HEADS = 0` — rebuilds the pre-2.0 graph exactly.
+- `MASK_CONTINUATION_ROWS = False` — trains the event and time heads on all positions again. The
+  mask arrays ship in the npz either way, so this costs a train and no re-clean.
+
+Worth knowing before reading an ambiguous result: eleven workstreams land in this train and their
+effects confound. These two are the only knobs that separate cleanly.
 
 **Result:**
 
@@ -1442,6 +1524,60 @@ harm it causes should not ship on.** §10 says to watch the per-quarter splits f
 drift and that a Q1 regression means the weight is too high. Build the measurement first, then
 decide. Nothing is lost by waiting — the mechanism is ~30 lines and the A/B is two trains
 against the same preprocess.
+**T. A dead-ball row inside a free-throw trip closed it early, and the pace gate hid it by
+cancelling against a biased reference.** Found while unifying the trip state for workstream 12's
+continuation rule, which needs the same "is a trip open" question correction M's possession clock
+already answered.
+
+`GameStateScan.step` resolved the trip on **any** non-free-throw row. But the trip is
+whistle-to-whistle: the ball is dead for its whole length, which is exactly when the rotation
+scheduler may substitute and when a coach may call timeout. Measured over the cleaned corpus:
+7,474 trips in 2022-23 carry a substitution or timeout strictly between two attempts, ~7,500 a
+season in every era, and **99.5% have the same shooter on both sides of the gap** — one trip, not
+two.
+
+The cost was worse than the split trip counting twice. Resolving early also **cleared**
+`ft_after_basket` and `ft_retains`, so both exclusions correction M was written to remove came
+back whenever a dead-ball row landed mid-trip. Six of six sampled divergences were and-1s or take
+fouls counted a second time. Fixing it drops the derived count by ~2.1 possessions per team per
+game.
+
+**And that made the gate fail: -3.1 / -3.1 / -3.7 against `PACE_TOLERANCE = 3.0`.** The tolerance
+was not touched — that is the "a loose gate is close to no gate" lesson pointing the wrong way.
+The reference was the biased side. `FGA - OREB + TOV + 0.44 * FTA` charges 0.44 of a possession
+to *every* free throw, including the two families that provably cannot end one: and-1s, where the
+made basket already ended it, and retaining fouls, where the shooting team keeps the ball. Those
+are ~3.4 and ~1.3 FTA per team per game, about 1.5 possessions of pure reference bias.
+`_non_ending_fta` removes them from **raw tokens alone**, with no possession rule involved, so
+independence is preserved.
+
+Rejected: detecting an and-1 as "a made field goal preceded the foul". Most defensive fouls
+follow somebody's made basket, so that measured 9.3 and-1s per team per game against a true 2.0.
+The free-throw shooter *being* the scorer is the only unambiguous raw signal.
+
+Result: the old +0.2 / +0.4 / -0.2 agreement was two errors cancelling. Both sides now measure
+the same quantity — -1.7 / -1.6 / -1.9, stable across twenty years, gate green with the tolerance
+unchanged. **The residual is a real, unexplained ~1.8 and it is worth its own look**: it did not
+exist as a visible quantity before, because the double-count was filling it.
+
+The general form, and it is the third time: **when two numbers agree, check they are measuring
+the same thing before believing them.** Published NBA pace matches the uncorrected formula
+because it carries the same 0.44 — which makes it a confirmation of the bias, not of the rule.
+
+**U. Correction O's `"null"` sentinel is contained, not live — I claimed otherwise and was
+wrong.** The cleaner writes `"null"` at about ten sites and `data_loading.py:53` coerces it to
+NaN, so training encodes those cells as the string `"nan"` — a real token in the player, type and
+result vocabularies. I read that as a train/inference mismatch on every offensive rebound (the
+controller emits `result="null"` at `simulation/controller.py:504`). It is not.
+`game_simulator._norm_cat` reproduces the same pandas coercion at every categorical encode site,
+and `simulation/input_cache.py` routes through it too, so `"null"` becomes `"nan"` before
+encoding and train and inference agree by construction.
+
+What is left is cosmetic: the corpus's semantic sentinel is spelled `"nan"` in the vocabularies.
+Changing it costs a re-clean and a fresh vocabulary freeze for no behavioural gain, so it is
+**deliberately not fixed** — unlike correction P's `Nene `, which is a genuine duplicate player
+embedding and is purged at workstream 12's clean.
+
 ---
 
 ## Log
