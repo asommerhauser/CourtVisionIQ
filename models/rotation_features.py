@@ -43,6 +43,22 @@ from models.game_state_features import iter_game_rows
 # here rather than being spelled out twice.
 NON_PERSONAL_FOUL_TYPES = {"technical"}
 
+# A made basket stops the clock only late in a period: the last minute of Q1-Q3, the last two
+# minutes of Q4 and of every overtime. Earlier the ball is inbounded live and play continues,
+# which is why a made basket is not by itself a substitution opportunity. Defined here rather
+# than in the controller because BOTH sides need it now -- the controller to decide when a
+# substitution may happen, and this module to label the positions the sub-decision head trains
+# on. ``simulation/controller.py`` imports these two names.
+LATE_CLOCK_STOP = 60.0         # Q1-Q3
+LATE_CLOCK_STOP_FINAL = 120.0  # Q4 and OT
+
+
+def made_basket_stops_clock(period_idx: int, seconds_left: float) -> bool:
+    """Whether a made field goal at this point in the period stops the clock."""
+    cutoff = LATE_CLOCK_STOP if period_idx < 3 else LATE_CLOCK_STOP_FINAL
+    return seconds_left <= cutoff
+
+
 # Non-play frames carry no state contribution (mirrors game_state_features._SKIP_EVENTS).
 _SKIP_EVENTS = {"start", "end", "none", "PAD", "UNK", ""}
 
@@ -112,6 +128,13 @@ def _norm_str(value) -> str:
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return ""
     return str(value).strip()
+
+
+def _as_int(value, default=0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
 
 
 # =====================
@@ -217,6 +240,134 @@ class LineupScan:
             [float(self.fouls.get(p, 0)) for p in names],
             [1.0 if p in self.left_at or self.played.get(p) else 0.0 for p in names],
         )
+
+
+# =====================
+# --- Sub decisions ---
+# =====================
+#
+# The sub-decision head is asked one question, at dead balls only: per team, how many
+# substitutions follow before the ball is live again. Both halves of that -- WHERE it is asked
+# and WHAT the answer is -- have to be read off cleaned rows, because the dead ball is a
+# controller concept that section 2 deliberately never writes into the data.
+
+# How many substitutions the head distinguishes. Three is "three or more": beyond that the count
+# stops mattering and the tail is thin.
+SUB_COUNT_CLASSES = 4
+
+# Turnovers that leave the ball live. A steal is the defence already going the other way; every
+# other turnover is a whistle.
+_LIVE_TURNOVER_TYPES = {"steal"}
+# Rebound types that leave the ball live. A team rebound is dead -- the ball goes out and is
+# inbounded -- while a player rebound is play continuing.
+_DEAD_REBOUND_TYPES = {"team offensive", "team defensive"}
+
+
+def dead_ball_after(event: str, etype: str, result: str, *,
+                    period_idx: int, seconds_left: float, ends_free_throws: bool) -> bool:
+    """Whether the ball is dead after this cleaned row -- the data-side reading of section 2.
+
+    Mirrors the table in ``docs/v2_planned_changes.md`` §2 and the assignments in
+    ``GameController``: dead after any foul, a non-steal turnover, a made last free throw, a team
+    rebound, a timeout or a period boundary, and after a made basket only when the clock stops.
+    Live after a missed or blocked shot, a live rebound, a steal, and a missed last free throw.
+
+    ``ends_free_throws`` says this row is the last attempt of its trip, which a single row cannot
+    know -- :class:`SubDecisionScan` resolves it the way ``GameStateScan`` resolves possessions.
+    """
+    if event in ("foul", "timeout"):
+        return True
+    if event == "turnover":
+        return etype not in _LIVE_TURNOVER_TYPES
+    if event == "rebound":
+        return etype in _DEAD_REBOUND_TYPES
+    if event == "shot":
+        if etype == "free throw":
+            # A trip that is not over leaves the ball dead anyway -- the shooter shoots again --
+            # so only the last attempt decides, and only a made one stops play.
+            return result == "made" if ends_free_throws else True
+        if result == "made":
+            return made_basket_stops_clock(period_idx, seconds_left)
+        return False        # a miss or a block is live for the rebound
+    return False
+
+
+def derive_sub_decisions(rows) -> dict[str, np.ndarray]:
+    """Per-row ``(dead_ball, subs_home, subs_away)`` for one game's ordered rows.
+
+    ``dead_ball`` is 1.0 where the head may be asked -- a dead ball on a row that is not itself a
+    substitution. ``subs_home`` / ``subs_away`` count the substitutions in the run that
+    immediately follows, clipped at ``SUB_COUNT_CLASSES - 1`` because past three the count stops
+    mattering and the tail is thin.
+
+    Reading the count off the following run needs no dead-ball notion at all and is exact. The
+    dead-ball mask is the part that has to mirror the controller, and it exists so the head is
+    never asked anywhere it did not learn -- the same discipline §10 applies to the event and
+    time heads.
+    """
+    from models.game_state_features import _period_end, _period_index
+
+    rows = list(rows)
+    n = len(rows)
+    out = {k: np.zeros((n,), dtype=np.float32)
+           for k in ("dead_ball", "subs_home", "subs_away")}
+
+    events = [_norm_str(r.get("event")) for r in rows]
+    times = [float(r.get("time") or 0.0) for r in rows]
+
+    # Which free throws end their trip: the last attempt before a row that is not one of its own.
+    ends_trip = [False] * n
+    for i, event in enumerate(events):
+        if event == "shot" and _norm_str(rows[i].get("type")) == "free throw":
+            nxt = i + 1
+            ends_trip[i] = not (nxt < n and events[nxt] == "shot"
+                                and _norm_str(rows[nxt].get("type")) == "free throw")
+
+    for i, row in enumerate(rows):
+        if events[i] == "substitution":
+            continue
+        t = times[i]
+        period = _period_index(t)
+        dead = dead_ball_after(
+            events[i], _norm_str(row.get("type")), _norm_str(row.get("result")),
+            period_idx=period, seconds_left=_period_end(t) - t, ends_free_throws=ends_trip[i],
+        )
+        home = away = 0
+        nxt = i + 1
+        while nxt < n and events[nxt] == "substitution":
+            if _as_int(rows[nxt].get("home/away")) == 1:
+                home += 1
+            else:
+                away += 1
+            nxt += 1
+
+        # A period boundary is a dead ball however the last play of the period ended. The
+        # lookahead has to skip the substitution run to find it: the buzzer's substitutions carry
+        # the buzzer's own timestamp, so comparing against the very next row sees no period
+        # change at all.
+        if nxt < n and _period_index(times[nxt]) != period:
+            dead = True
+
+        # A substitution that follows is itself proof the ball was dead, whatever the previous
+        # row was, and it has to be taken as such: measured over 400 games of 2022-23, **19.4% of
+        # substitutions follow a row the rule alone calls live**, a third of them a MISSED last
+        # free throw -- which cannot be, since that ball is live for the rebound. The raw file
+        # appends a stoppage's substitutions after the play that drew the whistle rather than at
+        # the moment they happened, and the cleaner preserves that order, so the preceding row is
+        # not a reliable witness to the game state.
+        #
+        # Taking the union rather than trusting the rule is the safe direction: every real
+        # substitution lands in the target, and the positions the controller actually asks about
+        # are a subset of the ones trained on. Trusting the rule would drop a fifth of all
+        # substitutions from the target and bias the head toward predicting none.
+        if home or away:
+            dead = True
+        out["dead_ball"][i] = 1.0 if dead else 0.0
+
+        cap = SUB_COUNT_CLASSES - 1
+        out["subs_home"][i] = min(home, cap)
+        out["subs_away"][i] = min(away, cap)
+    return out
 
 
 def game_available(rows) -> tuple[list, list]:
@@ -475,13 +626,6 @@ def _fold_subs(rows):
                         break
         out.append((list(home), list(away)))
     return out
-
-
-def _as_int(value, default=0) -> int:
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return default
 
 
 def _scan_game(rows):

@@ -17,12 +17,15 @@ from config import ROSTER_SIZE
 from models.rotation_features import (
     BENCH_ID_KEYS,
     BENCH_STATE_KEYS,
+    SUB_COUNT_CLASSES,
     NUM_ROSTER_SCALARS,
     ROSTER_STATE_KEYS,
     LineupScan,
     _fold_subs,
     _scan_game,
+    dead_ball_after,
     derive_lineup_state,
+    derive_sub_decisions,
     merge_rotation_features,
     normalize_lineup_state,
     normalize_lineup_state_row,
@@ -343,3 +346,85 @@ def test_bench_ids_are_not_normalized():
     assert np.array_equal(out["bench_home"], raw["bench_home"])
     assert out["bench_fouls_home"][0, 0] == pytest.approx(1.0)
     assert out["bench_fouls_home"][0, 1] == pytest.approx(2.0)      # clipped at the foul limit
+
+
+# ---------------------------------------------------------------------------
+# Sub-decision positions and targets
+# ---------------------------------------------------------------------------
+
+def _sub(time, side="home", out_="Alice", in_="Kate"):
+    row = _row(time, event="substitution", player=out_, etype="substitution",
+               result="substitution", secondary=in_)
+    row["home/away"] = 1 if side == "home" else 2
+    return row
+
+
+def test_the_dead_ball_rule_matches_the_table_in_section_2():
+    late = dict(period_idx=0, seconds_left=30.0, ends_free_throws=True)
+    early = dict(period_idx=0, seconds_left=400.0, ends_free_throws=True)
+
+    assert dead_ball_after("foul", "personal", "free throw", **early)
+    assert dead_ball_after("timeout", "home", "none", **early)
+    assert dead_ball_after("turnover", "violation", "cop", **early)
+    assert not dead_ball_after("turnover", "steal", "cop", **early), "a steal is live"
+    assert dead_ball_after("rebound", "team defensive", "cop", **early)
+    assert not dead_ball_after("rebound", "defensive", "cop", **early), "a live board"
+    assert not dead_ball_after("shot", "rim", "missed", **early)
+    # A made basket stops the clock only late in the period.
+    assert not dead_ball_after("shot", "rim", "made", **early)
+    assert dead_ball_after("shot", "rim", "made", **late)
+
+
+def test_a_free_throw_is_dead_until_the_trip_is_over():
+    mid = dict(period_idx=0, seconds_left=400.0, ends_free_throws=False)
+    last = dict(period_idx=0, seconds_left=400.0, ends_free_throws=True)
+    assert dead_ball_after("shot", "free throw", "missed", **mid), "he shoots again"
+    assert dead_ball_after("shot", "free throw", "made", **last)
+    assert not dead_ball_after("shot", "free throw", "missed", **last), "live for the rebound"
+
+
+def test_the_target_counts_the_substitution_run_that_follows_per_side():
+    rows = [
+        _row(0, event="start", player="start"),
+        _row(300, event="foul", player="Bob", etype="personal", result="free throw"),
+        _sub(300, "home"), _sub(300, "away"), _sub(300, "away"),
+        _row(320),
+    ]
+    out = derive_sub_decisions(rows)
+    assert out["dead_ball"][1] == 1.0
+    assert out["subs_home"][1] == 1.0
+    assert out["subs_away"][1] == 2.0
+    # The substitution rows themselves are never query positions.
+    assert out["dead_ball"][2] == 0.0
+
+
+def test_the_count_is_capped_at_the_last_class():
+    rows = [_row(0, event="start", player="start"),
+            _row(300, event="timeout", player="none", etype="home", result="none"),
+            *[_sub(300, "home") for _ in range(5)],
+            _row(320)]
+    out = derive_sub_decisions(rows)
+    assert out["subs_home"][1] == SUB_COUNT_CLASSES - 1
+
+
+def test_a_substitution_run_makes_its_position_a_query_position():
+    """The rule alone calls a missed last free throw live, and it is -- but 19.4% of real
+    substitutions follow one, because the raw file appends a stoppage's substitutions after the
+    play that drew the whistle. Trusting the rule would drop a fifth of them from the target."""
+    rows = [
+        _row(0, event="start", player="start"),
+        _row(300, event="shot", player="Frank", etype="free throw", result="missed"),
+        _sub(300, "home"),
+        _row(320),
+    ]
+    out = derive_sub_decisions(rows)
+    assert out["dead_ball"][1] == 1.0
+    assert out["subs_home"][1] == 1.0
+
+
+def test_a_live_row_with_no_substitutions_is_not_a_query_position():
+    rows = [_row(0, event="start", player="start"),
+            _row(300, event="shot", player="Alice", etype="rim", result="missed"),
+            _row(320)]
+    out = derive_sub_decisions(rows)
+    assert out["dead_ball"][1] == 0.0

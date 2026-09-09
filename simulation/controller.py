@@ -28,6 +28,7 @@ import numpy as np
 import config
 from models.conditional_time_model import ConditionalTimeModel
 from models.game_state_features import NON_TEAM_FOUL_TYPES
+from models.rotation_features import made_basket_stops_clock
 from models.stint_length_model import StintLengthModel
 from models.substitution_model import START_TOKEN
 from simulation.game_simulator import GameSimulator, HOME, AWAY
@@ -39,11 +40,10 @@ PERIOD_LENGTH = 720          # 12:00 regulation quarter (seconds)
 OT_LENGTH = 300              # 5:00 overtime period
 REGULATION = 4 * PERIOD_LENGTH  # 2880s (48:00)
 MAX_EVENTS = 4000            # hard safety cap on rollout length (≈ 8× a real game)
-# A made basket stops the clock only late in a period: the last minute of Q1–Q3, the last two
-# minutes of Q4 and of every overtime. Earlier than that the ball is inbounded live and play
-# continues, which is why a made basket is not by itself a substitution opportunity.
-LATE_CLOCK_STOP = 60.0       # Q1–Q3
-LATE_CLOCK_STOP_FINAL = 120.0  # Q4 and OT
+# The late-clock rule that decides whether a made basket stops the clock lives in
+# models.rotation_features, not here: the data side needs the same rule to label the positions
+# the sub-decision head trains on, and a substitution opportunity the controller offers but the
+# labeller never saw -- or the reverse -- is a head asked a question it did not learn.
 # Timeout budget (NBA): seven a game, at most four still available in the fourth quarter, at
 # most two inside the final three minutes, and two more granted per overtime.
 TIMEOUTS_PER_GAME = 7
@@ -857,8 +857,8 @@ class GameController:
         Earlier the ball is inbounded live and play continues, which is exactly why a made
         basket is not by itself a substitution opportunity for most of a game.
         """
-        cutoff = LATE_CLOCK_STOP if self._period_index() < 3 else LATE_CLOCK_STOP_FINAL
-        return (self._current_period_end() - self.clock) <= cutoff
+        return made_basket_stops_clock(self._period_index(),
+                                       self._current_period_end() - self.clock)
 
     def _count_team_foul(self, team: str) -> None:
         """Add one to ``team``'s per-period penalty count, and to the last-2:00 count in window.
