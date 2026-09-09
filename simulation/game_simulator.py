@@ -46,7 +46,7 @@ import numpy as np
 # module between runs. ROSTER_SIZE is a fixed architectural constant, not a dial, so it is safe
 # to bind. See config._TUNING_KEYS and tests/test_dials.py.
 import config
-from config import ROSTER_SIZE
+from config import BENCH_SIZE, ROSTER_SIZE
 from models.conditional_time_model import ConditionalTimeModel
 from encoder.encoder import Encoder
 from models.artifacts import DEFAULT_ARTIFACTS_ROOT
@@ -60,7 +60,7 @@ from models.game_state_features import (
     GAME_STATE_KEYS, derive_game_state, normalize_game_state,
 )
 from models.rotation_features import (
-    ROSTER_STATE_KEYS, derive_lineup_state, normalize_lineup_state,
+    BENCH_KEYS, ROSTER_STATE_KEYS, derive_lineup_state, normalize_lineup_state,
 )
 from models.stint_length_model import StintLengthModel
 from models.substitution_model import START_TOKEN, SUB_EVENT, SubstitutionModel
@@ -430,6 +430,39 @@ class GameSimulator:
         self._avail_mask_cache = (key, mask)
         return mask
 
+    def _bench_inputs(self) -> dict:
+        """The bench bundle for the substitution head: ids plus their per-player state.
+
+        Derived over the FULL history with the same scan preprocessing uses, then windowed --
+        the pattern the game-state keys already follow. Availability comes from the full
+        rosters, exactly as :meth:`_avail_mask` does, and for the same reason: it is the sim-time
+        reading of the per-game training set. That reading is not identical to training's, which
+        takes everyone who reaches the floor over the whole game; a player who never checks in
+        is on the bench here and absent there. It is the compromise ``game_available_mask``
+        already makes, named rather than hidden.
+
+        Only the incoming-substitution head declares these inputs, and it is asked ~50 times a
+        game, so a full-history scan per call is affordable where one per event would not be.
+        """
+        SEQ = self.sequence_length
+        n = min(len(self.history), SEQ)
+        pad_player = self.encoder.encode_player("PAD")
+        raw = derive_lineup_state(
+            self.history,
+            encode_bench=lambda names: self.encoder.encode_roster(names, BENCH_SIZE),
+        )
+        norm = normalize_lineup_state(raw)
+        out = {}
+        for name in BENCH_KEYS:
+            windowed = norm[name][-SEQ:]
+            if windowed.dtype == np.int32:
+                buf = np.full((SEQ, BENCH_SIZE), pad_player, dtype=np.int32)
+            else:
+                buf = np.zeros((SEQ, BENCH_SIZE), dtype=np.float32)
+            buf[:n] = windowed
+            out[name] = buf[None, ...]
+        return out
+
     def _conditioned_inputs(self, *, next_event: str, delta_seconds: float,
                             next_player: str | None = None,
                             next_type: str | None = None,
@@ -490,6 +523,7 @@ class GameSimulator:
                                           next_player=outgoing)
         if outgoing is not None:  # incoming pick (SubstitutionModel) — the avail-defined head
             inputs["avail_mask"] = self._avail_mask()
+            inputs.update(self._bench_inputs())
         return inputs
 
     def _infer(self, model_key: str, inputs: dict) -> dict:

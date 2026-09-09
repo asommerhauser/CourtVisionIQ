@@ -11,6 +11,13 @@ MAX_SEQUENCE_LENGTH = 600
 # Fixed number of on-court player slots per roster (PAD-filled below this)
 ROSTER_SIZE = 5
 
+# Fixed number of bench slots per side (PAD-filled below this, truncated above). The bench is
+# everyone who plays in the game minus the five on the floor, so it runs 4-8 in practice against
+# a rotation of 9-13; ten is headroom, not a limit that binds. An ARCH_KEY: a set's size changes
+# the mask shapes but no weight shape, so a graph rebuilt with a different value would load
+# quietly and pool over the wrong number of slots -- the same failure mode as correction K.
+BENCH_SIZE = 10
+
 # --- Model capacity (shared backbone dims; one place so train + reload always agree) ---
 # Every head's __init__/model()/train() default to these, and from_artifacts rebuilds with them,
 # so changing a value here re-sizes the whole chain consistently (requires a fresh train — old

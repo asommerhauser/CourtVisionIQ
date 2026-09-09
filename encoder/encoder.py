@@ -50,17 +50,19 @@ class Encoder:
     # --- Encoding Functions ---
     # ==========================
 
-    def encode_roster(self, roster) -> list[int]:
+    def encode_roster(self, roster, size: int = ROSTER_SIZE) -> list[int]:
         """
         Encode a roster into a fixed-length ordered list of player token IDs.
-        Length is exactly ROSTER_SIZE: right-padded with PAD(0) if fewer players,
-        truncated if more. Order is preserved as given.
+        Length is exactly ``size`` (ROSTER_SIZE by default, BENCH_SIZE for a bench bundle):
+        right-padded with PAD(0) if fewer players, truncated if more. Order is preserved
+        as given -- the set encoder is permutation-invariant, so order carries no meaning,
+        but it must stay aligned with the per-player scalars for the same row.
         """
         players = self.str_to_list(roster)
-        ids = [self.player_vocab.encode(p) for p in players[:ROSTER_SIZE]]
+        ids = [self.player_vocab.encode(p) for p in players[:size]]
         pad_id = self.player_vocab.encode("PAD")
-        if len(ids) < ROSTER_SIZE:
-            ids = ids + [pad_id] * (ROSTER_SIZE - len(ids))
+        if len(ids) < size:
+            ids = ids + [pad_id] * (size - len(ids))
         return ids
 
     def encode_player(self, player) -> int:

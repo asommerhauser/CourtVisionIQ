@@ -38,7 +38,7 @@ import keras
 from keras import layers, Input
 
 from config import (
-    MAX_SEQUENCE_LENGTH, ROSTER_SIZE, NORM_STATS_PATH,
+    MAX_SEQUENCE_LENGTH, ROSTER_SIZE, BENCH_SIZE, NORM_STATS_PATH,
     SEED, TEST_FRAC, HOLDOUT_FRAC, HOLDOUT_MANIFEST_NAME,
     MODEL_DIM, NUM_LAYERS, NUM_HEADS, FF_DIM, ROSTER_SAB_LAYERS,
 )
@@ -79,10 +79,15 @@ from models.game_state_features import (
     game_state_projections,
 )
 from models.rotation_features import (
+    BENCH_ID_KEYS,
+    BENCH_KEYS,
+    NUM_BENCH_SCALARS,
     NUM_ROSTER_SCALARS,
     ROSTER_STATE_KEYS,
     merge_rotation_features,
     append_rotation_batches,
+    bench_scalars,
+    make_bench_inputs,
     make_rotation_inputs,
     side_scalars,
 )
@@ -135,7 +140,11 @@ class SubstitutionModel:
     @property
     def INPUT_KEYS(self) -> tuple:
         # Base history + always-on conditioning + the decided outgoing player + availability.
-        return (*_BASE_INPUT_KEYS, "next_event", "next_delta_time", "next_player", "avail_mask")
+        # BENCH_KEYS ride on THIS head's keys, not on _BASE_INPUT_KEYS: stint_length and
+        # conditional_time share the base and make no rotation decision, so handing them ten
+        # more slots per side would be capacity spent on a question they are never asked.
+        return (*_BASE_INPUT_KEYS, *BENCH_KEYS,
+                "next_event", "next_delta_time", "next_player", "avail_mask")
 
     # =====================
     # --- Data Loading  ---
@@ -315,7 +324,11 @@ class SubstitutionModel:
             refit=refit_norm_stats,
         )
         merge_game_state_features(df, cols)  # running score / period-clock / team fouls
-        merge_rotation_features(df, cols)  # per-player stint / minutes / fouls
+        # encode_bench asks for the bench bundle too: this head decides a rotation, so it
+        # needs to see who is available to make it.
+        merge_rotation_features(
+            df, cols,
+            encode_bench=lambda names: self.encoder.encode_roster(names, BENCH_SIZE))
         train = self._build_split(cols, game_id, train_games)
         test = self._build_split(cols, game_id, test_games)
         holdout = self._build_split(cols, game_id, holdout_games)
@@ -374,6 +387,7 @@ class SubstitutionModel:
 
         batches = {k: [] for k in (*keys_1d, *keys_roster, *keys_cont, *SEASON_INPUT_KEYS,
                                    *GAME_STATE_INPUT_KEYS, *ROSTER_STATE_KEYS,
+                                   *BENCH_KEYS,
                                    *keys_next_cat, "next_delta_time",
                                    "pad_mask", "loss_mask", "avail_mask")}
 
@@ -410,7 +424,7 @@ class SubstitutionModel:
 
             append_season_batches(batches, cols, idx, n, SEQ)
             append_game_state_batches(batches, cols, idx, n, SEQ)
-            append_rotation_batches(batches, cols, idx, n, SEQ)
+            append_rotation_batches(batches, cols, idx, n, SEQ, PAD_PLAYER)
 
             next_bufs = {}
             for k in keys_next_cat:
@@ -446,6 +460,26 @@ class SubstitutionModel:
     # --- Model / Train ---
     # =====================
 
+    def build_bench_encoder(self, dropout: float = 0.1) -> SequenceRosterEncoder:
+        """A second set encoder over the bench, with its own weights.
+
+        Not the on-court encoder reused: RosterEncoderParams.roster_size is baked into build(),
+        so one instance cannot serve a five-slot and a ten-slot set. The scalars differ in
+        meaning too -- seconds since sitting down rather than seconds into a stint -- so sharing
+        weights would ask one projection to mean two things.
+        """
+        params = RosterEncoderParams(
+            roster_size=BENCH_SIZE,
+            num_players=self.encoder.player_vocab.next_token,
+            roster_dim=ROSTER_DIM,
+            num_sab_layers=ROSTER_SAB_LAYERS,
+            num_heads=4,
+            d_ff=256,
+            dropout=dropout,
+            num_scalars=NUM_BENCH_SCALARS,
+        )
+        return SequenceRosterEncoder(params, name="bench_vec")
+
     def build_roster_encoder(self, dropout: float = 0.1) -> SequenceRosterEncoder:
         num_players = self.encoder.player_vocab.next_token
         params = RosterEncoderParams(
@@ -477,6 +511,7 @@ class SubstitutionModel:
         target_vocab_size = player_vocab_size  # incoming player over the player vocab
 
         self.roster_encoder = self.build_roster_encoder(dropout=dropout)
+        self.bench_encoder = self.build_bench_encoder(dropout=dropout)
 
         # ---- Inputs ----
         cat_inputs = {
@@ -488,6 +523,7 @@ class SubstitutionModel:
         delta_time = Input(shape=(SEQ, 1), dtype="float32", name="delta_time")
         rest_home, rest_away, team_inputs = make_season_inputs(SEQ)
         rotation_inputs = make_rotation_inputs(SEQ)
+        bench_inputs = make_bench_inputs(SEQ)
         game_state_inputs = make_game_state_inputs(SEQ)
         next_event = Input(shape=(SEQ,), dtype="int32", name="next_event")
         next_delta_time = Input(shape=(SEQ, 1), dtype="float32", name="next_delta_time")
@@ -520,6 +556,14 @@ class SubstitutionModel:
         away_vec = self.roster_encoder(
             [away_roster, *side_scalars(rest_away, rotation_inputs, "away")])
 
+        # ---- Bench encoding ----
+        # Who is available and not on the floor, with how long each has been sitting. One shared
+        # encoder over both benches, weight-tied the way the on-court one is.
+        bench_home_vec = self.bench_encoder(
+            [bench_inputs["bench_home"], *bench_scalars(bench_inputs, "home")])
+        bench_away_vec = self.bench_encoder(
+            [bench_inputs["bench_away"], *bench_scalars(bench_inputs, "away")])
+
         # ---- Continuous projections ----
         t_abs = layers.Dense(16, name="time_abs_proj")(time_abs)
         t_delta = layers.Dense(16, name="delta_time_proj")(delta_time)
@@ -529,7 +573,7 @@ class SubstitutionModel:
 
         # ---- Fusion + the shared causal backbone (models/backbone.py) ----
         x = build_backbone(
-            [*embs, *cond_vecs, home_vec, away_vec, t_abs, t_delta, t_next_delta, *t_team, *t_gs],
+            [*embs, *cond_vecs, home_vec, away_vec, bench_home_vec, bench_away_vec, t_abs, t_delta, t_next_delta, *t_team, *t_gs],
             pad_mask, seq_len=SEQ, d_model=D,
             num_layers=num_layers, num_heads=num_heads, ff_dim=ff_dim, dropout=dropout,
         )
@@ -549,6 +593,7 @@ class SubstitutionModel:
             "rest_home": rest_home, "rest_away": rest_away, **team_inputs,
             **game_state_inputs,
             **rotation_inputs,
+            **bench_inputs,
             "next_event": next_event, "next_delta_time": next_delta_time,
             "next_player": next_player,
             "pad_mask": pad_mask, "avail_mask": avail_mask,
