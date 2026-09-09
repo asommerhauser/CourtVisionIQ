@@ -132,7 +132,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | 11a | `fix/roster-snapshot-flicker` | 3 | §8 | [x] | c9c1d2d |
 | 11b | `feature/lineup-state` | 3 | §8 | [x] | 4fa3713 |
 | 11c | `feature/bench-bundle` | 3 | §8 | [x] | 402c182 |
-| 11d | `feature/sub-decision-head` | 3 | §8 | [~] | |
+| 11d | `feature/sub-decision-head` | 3 | §8 | [x] | 1b48794 |
 | 12 | `feature/training-changes` | 3 | §10 | [ ] | |
 | 13 | `feature/quarter-eval-splits` | 4 | §11 | [ ] | |
 | — | **Gate C — pre-train checklist, then the 2.0 train** | 4 | | [ ] | |
@@ -1025,7 +1025,7 @@ python -m pytest tests/ -q
 two-output graph); `test_backbone` catches a head that builds at the wrong width;
 `test_dials` iterates `_TUNING_KEYS` live, so the four removals have to be clean.
 
-**Result:**
+**Result:** Full suite green, on the third run. The two before it are the Notes below.
 
 **Notes:** Two rounds of failures, and both were the same mistake rather than anything about
 rotation.
