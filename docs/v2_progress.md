@@ -130,7 +130,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | — | `fix/jump-ball-team-binding` | 2 | — | [x] | fac7095 |
 | — | `fix/free-throw-possessions` | 3 | §9 | [x] | bfb52c1 |
 | 11a | `fix/roster-snapshot-flicker` | 3 | §8 | [x] | c9c1d2d |
-| 11b | `feature/lineup-state` | 3 | §8 | [~] | |
+| 11b | `feature/lineup-state` | 3 | §8 | [x] | 4fa3713 |
 | 11c | `feature/bench-bundle` | 3 | §8 | [ ] | |
 | 11d | `feature/sub-decision-head` | 3 | §8 | [ ] | |
 | 12 | `feature/training-changes` | 3 | §10 | [ ] | |
