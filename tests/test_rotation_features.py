@@ -15,12 +15,16 @@ import pytest
 
 from config import ROSTER_SIZE
 from models.rotation_features import (
+    NUM_ROSTER_SCALARS,
     ROSTER_STATE_KEYS,
     LineupScan,
     _fold_subs,
     _scan_game,
     derive_lineup_state,
+    merge_rotation_features,
     normalize_lineup_state,
+    normalize_lineup_state_row,
+    side_scalars,
 )
 
 HOME = ["Alice", "Bob", "Charlie", "Dave", "Eve"]
@@ -214,3 +218,46 @@ def test_a_substitution_with_no_incoming_player_shrinks_the_fold_too():
     assert disagree == 0
     assert duplicated == 0
     assert short == 2                              # the two rows a side is four
+
+
+# ---------------------------------------------------------------------------
+# Train / inference parity
+# ---------------------------------------------------------------------------
+
+def test_the_incremental_path_matches_the_batch_path_bit_for_bit():
+    """The property the whole design rests on.
+
+    Preprocessing folds a whole game at once through merge_rotation_features; the simulator
+    folds one row at a time through LineupScan + normalize_lineup_state_row. They are the same
+    scan, so they must agree exactly -- not approximately, since a drift here is a model fed
+    one thing in training and another at rollout, with nothing to report it.
+    """
+    import pandas as pd
+
+    rows = [
+        _row(0, event="start", player="start"),
+        _row(120),
+        _row(300, event="foul", player="Bob", etype="personal", result="nothing"),
+        _row(600, home=["Kate"] + HOME[1:]),
+        _row(900, home=["Kate"] + HOME[1:]),
+    ]
+    df = pd.DataFrame([{**r, "game_id": 1} for r in rows])
+
+    cols = {}
+    merge_rotation_features(df, cols)
+
+    scan = LineupScan()
+    for i, row in enumerate(rows):
+        incremental = normalize_lineup_state_row(scan.step(row))
+        for key, values in zip(ROSTER_STATE_KEYS, incremental):
+            assert np.array_equal(cols[key][i], values), f"{key} differs at row {i}"
+
+
+def test_the_scalars_reach_the_encoder_with_rest_first():
+    """Rest stays scalar 0, so the single-scalar ordering from before 2.0 is a prefix of this
+    one and the meaning of a slot does not move under a model that predates the others."""
+    rotation = {k: f"<{k}>" for k in ROSTER_STATE_KEYS}
+    assert side_scalars("<rest_home>", rotation, "home") == [
+        "<rest_home>", "<stint_seconds_home>", "<played_seconds_home>", "<court_fouls_home>",
+    ]
+    assert len(side_scalars("<rest_away>", rotation, "away")) == NUM_ROSTER_SCALARS
