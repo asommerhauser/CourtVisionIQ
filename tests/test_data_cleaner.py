@@ -836,28 +836,33 @@ def test_substitution_home_away_identifies_team(tmp_path):
     assert sub["home/away"] == 1
 
 
-def test_substitution_only_incoming_present(tmp_path):
-    """Only `entered` present, and the lineup does not move: outgoing stays unknown.
+def test_a_one_sided_substitution_the_lineup_does_not_corroborate_is_dropped(tmp_path):
+    """Only `entered` present, and the five never moves: nothing happened.
 
-    The token is "none", not "null": data_loading reads the cleaned CSVs with pandas' default
-    NA list, which contains "null", so that sentinel becomes NaN before any vocabulary is built
-    and appears in none of the five. "none" is a real token in all of them.
+    The lineup is the authority. A substitution row the five does not corroborate cannot be
+    emitted -- folding it forward removes or adds a player who is still on the floor, which is
+    what the measurement pass catches. Six rows a season reach this (four null `entered`, two
+    null `left`), and where the five DOES move the transition is recovered instead of dropped.
     """
     row = {"event_type": "substitution", "entered": "Zach", "left": None}
     cleaned = _parse(tmp_path, [row])
-    sub = cleaned[cleaned["event"] == "substitution"].iloc[0]
-    assert sub["player"] == "none"              # no outgoing, and none recoverable
-    assert sub["type"] == "substitution"        # clean type (not the leaving player)
-    assert sub["secondary_player"] == "Zach"    # incoming player
+    assert cleaned[cleaned["event"] == "substitution"].empty
+    for _, r in cleaned.iterrows():
+        assert "Zach" not in _roster_list(r["roster_home"])
 
 
-def test_substitution_only_outgoing_present(tmp_path):
-    """Only `left` present: incoming unknown → secondary_player='none'."""
-    row = {"event_type": "substitution", "entered": None, "left": "Alice"}
-    cleaned = _parse(tmp_path, [row])
+def test_a_one_sided_substitution_is_kept_when_the_lineup_does_move(tmp_path):
+    """Only `left` present, and the five really does lose him: that is a real transition."""
+    rows = [
+        {"event_type": "substitution", "elapsed": "0:00:30",
+         "entered": None, "left": "Alice", "h1": None},
+        {"event_type": "shot", "elapsed": "0:00:40", "player": "Bob", "h1": None},
+    ]
+    cleaned = _parse(tmp_path, rows)
     sub = cleaned[cleaned["event"] == "substitution"].iloc[0]
-    assert sub["player"] == "Alice"             # outgoing player
-    assert sub["secondary_player"] == "none"    # no one entered → "none" token
+    assert sub["player"] == "Alice"
+    assert sub["secondary_player"] == "none"
+    assert "Alice" not in _roster_list(cleaned.iloc[-1]["roster_home"])
 
 
 # ---------------------------------------------------------------------------

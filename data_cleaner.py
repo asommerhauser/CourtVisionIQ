@@ -57,6 +57,9 @@ _BOUNDARY_EVENTS = {"start of period", "end of period"}
 _HOME_FIVE_COL = "_repaired_home_five"
 _AWAY_FIVE_COL = "_repaired_away_five"
 _DERIVED_SUBS_COL = "_derived_subs"
+# True on a raw substitution row whose pairing was refused (see _repair_fives). The repaired
+# lineup already says what happened, so emitting the raw pairing as well would contradict it.
+_DROP_RAW_SUB_COL = "_drop_raw_sub"
 
 # The cleaned-data schema, and the ENFORCED contract: parse_file checks every emitted event
 # against it and raises on a mismatch. This used to be a per-instance ``self.output_columns``
@@ -331,7 +334,7 @@ class DataCleaner:
         def instant(i):
             return (str(cols["period"][i]), str(cols["elapsed"][i]))
 
-        home_fives, away_fives, derived = [], [], []
+        home_fives, away_fives, derived, drop = [], [], [], []
         run_home, run_away = [], []
         # player -> the instant a substitution row took them off the floor. A snapshot at that
         # same instant naming them is the stale one, not the substitution.
@@ -373,6 +376,7 @@ class DataCleaner:
             snap = snapshot(i + 1) if i + 1 < n else here
             now_at = instant(i)
             subs = []
+            refused = False
 
             if game_start(i) or not (run_home or run_away):
                 run_home, run_away = list(here[0]), list(here[1])
@@ -396,6 +400,7 @@ class DataCleaner:
                             placed = True
                             break
                 if not placed:
+                    refused = True
                     # The row contradicts the floor, so its pairing cannot be trusted. Take the
                     # snapshot and describe the transition it implies; the caller drops the raw
                     # pairing in favour of these, or the same change is told twice, once wrongly.
@@ -416,7 +421,8 @@ class DataCleaner:
             home_fives.append(list(run_home))
             away_fives.append(list(run_away))
             derived.append(subs)
-        return home_fives, away_fives, derived
+            drop.append(refused)
+        return home_fives, away_fives, derived, drop
 
     @staticmethod
     def _label_shooting_fouls(df):
@@ -977,11 +983,12 @@ class DataCleaner:
             left = row["left"]        # outgoing player (on the active five)
             if pd.isna(entered) and pd.isna(left):
                 return events
-            # _repair_fives only reconstructs a substitution row's transition when the row names
-            # a player who is not on the floor, and it has already emitted what actually
-            # happened. Emitting the raw pairing as well would tell the same change twice, once
-            # with a name the lineup does not contain.
-            if derived:
+            # _repair_fives refused this row's pairing and the repaired lineup already says what
+            # happened -- as derived substitutions above, or as nothing at all where the lineup
+            # never moved. Either way the raw pairing contradicts the five, so it does not go out.
+            # Reading "were there derived subs" instead of the flag missed the second case: the
+            # row was emitted, and folding it removed a player who was still on the floor.
+            if row.get(_DROP_RAW_SUB_COL):
                 return events
             # Convention: `player` is the OUTGOING player (predicted by the Player
             # model, sampled from the active roster) and `secondary_player` is the
@@ -1044,10 +1051,11 @@ class DataCleaner:
         df[_TEAM_REBOUND_LABEL_COL] = self._label_team_rebounds(df)
         # The raw on-court snapshots flicker and omit substitutions; repair both before the row
         # loop, since deciding whether a snapshot is real needs the row after it.
-        home_fives, away_fives, derived_subs = self._repair_fives(df)
+        home_fives, away_fives, derived_subs, drop_raw = self._repair_fives(df)
         df[_HOME_FIVE_COL] = pd.Series(home_fives, index=df.index, dtype=object)
         df[_AWAY_FIVE_COL] = pd.Series(away_fives, index=df.index, dtype=object)
         df[_DERIVED_SUBS_COL] = pd.Series(derived_subs, index=df.index, dtype=object)
+        df[_DROP_RAW_SUB_COL] = pd.Series(drop_raw, index=df.index, dtype=bool)
 
         for _, row in df.iterrows():
             new_row = self.process_row(row)
