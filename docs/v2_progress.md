@@ -129,7 +129,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | 10b | `feature/possession-clock` | 3 | §9 | [x] | bfb52c1 |
 | — | `fix/jump-ball-team-binding` | 2 | — | [x] | fac7095 |
 | — | `fix/free-throw-possessions` | 3 | §9 | [x] | bfb52c1 |
-| 11a | `fix/roster-snapshot-flicker` | 3 | §8 | [~] | |
+| 11a | `fix/roster-snapshot-flicker` | 3 | §8 | [x] | c9c1d2d |
 | 11b | `feature/lineup-state` | 3 | §8 | [ ] | |
 | 11c | `feature/bench-bundle` | 3 | §8 | [ ] | |
 | 11d | `feature/sub-decision-head` | 3 | §8 | [ ] | |
@@ -1247,3 +1247,4 @@ Append one line per merge. Newest last.
 | 2026-09-07 | `feature/possession-clock` | 53224b3 | merged ahead of its run so one clean could settle data, arrays and code together |
 | 2026-09-07 | `fix/free-throw-possessions` | bfb52c1 | pace gate caught a 12% over-count; free throws resolve by trip now (correction M) |
 | 2026-09-08 | **Gate B** | 0ab3956 | passed on the third clean; vocabs frozen and committed; 685 green |
+| 2026-09-08 | `fix/roster-snapshot-flicker` | c9c1d2d | 707 green; the five disagreed with the substitutions ~21x/game (corrections N-Q) |
