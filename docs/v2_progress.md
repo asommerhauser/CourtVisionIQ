@@ -131,7 +131,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | — | `fix/free-throw-possessions` | 3 | §9 | [x] | bfb52c1 |
 | 11a | `fix/roster-snapshot-flicker` | 3 | §8 | [x] | c9c1d2d |
 | 11b | `feature/lineup-state` | 3 | §8 | [x] | 4fa3713 |
-| 11c | `feature/bench-bundle` | 3 | §8 | [~] | |
+| 11c | `feature/bench-bundle` | 3 | §8 | [x] | 402c182 |
 | 11d | `feature/sub-decision-head` | 3 | §8 | [ ] | |
 | 12 | `feature/training-changes` | 3 | §10 | [ ] | |
 | 13 | `feature/quarter-eval-splits` | 4 | §11 | [ ] | |
@@ -979,9 +979,12 @@ python -m pytest tests/ -q
 `test_substitution_model.py:196` builds the head's inputs straight from `INPUT_KEYS`, so a bench
 key produced by neither `_build_split` nor the graph fails there first.
 
-**Result:**
+**Result:** Full suite green.
 
-**Notes:**
+**Notes:** The scope narrowed while building it. The bench was going to the player head as well,
+until tracing the call pattern: that head is asked on **every event**, and the bench needs a
+full-history scan, so it would have been quadratic in game length. Cost decided the scope, and
+the spec agreed with the cheaper answer -- §8 only ever asks for the bench on the incoming pick.
 
 ### 11d. `feature/sub-decision-head` — §8, the head
 
