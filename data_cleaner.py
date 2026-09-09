@@ -31,6 +31,36 @@ _TEAM_REBOUND_LABEL_COL = "_team_rebound_side"
 # Raw rows that end a possession sequence — never scan a lookahead/lookbehind across one.
 _BOUNDARY_EVENTS = {"start of period", "end of period"}
 
+# The raw h1..h5 / a1..a5 snapshots do not agree with the substitution rows. Two distinct
+# faults, both measured over 200 games of 2022-23:
+#
+#   * a STALE snapshot. A free-throw row that follows interleaved substitution rows carries the
+#     PRE-substitution five, so the lineup appears to flip and flip back over three rows. About
+#     10.5 such flickers a game -- confirmed in the raw master file itself (game 22200001, rows
+#     86-91: free throw, rebound, sub, sub, sub, free throw, where the second free throw still
+#     names the outgoing player). Read naively, these are ~21 phantom lineup changes a game
+#     against 46.5 real substitutions.
+#   * a MISSING substitution row. 7.8 lineup changes a game are real and permanent but have no
+#     substitution row anywhere near them. Almost all are quarter-break changes: the raw file
+#     records the new lineup as a changed snapshot on the "start of period" row and nothing else,
+#     so the five the second quarter opens with is one the event stream never accounts for.
+#
+# _repair_fives resolves both by carrying a running five, updated in place by substitution rows
+# and resynced to the snapshot only when that snapshot is STABLE -- the next raw row of the same
+# game carries the same two sets. A one-row flicker is never stable, so it is ignored; a real
+# change persists, so it is adopted, and the swap is emitted as a substitution row of its own.
+# Residual disagreement between the running five and the snapshot falls from 156.6 rows a game
+# to 10.7, and those are the stale rows themselves: the five is right and the column is wrong.
+#
+# Private columns carrying the repaired lineups and the recovered substitutions from parse_file
+# into process_row. Never emitted.
+_HOME_FIVE_COL = "_repaired_home_five"
+_AWAY_FIVE_COL = "_repaired_away_five"
+_DERIVED_SUBS_COL = "_derived_subs"
+# True on a raw substitution row whose pairing was refused (see _repair_fives). The repaired
+# lineup already says what happened, so emitting the raw pairing as well would contradict it.
+_DROP_RAW_SUB_COL = "_drop_raw_sub"
+
 # The cleaned-data schema, and the ENFORCED contract: parse_file checks every emitted event
 # against it and raises on a mismatch. This used to be a per-instance ``self.output_columns``
 # that nothing ever read, so it drifted out of date silently -- and a stale third copy of the
@@ -39,6 +69,13 @@ OUTPUT_COLUMNS = (
     "game_id", "roster_home", "roster_away", "time", "event",
     "player", "type", "result", "secondary_player", "home/away", "season", "playoff",
     "game_date", "home_team", "away_team",
+)
+
+
+# Every raw column that holds a player name. Trimmed on read: see parse_file.
+_PLAYER_COLUMNS = (
+    "player", "assist", "block", "steal", "entered", "left", "opponent", "away", "home",
+    "h1", "h2", "h3", "h4", "h5", "a1", "a2", "a3", "a4", "a5",
 )
 
 
@@ -247,6 +284,147 @@ class DataCleaner:
         return data_str
 
     @staticmethod
+    def _repair_fives(df):
+        """Repaired on-court fives per raw row, plus the substitutions the raw data omits.
+
+        Returns ``(home_fives, away_fives, derived_subs)``, each a per-row list. ``derived_subs``
+        holds ``(outgoing, incoming, side)`` triples for the rows where a real lineup change had
+        no substitution row of its own; every other row carries an empty list.
+
+        See the note above ``_HOME_FIVE_COL`` for why this exists. The rule, per row:
+
+          * the first row of a game seeds the running five from its own snapshot;
+          * a ``substitution`` row applies ``left -> entered`` **in place**, so slot order is
+            stable for the whole game and the roster-parallel per-player features stay aligned
+            to the same slot from tip-off;
+          * any other row adopts its snapshot only when the snapshot is *stable* -- the next raw
+            row of the same game carries the same two sets -- **and does not contradict a
+            substitution made at this same instant**.
+
+        That second condition is not belt-and-braces, it is the whole difficulty. A dead-ball
+        substitution sequence is written as ``free throw, sub, sub, sub, free throw, free throw``,
+        and *both* trailing free throws carry the pre-substitution five. Two stale rows in a row
+        are "stable" by the first test alone, so stability on its own resyncs backwards, undoes
+        three real substitutions, and then emits three more spurious ones when the next live row
+        restores them -- six phantom substitutions from one real trip. Substitution rows are
+        authoritative: a snapshot that puts a player back on the floor at the same instant a
+        substitution row took them off is stale, however many rows repeat it.
+
+        A substitution whose outgoing player is not on the running five resyncs from the snapshot
+        rather than being dropped, so a single bad row cannot desync the rest of the game. It
+        happens 0.01 times a game once the stability rule is in place, against 2.79 without it.
+        """
+        n = len(df)
+        if n == 0:
+            return [], [], []
+
+        cols = {c: df[c].tolist() if c in df else [None] * n
+                for c in ("event_type", "period", "elapsed", "entered", "left",
+                          "h1", "h2", "h3", "h4", "h5", "a1", "a2", "a3", "a4", "a5")}
+
+        def snapshot(i):
+            home = [cols[c][i] for c in ("h1", "h2", "h3", "h4", "h5")]
+            away = [cols[c][i] for c in ("a1", "a2", "a3", "a4", "a5")]
+            return ([p for p in home if pd.notna(p)], [p for p in away if pd.notna(p)])
+
+        def game_start(i):
+            return (str(cols["event_type"][i] or "").strip() == "start of period"
+                    and str(cols["period"][i]).strip() in ("1", "1.0"))
+
+        def instant(i):
+            return (str(cols["period"][i]), str(cols["elapsed"][i]))
+
+        home_fives, away_fives, derived, drop = [], [], [], []
+        run_home, run_away = [], []
+        # player -> the instant a substitution row took them off the floor. A snapshot at that
+        # same instant naming them is the stale one, not the substitution.
+        removed_at = {}
+
+        def resync(five, now, side, now_at, subs):
+            """Move ``five`` onto ``now``, recording every transition it takes to get there.
+
+            Every path that changes the running five goes through here, so the five can never
+            change without a substitution to explain it. That is exactly what the measurement
+            pass checks by folding the substitutions forward from the opening lineup, and the
+            paths that skipped it are where the last disagreements lived.
+
+            Unequal counts are a lineup that changed SIZE, which happens when a raw substitution
+            row names only one side of the swap -- four null ``entered`` and two null ``left`` a
+            season. They are carried as substitutions with ``none`` standing in for the half the
+            data never gave, the same sentinel the raw substitution path uses.
+            """
+            gone = [p for p in five if p not in now]
+            arrived = [p for p in now if p not in five]
+            for out, inc in zip(gone, arrived):
+                five[five.index(out)] = inc
+                removed_at[out] = now_at
+                removed_at.pop(inc, None)
+                subs.append((out, inc, side))
+            for out in gone[len(arrived):]:
+                five.remove(out)
+                removed_at[out] = now_at
+                subs.append((out, "none", side))
+            for inc in arrived[len(gone):]:
+                five.append(inc)
+                removed_at.pop(inc, None)
+                subs.append(("none", inc, side))
+
+        snap = snapshot(0)
+        for i in range(n):
+            event = str(cols["event_type"][i] or "").strip()
+            here = snap
+            snap = snapshot(i + 1) if i + 1 < n else here
+            now_at = instant(i)
+            subs = []
+            refused = False
+
+            if game_start(i) or not (run_home or run_away):
+                run_home, run_away = list(here[0]), list(here[1])
+                removed_at = {}
+            elif event == "substitution":
+                out, inc = cols["left"][i], cols["entered"][i]
+                placed = False
+                # A substitution is only applicable if the outgoing player is on the floor and
+                # the incoming one is not. The second half is not pedantry: 2002-03 has rows like
+                # "Gerald Wallace out, Jim Jackson in" where Jim Jackson is already playing and
+                # the snapshot shows the real arrival was Doug Christie -- the `entered` column
+                # simply names the wrong man. Applied blindly it puts one player in two slots,
+                # and every later comparison is done by membership, so the five then grows to six
+                # and never recovers: 12 games in 2002-03, one of them for 148 rows.
+                if pd.notna(out) and pd.notna(inc) and inc not in run_home and inc not in run_away:
+                    for five in (run_home, run_away):
+                        if out in five:
+                            five[five.index(out)] = inc
+                            removed_at[out] = now_at
+                            removed_at.pop(inc, None)
+                            placed = True
+                            break
+                if not placed:
+                    refused = True
+                    # The row contradicts the floor, so its pairing cannot be trusted. Take the
+                    # snapshot and describe the transition it implies; the caller drops the raw
+                    # pairing in favour of these, or the same change is told twice, once wrongly.
+                    resync(run_home, here[0], "home", now_at, subs)
+                    resync(run_away, here[1], "away", now_at, subs)
+            else:
+                # Adopt the snapshot only if it survives the next row -- a flicker never does.
+                # The last row of a game has no next row inside it, so it is taken as stable.
+                stable = (i + 1 >= n or game_start(i + 1)
+                          or (set(snap[0]) == set(here[0]) and set(snap[1]) == set(here[1])))
+                if stable:
+                    for five, now, side in ((run_home, here[0], "home"),
+                                            (run_away, here[1], "away")):
+                        if any(removed_at.get(p) == now_at for p in now if p not in five):
+                            continue        # this snapshot is the stale half of a live trip
+                        resync(five, now, side, now_at, subs)
+
+            home_fives.append(list(run_home))
+            away_fives.append(list(run_away))
+            derived.append(subs)
+            drop.append(refused)
+        return home_fives, away_fives, derived, drop
+
+    @staticmethod
     def _label_shooting_fouls(df):
         """Per-row ``shooting 2pt`` / ``shooting 3pt`` label for every shooting-foul row.
 
@@ -429,10 +607,15 @@ class DataCleaner:
             self.away_team = None
             self.home_players = []
             self.away_players = []
-            self.last_home_five = self._clean_five(
+            # Through the repaired columns, so the start row and every row after it read the
+            # same five. At a game start the two agree by construction; going through one of
+            # them is what keeps that true if the seeding rule ever changes.
+            seed_home = row.get(_HOME_FIVE_COL)
+            seed_away = row.get(_AWAY_FIVE_COL)
+            self.last_home_five = list(seed_home) if seed_home is not None else self._clean_five(
                 [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]]
             )
-            self.last_away_five = self._clean_five(
+            self.last_away_five = list(seed_away) if seed_away is not None else self._clean_five(
                 [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]]
             )
 
@@ -452,10 +635,16 @@ class DataCleaner:
             })
 
         # ---- CURRENT ON-COURT LINEUPS (NaN-free) ----
-        home_five = [row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]]
-        away_five = [row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]]
-        clean_home = self._clean_five(home_five)
-        clean_away = self._clean_five(away_five)
+        # Repaired by _repair_fives, not read off this row: the raw snapshot is stale on roughly
+        # eight rows a game (see the note above _HOME_FIVE_COL). The raw columns remain the
+        # fallback for a frame that never went through the pre-pass.
+        clean_home = row.get(_HOME_FIVE_COL)
+        clean_away = row.get(_AWAY_FIVE_COL)
+        if clean_home is None or clean_away is None:
+            clean_home = self._clean_five([row["h1"], row["h2"], row["h3"], row["h4"], row["h5"]])
+            clean_away = self._clean_five([row["a1"], row["a2"], row["a3"], row["a4"], row["a5"]])
+        clean_home = list(clean_home)
+        clean_away = list(clean_away)
 
         # Keep last-known lineups up to date so the end event is accurate.
         if clean_home:
@@ -481,6 +670,55 @@ class DataCleaner:
         if time_val is not None:
             self.last_time = time_val
         time_safe = time_val if time_val is not None else self.last_time
+
+        # ---- SUBSTITUTIONS THE RAW DATA OMITS ----
+        # A lineup change that persists but carries no substitution row -- 7.8 a game, almost all
+        # of them at a period start, where quarter-break changes are recorded as a changed
+        # snapshot and nothing else (see the note above _HOME_FIVE_COL). Emitted before this
+        # row's own events, because the five they produce is the five this row is played with.
+        # Without them the sequence contains a change of personnel that no event explains, which
+        # the controller could never reproduce.
+        #
+        # Each carries its own PROGRESSIVE five, not the finished one. Three changes at a period
+        # break are three rows, and a row that names one swap while its roster shows all three
+        # already made is not a state any consumer can fold forward -- it is what the gate's
+        # fold-the-substitutions check catches, and it disagreed on 409 rows over 82 games before
+        # this. So the swaps are undone back to the five this row started from, then reapplied
+        # one at a time.
+        derived = list(row.get(_DERIVED_SUBS_COL) or ())
+        if derived:
+            step_home, step_away = list(clean_home), list(clean_away)
+            for outgoing, incoming, side in reversed(derived):
+                five = step_home if side == "home" else step_away
+                if outgoing == "none":              # nobody left: undo by removing the arrival
+                    if incoming in five:
+                        five.remove(incoming)
+                elif incoming == "none":            # nobody came on: undo by restoring the leaver
+                    five.append(outgoing)
+                elif incoming in five:
+                    five[five.index(incoming)] = outgoing
+            for outgoing, incoming, side in derived:
+                five = step_home if side == "home" else step_away
+                if outgoing == "none":
+                    five.append(incoming)
+                elif incoming == "none":
+                    if outgoing in five:
+                        five.remove(outgoing)
+                elif outgoing in five:
+                    five[five.index(outgoing)] = incoming
+                events.append({
+                    "roster_home": list(step_home),
+                    "roster_away": list(step_away),
+                    "time": time_safe,
+                    "event": "substitution",
+                    "player": outgoing,
+                    "type": "substitution",
+                    "result": "substitution",
+                    "secondary_player": incoming,
+                    "home/away": 1 if side == "home" else 2,
+                    "season": self.season,
+                    "playoff": 2 if self.playoff else 1,
+                })
 
         # ---- SHOT ZONE ----
         # One of the fifteen spatial tokens (zones.py), replacing the old 2pt/3pt binary. The raw
@@ -745,6 +983,13 @@ class DataCleaner:
             left = row["left"]        # outgoing player (on the active five)
             if pd.isna(entered) and pd.isna(left):
                 return events
+            # _repair_fives refused this row's pairing and the repaired lineup already says what
+            # happened -- as derived substitutions above, or as nothing at all where the lineup
+            # never moved. Either way the raw pairing contradicts the five, so it does not go out.
+            # Reading "were there derived subs" instead of the flag missed the second case: the
+            # row was emitted, and folding it removed a player who was still on the floor.
+            if row.get(_DROP_RAW_SUB_COL):
+                return events
             # Convention: `player` is the OUTGOING player (predicted by the Player
             # model, sampled from the active roster) and `secondary_player` is the
             # INCOMING player (predicted by the Substitution model, sampled from the
@@ -757,7 +1002,11 @@ class DataCleaner:
                 "roster_away": clean_away,
                 "time": time_safe,
                 "event": "substitution",
-                "player": left if pd.notna(left) else "null",
+                # "none", not "null": pandas reads "null" back as NaN with its default NA list,
+                # so data_loading.py:53 destroys the sentinel before the vocabulary is built --
+                # "null" appears in none of the five frozen vocabularies, in any column. Here it
+                # decides who left the floor, so it has to survive.
+                "player": left if pd.notna(left) else "none",
                 "type": "substitution",
                 "result": "substitution",
                 "secondary_player": entered if pd.notna(entered) else "none",
@@ -785,11 +1034,28 @@ class DataCleaner:
             "original_x", "original_y", "description",
         ], errors="ignore")
 
+        # Trim every player-valued column before anything reads one. 2002-03 spells Nene as
+        # "Nene " in `entered`/`left` and "Nene" in the h1..h5 snapshots, so the two never match:
+        # folding the substitutions desynced the on-court five for the rest of every Denver game,
+        # and the frozen 2.0 player vocabulary carried "Nene" and "Nene " as two separate players
+        # with two separate embeddings. One trim here, before the pre-passes and the row loop, is
+        # the only place that cannot drift -- a dozen call sites each stripping their own would.
+        for col in _PLAYER_COLUMNS:
+            if col in df.columns and df[col].dtype == object:
+                df[col] = df[col].str.strip()
+
         # Shooting fouls need the FOLLOWING trip's `outof` to know whether the fouled attempt
         # was a 2 or a 3, so the label is computed over the whole file before the row loop.
         df[_SHOOTING_LABEL_COL] = self._label_shooting_fouls(df)
         # Bare team rebounds record no side; recover it (or mark the row for dropping).
         df[_TEAM_REBOUND_LABEL_COL] = self._label_team_rebounds(df)
+        # The raw on-court snapshots flicker and omit substitutions; repair both before the row
+        # loop, since deciding whether a snapshot is real needs the row after it.
+        home_fives, away_fives, derived_subs, drop_raw = self._repair_fives(df)
+        df[_HOME_FIVE_COL] = pd.Series(home_fives, index=df.index, dtype=object)
+        df[_AWAY_FIVE_COL] = pd.Series(away_fives, index=df.index, dtype=object)
+        df[_DERIVED_SUBS_COL] = pd.Series(derived_subs, index=df.index, dtype=object)
+        df[_DROP_RAW_SUB_COL] = pd.Series(drop_raw, index=df.index, dtype=bool)
 
         for _, row in df.iterrows():
             new_row = self.process_row(row)

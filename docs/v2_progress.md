@@ -19,10 +19,15 @@
 
 ## START HERE (as of 2026-09-08)
 
-**Phases 1 and 2, Gate B, and all of §9 are done and merged into `feature/version2`. The next
-thing to do is workstream 11, `feature/rotation-model`** — the largest branch in the programme,
-and the one §8 flags as possibly needing its own train. A smaller version is specified if it
-proves too much for one.
+**Phases 1 and 2, Gate B, and all of §9 are done and merged into `feature/version2`. Workstream
+11 is in progress**, split into 11a–11d on the 10a/10b precedent. `fix/roster-snapshot-flicker`
+(11a) is built and waiting on a pytest run and a re-clean; 11b–11d are the model side and have
+not started.
+
+**11a is not the branch anyone planned to write.** §8 is about giving the model per-player state,
+and the measurement written to check that state found that the on-court five it derives from is
+wrong ~21 times a game — see the 11a section, and corrections N, O and P, all three found by the
+gate rather than by a test.
 
 2.0 cleaned data is on disk and the vocabularies are frozen and committed (`0ab3956`). The full
 suite is **685 green**. `data/processed` was written by the same run, so it already carries the
@@ -124,7 +129,10 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | 10b | `feature/possession-clock` | 3 | §9 | [x] | bfb52c1 |
 | — | `fix/jump-ball-team-binding` | 2 | — | [x] | fac7095 |
 | — | `fix/free-throw-possessions` | 3 | §9 | [x] | bfb52c1 |
-| 11 | `feature/rotation-model` | 3 | §8 | [ ] | |
+| 11a | `fix/roster-snapshot-flicker` | 3 | §8 | [x] | c9c1d2d |
+| 11b | `feature/lineup-state` | 3 | §8 | [ ] | |
+| 11c | `feature/bench-bundle` | 3 | §8 | [ ] | |
+| 11d | `feature/sub-decision-head` | 3 | §8 | [ ] | |
 | 12 | `feature/training-changes` | 3 | §10 | [ ] | |
 | 13 | `feature/quarter-eval-splits` | 4 | §11 | [ ] | |
 | — | **Gate C — pre-train checklist, then the 2.0 train** | 4 | | [ ] | |
@@ -785,7 +793,109 @@ Three of my test expectations were wrong against correct code during this branch
 anchor, the and-1 timing, and the first free-throw case). Each is now pinned by a test that
 states the reasoning rather than just the number.
 
-### 11. `feature/rotation-model` — §8, full version
+### 11. `feature/rotation-model` — §8, full version, split four ways
+
+**Split into 11a–11d**, on the 10a/10b precedent. §8 is the largest workstream in the programme
+and the one the spec flags as possibly needing its own train; four branches means a bad result
+stays separable, and 11d — the new head and the scheduler's retirement — can be dropped late
+without losing the rest.
+
+| | Branch | What it lands |
+|---|---|---|
+| 11a | `fix/roster-snapshot-flicker` | the cleaner repair, the shared scan, the measurement gate |
+| 11b | `feature/lineup-state` | the three per-player scalars through the roster encoder |
+| 11c | `feature/bench-bundle` | the bench set input |
+| 11d | `feature/sub-decision-head` | the new head; retire the scheduler, `_fatigue_bias`, `STINT_*` |
+
+### 11a. `fix/roster-snapshot-flicker` — §8, the on-court five
+
+**Scope.** Everything §8 derives comes from the on-court five, and the five turned out to be the
+thing the raw data is least reliable about. Measured over 200 games of 2022-23 *before* writing
+anything: the per-row `roster_home` / `roster_away` snapshots — which feed the roster encoder,
+`build_box_score` minutes and any on-court derivation — **do not agree with the substitution
+rows**, in two separate ways.
+
+| | per game |
+|---|---|
+| substitution rows | 46.5 |
+| lineup changes carrying **no** substitution row | ~21 |
+| of those, one-row flickers (the snapshot reverts on the next row) | ~10.5 pairs |
+| permanent desyncs when folding the substitutions forward | ~1.1 |
+| team minutes from the snapshots | **exactly 480.0** (530.0 with one OT) |
+
+Taken naively that is ~21 phantom lineup changes a game against 46.5 real substitutions — a
+**~45% corruption of exactly the signal this workstream exists to fix**, going straight into
+stint seconds and minutes played.
+
+The flicker is a **raw-data artefact, not a cleaner bug**: in
+`RawData/MasterFiles/[10-18-2022]-[06-12-2023]-combined-stats.csv`, game `22200001`, rows 86–91
+are `free throw, rebound, sub, sub, sub, free throw` and the **second free throw carries the
+pre-substitution `h1..h5`**.
+
+- `data_cleaner._repair_fives` — a whole-file pre-pass, the third alongside
+  `_label_shooting_fouls` and `_label_team_rebounds`. Carries a running five, updated in place by
+  substitution rows, resynced to the snapshot only when the snapshot is *stable* (the next raw row
+  of the same game carries the same two sets) **and** does not contradict a substitution made at
+  that same instant. Every path that changes the five goes through one `resync`, which records
+  what it took to get there — so the five cannot move without a substitution to explain it.
+- Real changes with no substitution row are **emitted as substitution rows**, each carrying its
+  own progressive roster.
+- `models/rotation_features.py` — `LineupScan`, the shared derivation of stint seconds, seconds
+  played and personal fouls, structured like `GameStateScan` and used by both preprocessing and
+  the simulator. Fixed-constant normalization, so **correction C does not apply**: no
+  `norm_stats_io.py` change, no new `norm_stats.json` keys, nothing to load at inference.
+- `shell/actions.py:26` — its `ARCH_KEYS` was a second copy and had drifted (see correction N).
+
+**The independent number** is check 2 of the gate: the on-court five read two ways off the same
+file — from each row's snapshot, and by folding the substitutions forward from the opening five.
+After the repair those are the same quantity by independent routes, so they must agree exactly.
+
+**Verify**
+```bash
+python -m pytest tests/test_data_cleaner.py tests/test_rotation_features.py tests/test_chronology.py tests/test_box_score.py tests/test_model_naming.py -q
+python -m pytest tests/ -q
+python main.py --clean --rebuild-vocabs --model event_time
+```
+No token changes, so the rebuilt vocabularies must come back byte-identical to the frozen
+`0ab3956` set **except for one deletion**: `Nene ` leaves the player vocab (correction O). Check
+`git status --short encoder/vocabs/` and `git diff` it — any other change means the repair moved
+the token set, which it must not.
+
+Then, TF-free and on CPU, against the new clean:
+```bash
+python -m models.rotation_features --seasons 2003,2013,2023
+python -m models.game_state_features --seasons 2003,2013,2023
+python -m zones --seasons 2003,2013,2023
+```
+
+**Result:** Verified end to end without a full pipeline run: each of the three era master files
+was cleaned in process and the gate run over the result. All four checks pass with margin.
+
+| era | disagree/g | dup rows | short % | min fails | subs/team | top10 min | 10+ min |
+|---|---|---|---|---|---|---|---|
+| 2002-03 | 0.0000 | 0 | 0.0022 | 0 | 22.0 | 34.2 | 8.5 |
+| 2012-13 | 0.0000 | 0 | 0.0025 | 0 | 24.0 | 32.9 | 8.9 |
+| 2022-23 | 0.0000 | 0 | 0.0000 | 0 | 27.2 | 32.5 | 8.9 |
+
+The possession-clock gate re-run against the first re-clean is unchanged from workstream 10b —
+94.1 / 94.6 / 99.2 against 93.9 / 94.2 / 99.4 — so the repair moved nothing it should not have.
+The vocabularies came back byte-identical (no token added or removed); `norm_stats.json` moved as
+expected, `delta_mean` 5.930 → 5.839, tracking the ~1.5% extra rows sitting at existing
+timestamps. **A second clean is still owed** — the data on disk predates corrections Q.
+
+**Notes:** The first full-season run of the gate is what found correction Q, and it found it by
+failing a threshold calibrated on an 86-game slice: 0.0573% short lineups against an allowance of
+0.05%. Widening the allowance would have buried a defect touching 12 games. `SHORT_LINEUP_PCT` is
+now 0.01, four times the worst era's real rate and no more, and a player in two slots has its own
+check and its own message rather than surfacing as a short-lineup rate.
+
+`Nene ` is still in the player vocabulary at token 232, with `Nene` at 2152. `--rebuild-vocabs`
+*appends* — the vocabs are append-only, which is why Gate B's procedure deletes the files first.
+Every row now encodes to 2152, so 232 is simply a dead embedding row. Not worth an hour to purge
+on its own; **Gate C re-establishes the freeze and is the place to do it**, and a wholesale
+rebuild before then would destroy the byte-identical check that has been useful twice already.
+
+### 11b–11d. `feature/rotation-model` — §8, the model side
 
 **Scope.** The largest branch. Substitutions move inside the model; the stint-length scheduler and
 the fatigue nudge retire.
@@ -1076,6 +1186,45 @@ trip resolves on the first row that is not one of its own free throws. That need
 `num`/`outof` index - which the cleaned data does not carry, and which §4 deferred to v3 - and
 it dates the next possession from the LAST made attempt rather than the first.
 
+**N. Correction K landed in the manifest and not in the check.** `ARCH_KEYS` existed twice —
+`models/manifest.py:43` and `shell/actions.py:26` — and workstream 10a added
+`LOCAL_ATTENTION_HEADS` / `LOCAL_ATTENTION_WINDOW` only to the first. The manifest therefore
+*recorded* both settings and LOAD *compared* neither, so the silent local/global reload
+correction K exists to prevent was still fully available. `shell/actions.py` now imports the one
+list; a test pins that. Worth remembering for 11c, which adds `BENCH_SIZE` to it.
+
+**O. `"null"` reaches no vocabulary, in any column.** The cleaner writes `"null"` as the sentinel
+for a missing player, result or type at about ten sites. `data_loading.py:53` reads the cleaned
+CSVs with `pd.read_csv(p)` and pandas' default NA list contains `"null"`, so every one of them
+becomes NaN before a vocabulary is built. Checked against the frozen 2.0 vocabularies: `"null"`
+is in none of the five, while `"none"` is in all of them. The substitution path is switched to
+`"none"` on 11a, because there it decides who is on the floor; the other sites are left, the same
+defect with a wider blast radius and nothing depending on them structurally. **Not yet fixed.**
+
+**Q. A substitution row can name the wrong incoming player, and applying it grows the five to
+six.** 2002-03 has rows like "Gerald Wallace out, Jim Jackson in" where Jim Jackson is already on
+the floor; the lineup snapshot shows the real arrival was Doug Christie. `_repair_fives` checked
+only that the *outgoing* player was on the floor, so it applied the row and put one player in two
+slots. Every comparison downstream is by membership, so the five then grew to six and never
+recovered — 12 games in 2002-03, one of them for 148 rows, 359 short/duplicated rows out of 9 bad
+rows in the source. A substitution is now applicable only if the outgoing player is on the floor
+**and** the incoming one is not; otherwise the pairing is refused, the transition is recovered
+from the lineup, and the raw row is dropped.
+
+The refusal has to be a **flag**, not something inferred from whether the recovery emitted
+anything: where the lineup never moves the recovery emits nothing, and reading it that way let
+the contradictory row out. That version measured 0.088 disagreeing rows a game in 2002-03 — a
+*pass* against the 0.1 tolerance, and worth nothing. The rule it encodes is the one the whole
+branch rests on: **the lineup is the authority, and a substitution the five does not corroborate
+is not emitted.**
+
+**P. 2002-03 spells one player two ways, and the vocabulary carries both.** The raw `entered` /
+`left` columns give `"Nene "` where `h1..h5` give `"Nene"`. The two never matched, so folding the
+substitutions desynced for the rest of every Denver game — and the frozen 2.0 `player_vocab.json`
+holds `"Nene"` and `"Nene "` as two players with two embeddings. `parse_file` now trims every
+player-valued raw column once, on read, before the pre-passes and the row loop; a dozen call
+sites each stripping their own would drift. One token leaves the vocabulary at the next clean.
+
 ---
 
 ## Log
@@ -1098,3 +1247,4 @@ Append one line per merge. Newest last.
 | 2026-09-07 | `feature/possession-clock` | 53224b3 | merged ahead of its run so one clean could settle data, arrays and code together |
 | 2026-09-07 | `fix/free-throw-possessions` | bfb52c1 | pace gate caught a 12% over-count; free throws resolve by trip now (correction M) |
 | 2026-09-08 | **Gate B** | 0ab3956 | passed on the third clean; vocabs frozen and committed; 685 green |
+| 2026-09-08 | `fix/roster-snapshot-flicker` | c9c1d2d | 707 green; the five disagreed with the substitutions ~21x/game (corrections N-Q) |

@@ -127,6 +127,22 @@ def test_new_manifest_captures_the_arch():
     assert m["arch"]["NUM_LAYERS"] == config.NUM_LAYERS
 
 
+def test_the_load_check_reads_the_same_arch_keys_the_manifest_records():
+    """One list, not two.
+
+    They were two, and they drifted: workstream 10a added LOCAL_ATTENTION_HEADS and
+    LOCAL_ATTENTION_WINDOW to the recorded list per correction K, but not to the list LOAD
+    checks against -- so the silent local/global reload that correction exists to prevent was
+    recorded in every manifest and checked in none. A key that is recorded but never compared
+    is not a guard.
+    """
+    from models.manifest import ARCH_KEYS
+    from shell import actions
+
+    assert actions.ARCH_KEYS is ARCH_KEYS
+    assert "LOCAL_ATTENTION_HEADS" in ARCH_KEYS
+
+
 def test_new_manifest_records_the_dials_in_force():
     from models.manifest import new_manifest
     config.set_dial("DELTA_TIME_SCALE", 0.99)

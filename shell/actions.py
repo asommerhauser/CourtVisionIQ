@@ -14,6 +14,7 @@ from pathlib import Path
 
 import config
 from models.artifacts import ModelArtifacts, list_models, model_root, set_active_model
+from models.manifest import ARCH_KEYS
 from shell.heavy import ensure_tf
 
 # The heads GameController requires to play a game. Checked at LOAD so a missing head fails
@@ -21,10 +22,11 @@ from shell.heavy import ensure_tf
 REQUIRED_HEADS = ("player", "substitution", "shot_type", "shot_result",
                   "assist_type", "turnover_type", "foul_type", "rebound_type")
 
-# Capacity dims baked into the weights: from_artifacts rebuilds the graph from these, so a
-# mismatch surfaces as an opaque Keras shape error deep inside load_weights.
-ARCH_KEYS = ("MODEL_DIM", "NUM_LAYERS", "NUM_HEADS", "FF_DIM", "ROSTER_SAB_LAYERS",
-             "MAX_SEQUENCE_LENGTH", "ROSTER_SIZE")
+# ARCH_KEYS is imported from models.manifest, not restated here. It used to be a second copy,
+# and the copies drifted: workstream 10a added LOCAL_ATTENTION_HEADS and LOCAL_ATTENTION_WINDOW
+# to the manifest's list, per correction K, but not to this one -- so the silent local/global
+# reload that correction exists to prevent was being recorded in every manifest and checked in
+# none. The point of the key is the check, so there is one list.
 
 
 class ShellError(Exception):
