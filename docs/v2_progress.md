@@ -6,98 +6,130 @@
 
 ## Standing rules
 
-1. **GPU/CUDA/TensorFlow work is run by Alec in WSL, never by Claude.** That covers training,
-   rollouts, evals, `main.py --clean`, and `pytest` — `tests/conftest.py:14` imports TF before
-   anything else, so even a two-test subset is a TF run. Claude stops at each verification point,
-   hands over a command, and waits for a pasted result.
-2. **No large evals mid-programme.** Short smoke runs only (a handful of games, a few sims) to prove
-   things run. The full 2.0 eval happens after the train.
-3. **`v1.0` weights stop being meaningful at Gate B.** The re-clean introduces zone tokens, the
-   `shooting 2pt` / `shooting 3pt` split and `timeout` — tokens the `v1.0` heads have never seen.
-   **Gate A is the last point where an end-to-end sim run against existing weights says anything.**
-   After it, verification is pytest plus inspection of cleaner output until the 2.0 train.
+These are Alec's, given at the outset, and they are not negotiable conveniences — every one of
+them exists because the alternative wasted real time.
 
-## START HERE (as of 2026-09-08)
+### 1. Claude never runs anything that touches TensorFlow. Alec runs it, in WSL.
 
-**Phases 1 and 2, Gate B, and all of §9 are done and merged into `feature/version2`. Workstream
-11 is in progress**, split into 11a–11d on the 10a/10b precedent. `fix/roster-snapshot-flicker`
-(11a) is built and waiting on a pytest run and a re-clean; 11b–11d are the model side and have
-not started.
+That covers **training, preprocessing, rollouts, evals, `main.py --clean`, `train.py`, and
+`pytest`**. `pytest` is on the list because `tests/conftest.py` imports TF before anything else,
+so even a two-test subset is a TF run.
 
-**11a is not the branch anyone planned to write.** §8 is about giving the model per-player state,
-and the measurement written to check that state found that the on-court five it derives from is
-wrong ~21 times a game — see the 11a section, and corrections N, O and P, all three found by the
-gate rather than by a test.
+Two independent reasons, and either alone would be enough:
 
-2.0 cleaned data is on disk and the vocabularies are frozen and committed (`0ab3956`). The full
-suite is **685 green**. `data/processed` was written by the same run, so it already carries the
-seventh game-state key.
+- **TF does not load on the Windows side at all.** `import tensorflow` dies in
+  `_pywrap_tensorflow_internal` (a DLL init failure). Anything importing `simulation/` hits it too,
+  because `simulation/__init__.py` imports `GameSimulator`. So a Claude-side run does not produce
+  a wrong answer, it produces a traceback.
+- **The GPU is only visible from WSL.** Native Windows TF cannot see the 4070, so even where a run
+  starts it falls back to CPU and stalls.
 
-Two things to carry into workstream 11, both learned the expensive way at Gate B:
+**The pattern is therefore: Claude stops at each verification point, states what changed, hands
+over the exact command, says what to send back and what each outcome would mean — then waits for
+a pasted result.** Do not guess at the outcome, do not proceed as if it passed, and do not report
+a branch as verified on anything less than a pasted run.
 
-1. **Unit tests found neither real bug this stage.** The jump-ball collapse survived 663 green
-   tests because every timeout test bound team abbreviations from shot rows; the possession
-   over-count survived 26 tests written specifically for it. Both were caught by comparing one
-   number against an independent source. Workstream 11 owns player minutes — the single largest
-   box-score error — so decide now what its independent number is, and it is not a unit test.
-2. **A loose gate is close to no gate.** The first pace band was drawn from published NBA pace,
-   which is normalized per 48 minutes and excludes playoffs, so it had to be wide enough that
-   109.4 only just failed and 104.0 would have passed silently. Prefer a reference computed
-   from the same file by an independent route.
+### 2. What Claude CAN run, and should
+
+TF-free CPU passes over the cleaned data, which is where most of this programme's real findings
+came from:
+
+```bash
+python -m zones --seasons 2003,2013,2023
+python -m models.game_state_features --seasons 2003,2013,2023
+python -m models.rotation_features --seasons 2003,2013,2023
+```
+
+Plus anything in plain pandas/numpy — ad-hoc measurement over `data/*.csv` and
+`RawData/MasterFiles/*.csv`, and driving the cleaner or a scan directly in-process. Those are
+cheap, they are not gated, and **they are what found the jump-ball collapse, the 12% possession
+over-count, the roster-snapshot flicker and the split Nene embedding.** None of those was found
+by a test.
+
+### 3. Commit at each meaningful step
+
+Not one commit per branch. Each commit's message says what changed and *why*, including what was
+measured and what was rejected — the messages are the record of reasoning, and several of them
+are the only place a rejected alternative is written down.
+
+### 4. No large evals mid-programme
+
+Short smoke runs only (a handful of games, a few sims) to prove things run. The full 2.0 eval
+happens after the train.
+
+### 5. Weights stopped being meaningful at Gate B
+
+The re-clean introduced zone tokens, the `shooting 2pt` / `shooting 3pt` split and `timeout` —
+tokens the `v1.0` heads have never seen. Gate A was the last point where a sim against existing
+weights meant anything. **There is no loadable model and has not been since Gate B**; verification
+is pytest plus TF-free measurement until the 2.0 train.
+
+## START HERE (as of 2026-09-09)
+
+**Workstream 11 is complete. Phases 1 and 2, Gate B, all of §9 and all of §8 are merged into
+`feature/version2`.** The full suite is green.
+
+**What is left is 12, 13 and Gate C** — and 12's scope changed, so read its section before
+starting it rather than reading §10 in the spec.
 
 ### Where the tree stands
 
 | | |
 |---|---|
-| branch | `feature/version2`, clean tree |
-| cleaned data | 2.0, all 21 seasons, from the clean that passed Gate B |
-| vocabularies | frozen and committed, `0ab3956` |
-| `data/processed` | written by the same run, so it carries all seven game-state keys |
-| suite | 685 passed, 0 failed |
-| weights | **none usable** — see below |
+| branch | `feature/version2`, clean tree, everything merged |
+| cleaned data | 2.0, all 21 seasons — **one clean behind**, see below |
+| vocabularies | frozen and committed, `0ab3956`, byte-identical through the last clean |
+| suite | green (~719) |
+| weights | **none usable** — see standing rule 5 |
 
-**There is no loadable model.** `artifacts/v1.0`, full2 and full3 are all dead: the vocab
-rebuild gave them tokens they have never seen, and workstream 10b widened the fusion concat by
-16, so `fusion_projection`'s kernel no longer matches either. Nothing can be evaluated,
-smoke-run or sim-tested until the 2.0 train. **pytest plus TF-free measurement passes are the
-entire verification surface from here to Gate C** — which is why workstreams 11-13 each need to
-bring their own measurement, not just tests.
+**One clean is owed.** `data/` predates correction Q (a substitution naming a player already on
+the floor). Workstream 12 needs a re-preprocess anyway, so that is where the `--clean` should
+ride rather than spending a run of its own:
+
+```bash
+python main.py --clean --rebuild-vocabs --model event_time
+```
+
+No token changes since the freeze, so the vocabularies must come back byte-identical. There is
+**one** known exception to purge at Gate C: `Nene ` (trailing space) is still a dead token at id
+232 with the real `Nene` at 2152 — `--rebuild-vocabs` appends rather than rebuilding, so only
+deleting `encoder/vocabs/*.json` first removes it. See correction P.
 
 ### Two standing guards
 
-Neither fired at Gate B. A failure from either is the system working, not a bug to route around:
+Neither has fired since Gate B. A failure from either is the system working, not a bug to route
+around:
 
 1. **`zones.points_for_shot` raises** on any shot `type` that is neither a zone nor
    `free throw`. A stray token aborts the preprocess instead of silently scoring it as two.
 2. **`DataCleaner._check_schema` raises** if any emitted event's keys differ from
    `OUTPUT_COLUMNS`. A missing key would otherwise become a silent all-NaN column.
 
-### The line numbers in workstreams 11 and 12 were stale
+### What this programme has actually taught, twice each
 
-The backbone extraction removed ~24 lines from each of the six model files, and Phase 1/2 grew
-the controller, so anchors written before the build had all drifted. Re-measured 2026-09-08:
+Both of these were written down mid-programme and then violated inside the same branch that
+recorded them. They are here because they keep costing time:
 
-| Anchor | doc said | actual |
-|---|---|---|
-| `apply_recency` in `event_time_model.py` | 687 | **618** |
-| `apply_recency` in `player_model.py` | 463 | **438** |
-| `apply_recency` in `conditional_type_model.py` | 557 | **538** |
-| `apply_recency` in `substitution_model.py` | 597 | **572** |
-| `apply_recency` in `stint_length_model.py` | 493 | **468** |
-| `apply_recency` in `conditional_time_model.py` | 377 | **352** |
-| `controller._fatigue_bias` | 389 | **516** |
-| `controller._schedule_stint` | 411 | **538** |
-| `controller._process_scheduled_subs` | 420 | **547** |
-| `controller._maybe_force_sub` | 447 | **577** |
-| `RosterEncoderParams.get_config` / `from_config` | 131-146, 148-153 | **131, 149** |
-| `registry.MODEL_REGISTRY` / `STAGE_MODEL_KEYS` | 23, 41 | 23, 41 (unchanged) |
-| `roster_set_encoder.rest_proj` | 71, 102, 120 | 71, 102, 120 (unchanged) |
+1. **Tests do not find the real bugs; one number against an independent source does.** The
+   jump-ball collapse survived 663 green tests. The 12% possession over-count survived 26 tests
+   written for it. The roster-snapshot flicker survived everything. Every one was caught by
+   computing the same quantity two ways and comparing. **Every workstream should decide, before
+   writing code, what its independent number is** — and it is never a unit test.
+2. **A list read in more than one place must live somewhere both can import BEFORE anything is
+   added to it.** `ARCH_KEYS` existed twice and drifted (correction N). The controller's required
+   heads existed four times and drifted, breaking 87 tests that had nothing to do with the change
+   (correction R). Same lesson, same branch, weeks apart.
 
-Workstream 13's anchors were not touched this stage and still land: `_accuracy_section` at
-`reporting/eval_report.py:412`, the parquet writes around `:768`, `compare_holdout` at
-`simulation/diagnostics.py:144`.
+And one about gates: **a loose gate is close to no gate.** The first pace band was drawn from
+published NBA figures, which are per-48-minute and exclude playoffs, so it had to be wide enough
+that 109.4 only just failed and 104.0 would have passed silently. Prefer a reference computed
+from the same file by an independent route.
 
-**Grep for the symbol rather than trusting any of these.** That is the lesson, not the table.
+### Line numbers in this document are unreliable
+
+They have gone stale three times: the backbone extraction removed ~24 lines from each of six
+model files, Phases 1-2 grew the controller by ~130, and workstream 11 rewrote its rotation
+section entirely. **Grep for the symbol.** That is the lesson, not any table of anchors.
 
 ## Working pattern, per feature
 
@@ -133,9 +165,12 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | 11b | `feature/lineup-state` | 3 | §8 | [x] | 4fa3713 |
 | 11c | `feature/bench-bundle` | 3 | §8 | [x] | 402c182 |
 | 11d | `feature/sub-decision-head` | 3 | §8 | [x] | 1b48794 |
-| 12 | `feature/training-changes` | 3 | §10 | [ ] | |
+| 12 | `feature/training-changes` | 3 | §10† | [ ] | |
 | 13 | `feature/quarter-eval-splits` | 4 | §11 | [ ] | |
 | — | **Gate C — pre-train checklist, then the 2.0 train** | 4 | | [ ] | |
+
+† Workstream 12 builds only half of §10: the clutch loss weighting was started and dropped
+on 2026-09-09 (see its section, and correction S). The loss masking is still to build.
 
 Starting point: `feature/version2` at `82783c7`, docs-only ahead of `main`. No 2.0 code exists.
 
@@ -1047,47 +1082,73 @@ resets it.
 Recorded because correction N in this same branch is the identical lesson — two `ARCH_KEYS`
 lists that drifted — and it was reproduced twice more within days of writing it down.
 
-### 12. `feature/training-changes` — §10
+### 12. `feature/training-changes` — §10, minus the clutch weighting
 
-**Scope.** Clutch loss weighting, and loss masked to the positions the simulator actually queries.
+**Scope changed on 2026-09-09. Read this, not §10.** The spec asks for two things: clutch loss
+weighting, and masking the loss to the rows the simulator actually queries. **Only the second is
+being built.** The first was started and deliberately dropped — see below.
 
-New `apply_clutch(mask, split)` in `models/game_state_features.py`, a sibling of `apply_recency`
-(`models/season_features.py:162`) — the single funnel all six heads already call. Rows that are close
-and late (`period_idx >= 3`, `period_time_left <= 300`, `abs(score_diff) <= 8`) count double.
-`CLUTCH_LOSS_WEIGHT = 1.0` disables it, which makes an A/B against the same preprocess trivial.
+#### Not building: clutch loss weighting
 
-Call sites (the spec's line numbers are stale by up to 12 lines; these are current):
+§10 proposes that rows which are close and late (`period_idx >= 3`, `period_time_left <= 300`,
+`abs(score_diff) <= 8`) count double in every head's loss. Alec rejected it, and the reasoning
+holds:
 
-| File | `apply_recency` call |
-|---|---|
-| `models/event_time_model.py` | `:618` |
-| `models/player_model.py` | `:438` |
-| `models/conditional_type_model.py` | `:538` |
-| `models/substitution_model.py` | `:572` |
-| `models/stint_length_model.py` | `:468` |
-| `models/conditional_time_model.py` | `:352` |
+- **The features are already inputs.** `period_idx`, `period_time_left` and `score_diff` have been
+  plumbed since the game-state work, and 2.0 is simply the first train whose weights consume them.
+  Weighting is only justified if the model *under-fits* end-game despite having them — and no
+  train has ever consumed them, so there is **no evidence either way**. Turning it on is a guess.
+- **It biases the metric we report.** The programme is scored on box-score accuracy over whole
+  games. A Q1 rebound counts toward a player's total exactly as much as a Q4 one, and the
+  overwhelming majority of every box score comes from non-clutch rows. Doubling a thin slice buys
+  accuracy there by spending it everywhere else.
+- **§10 half-concedes this** — it says to watch the per-quarter splits for early-game drift, and
+  that a Q1 regression means the weight is too high. A knob that anticipates its own harm should
+  not ship on.
 
-Two call shapes exist — mask built first then wrapped (`event_time`, `conditional_time`), and wrapped
-inline (the other four) — both ending at `sample_weights = {<output_name>: mask}`.
+If the post-train per-quarter splits (workstream 13) show end-game genuinely mis-modelled — no
+intentional fouling when trailing, no three-point hunting — that is the evidence, and the
+mechanism can be built then. It is ~30 lines and the A/B would be two trains against the **same**
+preprocess, so nothing is lost by waiting for a reason.
 
-**Shape trap.** The recency weight is per-*game*, `(N,)` reshaped to `(-1,1)`; the clutch weight is
-per-*row*, `(N, SEQ)`, and the game-state columns in `split` are `(N, SEQ, 1)` and need a reshape.
-Normalization is fixed constants (`_NORM`, `:54`), so thresholds convert to normalized units exactly
-— there is no need to carry raw arrays alongside.
+#### Building: the loss mask
 
-Also here: the event and time heads stop training on rows the simulator never asks about —
-continuation rows, controller-forced substitution rows, and for the time head the last row before a
-period break. The continuation rule is **one function shared with the controller's play expansion**
-so the two cannot drift.
+The event and time heads stop training on rows the simulator never asks about.
 
-`CLUTCH_LOSS_WEIGHT` is a **training** knob and does **not** go in `_TUNING_KEYS`.
+**Already done**, in `EventTimeModel._make_dataset`: rows whose next event is a substitution are
+already zero-weighted, because rotation is injected by the controller and never sampled from the
+event stream.
+
+**Still to do:**
+
+- **Continuation rows.** The controller expands one sampled event into several emitted rows, and
+  the event head is never asked "what next" at the intermediate ones. From the `_append` calls in
+  `simulation/controller.py`, the expansions are exactly four:
+
+  | first row | continuation | emitted by |
+  |---|---|---|
+  | `assist` | `shot` | `_do_assist` |
+  | `shot` (blocked) | `block` | `_do_shot` |
+  | `foul` | `shot`/`free throw` | `_do_foul` / `_do_shooting_foul` -> `_free_throws` |
+  | `shot`/`free throw` | the next attempt of the same trip | `_free_throws` |
+
+  §10 requires this be **one function shared with the controller's play expansion** so the two
+  cannot drift. The controller's expansion is imperative, so the practical form is: the rule lives
+  as a predicate beside the other cleaned-row semantics (`models/game_state_features.py`, next to
+  `possession_boundary`), preprocessing builds the mask from it, and a test walks the controller's
+  own emitted rows asserting every within-play adjacent pair IS a continuation by that predicate
+  and every across-play pair is NOT.
+- **For the time head only:** the last row before a period break.
+- Only `EventTimeModel` needs the new array, which keeps the plumbing to one head.
 
 `tests/test_game_state_wiring.py` covers event_time, conditional_type, conditional_time and
-stint_length but **not** `player` or `substitution`. Close that gap here.
+sub_decision but **not** `player` or `substitution`. Close that gap here.
 
-**Verify**
+**A re-preprocess is required** — and this is where the clean owed since correction Q should ride:
+
 ```bash
-pytest tests/test_game_state_wiring.py tests/test_recency.py tests/test_preprocess.py -q
+python main.py --clean --rebuild-vocabs --model event_time
+python -m pytest tests/ -q
 ```
 
 **Result:**
@@ -1315,17 +1376,12 @@ is in none of the five, while `"none"` is in all of them. The substitution path 
 `"none"` on 11a, because there it decides who is on the floor; the other sites are left, the same
 defect with a wider blast radius and nothing depending on them structurally. **Not yet fixed.**
 
-**R. The same list existed four times, and adding to it broke 87 tests.** The heads
-`GameController` requires were a literal in `shell/actions.py`, another in the controller's own
-constructor, a third in `tests/test_controller.py`'s FakeSim and a fourth in
-`tests/test_shell.py`'s `ALL_HEADS`. Registering `sub_decision` in two of them left the other
-two stale, and every test that builds a controller died on a missing head — a failure with
-nothing to do with the change that caused it. It lives in `config.REQUIRED_HEADS` now, the only
-module all four can import without TensorFlow.
-
-This is correction N a second time (two `ARCH_KEYS` lists that drifted), and it was reproduced
-within the same branch that recorded N. **When a list is read in more than one place, put it
-somewhere both can import before adding to it, not after.**
+**P. 2002-03 spells one player two ways, and the vocabulary carries both.** The raw `entered` /
+`left` columns give `"Nene "` where `h1..h5` give `"Nene"`. The two never matched, so folding the
+substitutions desynced for the rest of every Denver game — and the frozen 2.0 `player_vocab.json`
+holds `"Nene"` and `"Nene "` as two players with two embeddings. `parse_file` now trims every
+player-valued raw column once, on read, before the pre-passes and the row loop; a dozen call
+sites each stripping their own would drift. One token leaves the vocabulary at the next clean.
 
 **Q. A substitution row can name the wrong incoming player, and applying it grows the five to
 six.** 2002-03 has rows like "Gerald Wallace out, Jim Jackson in" where Jim Jackson is already on
@@ -1344,13 +1400,30 @@ the contradictory row out. That version measured 0.088 disagreeing rows a game i
 branch rests on: **the lineup is the authority, and a substitution the five does not corroborate
 is not emitted.**
 
-**P. 2002-03 spells one player two ways, and the vocabulary carries both.** The raw `entered` /
-`left` columns give `"Nene "` where `h1..h5` give `"Nene"`. The two never matched, so folding the
-substitutions desynced for the rest of every Denver game — and the frozen 2.0 `player_vocab.json`
-holds `"Nene"` and `"Nene "` as two players with two embeddings. `parse_file` now trims every
-player-valued raw column once, on read, before the pre-passes and the row loop; a dozen call
-sites each stripping their own would drift. One token leaves the vocabulary at the next clean.
+**R. The same list existed four times, and adding to it broke 87 tests.** The heads
+`GameController` requires were a literal in `shell/actions.py`, another in the controller's own
+constructor, a third in `tests/test_controller.py`'s FakeSim and a fourth in
+`tests/test_shell.py`'s `ALL_HEADS`. Registering `sub_decision` in two of them left the other
+two stale, and every test that builds a controller died on a missing head — a failure with
+nothing to do with the change that caused it. It lives in `config.REQUIRED_HEADS` now, the only
+module all four can import without TensorFlow.
 
+This is correction N a second time (two `ARCH_KEYS` lists that drifted), and it was reproduced
+within the same branch that recorded N. **When a list is read in more than one place, put it
+somewhere both can import before adding to it, not after.**
+
+**S. Clutch loss weighting was rejected, and the reasoning generalises.** §10 asks that
+close-and-late rows count double in every head's loss. The features it keys on are already model
+inputs, and 2.0 is the first train that consumes them, so there is no evidence the model
+under-fits end-game — and the programme is scored on box-score accuracy over whole games,
+where the overwhelming majority of every box score comes from non-clutch rows. Weighting a thin
+slice buys accuracy there by spending it on the reported metric.
+
+The general form is worth keeping: **a knob whose own documentation tells you to watch for the
+harm it causes should not ship on.** §10 says to watch the per-quarter splits for early-game
+drift and that a Q1 regression means the weight is too high. Build the measurement first, then
+decide. Nothing is lost by waiting — the mechanism is ~30 lines and the A/B is two trains
+against the same preprocess.
 ---
 
 ## Log
@@ -1374,3 +1447,7 @@ Append one line per merge. Newest last.
 | 2026-09-07 | `fix/free-throw-possessions` | bfb52c1 | pace gate caught a 12% over-count; free throws resolve by trip now (correction M) |
 | 2026-09-08 | **Gate B** | 0ab3956 | passed on the third clean; vocabs frozen and committed; 685 green |
 | 2026-09-08 | `fix/roster-snapshot-flicker` | c9c1d2d | 707 green; the five disagreed with the substitutions ~21x/game (corrections N-Q) |
+| 2026-09-09 | `feature/lineup-state` | 4fa3713 | stint/minutes/fouls per player through the roster encoder; 8.6 GB record spike removed |
+| 2026-09-09 | `feature/bench-bundle` | 402c182 | ten bench slots per side, second set encoder; BENCH_SIZE into ARCH_KEYS |
+| 2026-09-09 | `feature/sub-decision-head` | 1b48794 | rotation is a decision, not a timer; stint head + 4 dials retired (correction R) |
+| 2026-09-09 | — | — | clutch weighting rejected before building (correction S); workstream 11 complete |
