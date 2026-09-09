@@ -29,8 +29,6 @@ import config
 from models.conditional_time_model import ConditionalTimeModel
 from models.game_state_features import NON_TEAM_FOUL_TYPES
 from models.rotation_features import made_basket_stops_clock
-from models.stint_length_model import StintLengthModel
-from models.substitution_model import START_TOKEN
 from simulation.game_simulator import GameSimulator, HOME, AWAY
 from data_cleaner import SHOOTING_2PT, SHOOTING_3PT
 from zones import ZONE_TOKENS, points_for_shot
@@ -115,7 +113,6 @@ class GameController:
 
     def __init__(self, sim: GameSimulator, *, seed: int | None = None, greedy: bool = False,
                  player_temp: float | None = None,
-                 sub_fatigue_weight: float | None = None,
                  sub_max_gap: float | None = None,
                  home_court_bias: float | None = None):
         self.sim = sim
@@ -124,8 +121,6 @@ class GameController:
         # sampled with the same actor temperature as every other player pick — the off/def split
         # is owned by the rebound-type head, so there is no separate rebound dial.
         self.player_temp = config.PLAYER_TEMPERATURE if player_temp is None else player_temp
-        self.sub_fatigue_weight = (config.SUB_FATIGUE_WEIGHT if sub_fatigue_weight is None
-                                   else sub_fatigue_weight)
         self.sub_max_gap = config.SUB_MAX_GAP_SECONDS if sub_max_gap is None else sub_max_gap
         # Logit nudge to the home offense's made-shot outcome (away gets the negation): the rollout's
         # one source of home/away asymmetry, so win prediction isn't a coin flip. See config.
@@ -135,7 +130,7 @@ class GameController:
             self.sim.rng = np.random.default_rng(seed)
         self.rng = self.sim.rng
 
-        required = {"player", "substitution", "shot_type", "shot_result",
+        required = {"player", "substitution", "sub_decision", "shot_type", "shot_result",
                     "assist_type", "turnover_type", "foul_type", "rebound_type"}
         missing = required - set(self.sim.heads)
         if missing:
@@ -190,15 +185,11 @@ class GameController:
         self.stint_start: dict[str, float] = {}
         self.last_sub_clock: dict[str, float] = {HOME: 0.0, AWAY: 0.0}
 
-        # --- Stint-length scheduler ---
-        # Substitutions are never sampled from the event head (it isn't trained to emit them);
-        # rotation is owned here. When the stint-length head is loaded, each entering player is
-        # committed to a stint and scheduled to exit at this clock, then pulled at the next dead
-        # ball once reached (see _schedule_stint / _process_scheduled_subs). When the head is
-        # absent we fall back to the cadence backstop (_maybe_force_sub) alone so a bundle without
-        # the stint head still rotates (just without committed stint lengths).
-        self.use_scheduler: bool = StintLengthModel.KEY in self.sim.heads
-        self.stint_target_clock: dict[str, float] = {}
+        # --- Rotation ---
+        # Substitutions are never sampled from the event head (it is not trained to emit them);
+        # rotation is owned here. The sub-decision head is asked at every position Rule 3 permits
+        # a substitution and answers how many each side makes; _maybe_force_sub remains as the
+        # cadence backstop for a team the head never picks.
         self.open_play_events: list[str] = list(OPEN_PLAY_EVENTS)
 
         # --- Conditional time head (event→player→Δt) ---
@@ -250,10 +241,6 @@ class GameController:
         for player in self._all_ten():
             self.stint_start[player] = 0.0
         self.last_sub_clock = {HOME: 0.0, AWAY: 0.0}
-        # Commit each starter to an opening stint (outgoing = the "start" token, as trained).
-        if self.use_scheduler:
-            for player in self._all_ten():
-                self._schedule_stint(player, START_TOKEN)
         return self
 
     def run(self) -> list[dict]:
@@ -291,9 +278,8 @@ class GameController:
             self._do_timeout(marginal)
 
         self._check_period()
-        if self.use_scheduler:
-            self._process_scheduled_subs()
-        self._maybe_force_sub()   # cadence backstop (and the legacy in-game sub path's safety net)
+        self._run_substitutions()
+        self._maybe_force_sub()   # cadence backstop, for a team the head never picks
 
     def _event_menu(self, post_miss: bool) -> list[str]:
         """The events the event head may be sampled from right now.
@@ -529,18 +515,8 @@ class GameController:
         """
         self._advance_clock(delta)
         outgoing, incoming = self.sim.sample_substitution(
-            delta_seconds=delta, greedy=self.greedy, outgoing_bias=self._fatigue_bias())
+            delta_seconds=delta, greedy=self.greedy)
         self._apply_sub(outgoing, incoming)
-
-    def _fatigue_bias(self, team: str | None = None) -> dict[str, float]:
-        """Per-player outgoing-sub bonus: ``weight × current stint seconds`` for on-court players.
-
-        Restricted to ``team``'s five when given (the safety net subs one team at a time)."""
-        if not self.sub_fatigue_weight:
-            return {}
-        pool = self._five_of(team) if team is not None else self._all_ten()
-        return {p: self.sub_fatigue_weight * (self.clock - self.stint_start.get(p, self.clock))
-                for p in pool}
 
     def _apply_sub(self, outgoing: str, incoming: str) -> None:
         """Emit the substitution row and update minutes/stint/last-sub bookkeeping."""
@@ -549,54 +525,34 @@ class GameController:
         self.stint_start.pop(outgoing, None)
         self.stint_start[incoming] = self.clock
         self.last_sub_clock[team] = self.clock
-        # Commit the incoming player to a fresh stint; the outgoing player's schedule is done.
-        if self.use_scheduler:
-            self.stint_target_clock.pop(outgoing, None)
-            self._schedule_stint(incoming, outgoing)
 
-    def _schedule_stint(self, incoming: str, outgoing: str) -> None:
-        """Sample ``incoming``'s stint length and schedule their exit at ``clock + length``.
+    def _run_substitutions(self) -> None:
+        """Ask the sub-decision head how many substitutions each side makes here, then make them.
 
-        ``outgoing`` is the player they replace (the literal ``"start"`` token for an opener),
-        passed through as the stint head's outgoing conditioning.
-        """
-        length = self.sim.predict_stint_length(incoming, outgoing, greedy=self.greedy)
-        self.stint_target_clock[incoming] = self.clock + length
+        This is workstream 11's whole point. Rotation used to be a timer: ``_schedule_stint``
+        sampled a stint length for every entering player and pulled him when the clock reached
+        it, with ``_fatigue_bias`` nudging the outgoing pick. Player minutes were the largest
+        remaining box-score error and that timer was why. The count is now a decision the model
+        makes from the state it makes every other decision from -- who is on the floor, how long
+        they have been there, how many fouls they carry, and who is on the bench.
 
-    def _process_scheduled_subs(self) -> None:
-        """Scheduler trigger: at a dead ball, pull each team's most-overdue committed player.
-
-        A player is due when the clock reaches their scheduled exit; we sub out the single
-        most-overdue player per team per dead ball (the next dead ball catches the next one) and
-        let the substitution head pick the bench replacement. Foul-outs/ejections still pull
-        players immediately elsewhere; this only governs ordinary rotation timing.
-
-        The test is ``self.can_sub``, not ``self.ball_dead`` and certainly not the pre-2.0 "no
-        rebound pending" proxy: a made field goal is a dead ball and is never a substitution
-        opportunity (Rule 3, Section V, clause 10).
-
-        Clause 4 -- a substitute may not replace a free-throw shooter -- needs no code here. A
-        foul and its whole trip resolve inside :meth:`_do_foul` before :meth:`_step` reaches the
-        rotation, so there is no point at which a substitution can land mid-trip.
+        Asked only where Rule 3 permits a substitution (``self.can_sub``), which is the same
+        predicate ``rotation_features.can_substitute`` labels the training positions with. That
+        matters for the RATE, not only for legality: a substitution follows ~1% of all rows and
+        20-27% of legal opportunities, so a head trained against the wrong denominator would
+        substitute a fifth as often as a real team.
         """
         if not self.can_sub or self.finished:
             return
         for team in (HOME, AWAY):
-            five = self._five_of(team)
-            overdue = [(self.clock - self.stint_target_clock[p], p) for p in five
-                       if p in self.stint_target_clock
-                       and self.clock >= self.stint_target_clock[p]]
-            if not overdue:
-                continue
-            overdue.sort(reverse=True)          # most overdue first
-            outgoing = overdue[0][1]
-            bench = [p for p in (self.sim.home_full if team == HOME else self.sim.away_full)
-                     if p not in five]
-            if not bench:                       # nobody to bring in — push the target out, move on
-                self.stint_target_clock[outgoing] = self.clock + self.sub_max_gap
-                continue
-            incoming = self.sim.predict_incoming(outgoing, bench, greedy=self.greedy)
-            self._apply_sub(outgoing, incoming)
+            for _ in range(self.sim.predict_sub_count(team, greedy=self.greedy)):
+                five = self._five_of(team)
+                bench = [p for p in (self.sim.home_full if team == HOME else self.sim.away_full)
+                         if p not in five]
+                if not bench:
+                    break
+                outgoing, incoming = self.sim.sample_substitution(team=team, greedy=self.greedy)
+                self._apply_sub(outgoing, incoming)
 
     def _maybe_force_sub(self) -> None:
         """Cadence safety net: force a sub for any team starved past ``sub_max_gap``.
@@ -615,8 +571,7 @@ class GameController:
             if not bench:                       # nobody to bring in — reset the timer, move on
                 self.last_sub_clock[team] = self.clock
                 continue
-            outgoing, incoming = self.sim.sample_substitution(
-                team=team, greedy=self.greedy, outgoing_bias=self._fatigue_bias(team))
+            outgoing, incoming = self.sim.sample_substitution(team=team, greedy=self.greedy)
             self._apply_sub(outgoing, incoming)
 
     def _do_foul(self, delta: float, *, rebounding: bool = False) -> None:

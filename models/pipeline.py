@@ -28,17 +28,17 @@ from models.conditional_type_model import CONDITIONAL_MODEL_CLASSES
 from models.event_time_model import EventTimeModel
 from models.model_bundle import ModelBundle
 from models.player_model import PlayerModel
-from models.stint_length_model import StintLengthModel
+from models.sub_decision_model import SubDecisionModel
 from models.substitution_model import SubstitutionModel
 
 
 # Heavier heads that get a capped batch so the chain fits a tight (~10 GB) GPU alongside the shared
 # roster encoder (~8 GB at batch 32). PlayerModel + SubstitutionModel emit logits over the large
-# *player* vocab (+~0.5–1 GB of logits/gradients — the actual OOM cause); StintLengthModel has a
+# *player* vocab (+~0.5–1 GB of logits/gradients — the actual OOM cause); SubDecisionModel has a
 # scalar output but is the substitution model's sibling (two player-embedding conditioning inputs),
 # capped here too as a precaution since it's the last head to train. Every other head (event / type /
 # result / conditional-time — tiny outputs) trains at the full batch_size.
-LARGE_OUTPUT_MODELS = {PlayerModel.KEY, SubstitutionModel.KEY, StintLengthModel.KEY}
+LARGE_OUTPUT_MODELS = {PlayerModel.KEY, SubstitutionModel.KEY}
 # Per-head cap for the player-vocab heads (their logits/gradients over the player vocab are the
 # real OOM risk). Set to 64 for the paid-GPU train 2 (provisioning a high-VRAM card), matching the
 # global batch_size so these heads also train at 64 — i.e. effectively uncapped. Lower this (e.g.
@@ -129,14 +129,15 @@ def run_all(data_dir: str = "./data", artifacts_root: str = DEFAULT_ARTIFACTS_RO
     if train:
         _train(sub, SubstitutionModel.KEY)
 
-    # 5) Stint-length head — self-contained preprocess (own stint_*.npz, with the
-    # synthesized opening subs), then train. Drives rotation timing at inference.
-    stint = StintLengthModel(Encoder(), path=data_dir)
+    # 5) Sub-decision head — self-contained preprocess (own subdec_*.npz, and
+    # deliberately WITHOUT the synthesized opening subs: a tip-off is not a stoppage). Drives
+    # rotation timing at inference, in place of the retired stint scheduler.
+    subdec = SubDecisionModel(Encoder(), path=data_dir)
     if not skip_preprocess:
-        print("[pipeline] preprocess 'stint_length' (stint_*.npz w/ opening subs)")
-        stint.preprocess(rebuild_vocabs=False, holdout_frac=holdout_frac)
+        print("[pipeline] preprocess 'sub_decision' (subdec_*.npz)")
+        subdec.preprocess(rebuild_vocabs=False, holdout_frac=holdout_frac)
     if train:
-        _train(stint, StintLengthModel.KEY)
+        _train(subdec, SubDecisionModel.KEY)
 
     if train:
         print(f"\n[pipeline] all models trained -> loading bundle from {artifacts_root}")
@@ -173,7 +174,7 @@ def run_stage(data_dir: str, game_partition, *, artifacts_root: str = DEFAULT_AR
     preprocess + train on ``subset_train_games`` instead of the full train pool — a compact,
     recency-weighted, coverage-complete slice (see ``training.subset``). Their val/holdout stay the
     full partition's, so early stopping + the reserved holdout are unchanged; only the train set
-    shrinks. Heads not listed (player / substitution / stint_length) keep the full corpus.
+    shrinks. Heads not listed (player / substitution / sub_decision) keep the full corpus.
     """
     warm_start_root = (warm_start_root or artifacts_root) if warm_start else None
     done = set(done or [])
@@ -245,10 +246,10 @@ def run_stage(data_dir: str, game_partition, *, artifacts_root: str = DEFAULT_AR
         sub.preprocess(**_pp(SubstitutionModel.KEY))
         _train(sub, SubstitutionModel.KEY)
 
-    stint = StintLengthModel(Encoder(), path=data_dir)
-    if StintLengthModel.KEY not in done:
-        stint.preprocess(**_pp(StintLengthModel.KEY))
-        _train(stint, StintLengthModel.KEY)
+    subdec = SubDecisionModel(Encoder(), path=data_dir)
+    if SubDecisionModel.KEY not in done:
+        subdec.preprocess(**_pp(SubDecisionModel.KEY))
+        _train(subdec, SubDecisionModel.KEY)
 
     print(f"\n[stage] trained this call: {trained}")
     return trained

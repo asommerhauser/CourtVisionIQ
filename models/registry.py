@@ -16,7 +16,7 @@ from models.conditional_time_model import ConditionalTimeModel
 from models.conditional_type_model import CONDITIONAL_MODEL_CLASSES
 from models.event_time_model import EventTimeModel
 from models.player_model import PlayerModel
-from models.stint_length_model import StintLengthModel
+from models.sub_decision_model import SubDecisionModel
 from models.substitution_model import SubstitutionModel
 
 # key -> model wrapper class
@@ -30,16 +30,18 @@ MODEL_REGISTRY: dict[str, type] = {
     **{cls.KEY: cls for cls in CONDITIONAL_MODEL_CLASSES},
     # Substitution head: predicts the incoming player of a substitution.
     SubstitutionModel.KEY: SubstitutionModel,
-    # Stint-length head: regresses how long an entering player stays on the floor.
-    StintLengthModel.KEY: StintLengthModel,
+    # Sub-decision head: how many substitutions each side makes at an opportunity. Replaces
+    # the stint-length head, which regressed how long an entering player would stay on and was
+    # consumed by a scheduler rather than by a decision.
+    SubDecisionModel.KEY: SubDecisionModel,
 }
 
 # Canonical dependency-ordered training sequence (matches models.pipeline.run_stage). Lives here —
 # the neutral registry — rather than in any one training driver, so both the full-train path and
 # per-model retrains share one list. (Order: event/time -> player -> conditional-time -> the
-# conditional type/result heads -> substitution -> stint_length.)
+# conditional type/result heads -> substitution -> sub_decision.)
 STAGE_MODEL_KEYS: list[str] = [
     EventTimeModel.KEY, PlayerModel.KEY, ConditionalTimeModel.KEY,
     *[cls.KEY for cls in CONDITIONAL_MODEL_CLASSES],
-    SubstitutionModel.KEY, StintLengthModel.KEY,
+    SubstitutionModel.KEY, SubDecisionModel.KEY,
 ]

@@ -409,6 +409,32 @@ def derive_sub_decisions(rows) -> dict[str, np.ndarray]:
     return out
 
 
+SUB_DECISION_KEYS = ("can_sub", "subs_home", "subs_away")
+
+
+def merge_sub_decisions(df, cols) -> dict:
+    """Derive the opportunity mask and the per-side counts into ``cols`` (positional over df)."""
+    n = len(df)
+    raw = {k: np.zeros((n,), dtype=np.float32) for k in SUB_DECISION_KEYS}
+    for pos, records in iter_game_rows(df):
+        sd = derive_sub_decisions(records)
+        for k in SUB_DECISION_KEYS:
+            raw[k][pos] = sd[k]
+    cols.update(raw)
+    return cols
+
+
+def append_sub_decision_batches(batches, cols, idx, n, SEQ) -> None:
+    """Pad/stack the mask and the two count targets for one game (shape ``(SEQ,)`` each).
+
+    Padded steps stay at zero, which for ``can_sub`` is exactly the mask the loss wants.
+    """
+    for k in SUB_DECISION_KEYS:
+        buf = np.zeros((SEQ,), dtype=np.float32)
+        buf[:n] = cols[k][idx]
+        batches[k].append(buf)
+
+
 def game_available(rows) -> tuple[list, list]:
     """Everyone who appears on each side's floor across ``rows``, in first-appearance order.
 
