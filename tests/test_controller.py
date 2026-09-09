@@ -21,6 +21,7 @@ from simulation.controller import (
 )
 from simulation.controller import SHOOTING_2PT, SHOOTING_3PT, SHOOTING_FOUL_TYPES
 from simulation.game_simulator import HOME, AWAY
+from models.game_state_features import GameStateScan
 from zones import ZONE_TOKENS
 
 HOME_FIVE = ["A", "B", "C", "D", "E"]
@@ -1144,3 +1145,110 @@ def test_the_retired_stint_dials_are_gone():
                  "STINT_LENGTH_SCALE", "STINT_MAX_SECONDS"):
         assert not hasattr(config, name), name
         assert name not in config._TUNING_KEYS, name
+
+
+# ===================================================================== #
+# Play expansion vs. the loss mask — workstream 12's independent check
+# ===================================================================== #
+#
+# The loss mask exists to stop the event and time heads training at positions the controller
+# never queries. Which positions those are is decided by GameStateScan._continuation_of, reading
+# cleaned rows; which positions they actually are is decided here, by the controller's own
+# _append calls. Those are two independent routes to one number, and §10 requires they cannot
+# drift, so this asserts they agree EXACTLY — not within a tolerance.
+#
+# The ledger form: a play that appends k rows contributes exactly k-1 continuations, and the
+# first row of every play is never one. Equivalently, the set of indices the predicate calls
+# "not a continuation" is exactly the set of play starts.
+
+
+def _continuation_flags(ctrl):
+    """Run the production scan over the controller's own emitted rows."""
+    scan = GameStateScan()
+    flags = []
+    for row in rows(ctrl):
+        scan.step(row)
+        flags.append(scan.is_continuation)
+    return flags
+
+
+def _drive_every_play_shape():
+    """One controller, driven through every expansion shape; returns it + the play-start indices."""
+    ctrl = make_controller(HOME)
+    starts = []
+
+    def play(fn, **script):
+        starts.append(len(rows(ctrl)))
+        ctrl.sim.script(**script)
+        fn()
+
+    # 1 row: an unassisted miss.
+    play(lambda: ctrl._do_shot(delta=5.0),
+         player=["A"], type=["paint"], result=["missed"])
+    # 1 row: the defensive board that follows it.
+    play(lambda: ctrl._do_rebound(delta=2.0),
+         type=["defensive"], player=["F"])
+    # 2 rows: assist -> the assisted basket.
+    ctrl.possession = AWAY
+    play(lambda: ctrl._do_assist(delta=5.0),
+         player=["F", "H"], type=["rim"])
+    # 2 rows: blocked shot -> the block.
+    ctrl.possession = HOME
+    play(lambda: ctrl._do_shot(delta=5.0),
+         player=["A", "F"], type=["paint"], result=["blocked"])
+    # 1 row: a steal collapses to one turnover row.
+    play(lambda: ctrl._do_turnover(delta=4.0),
+         player=["A", "F"], type=["steal"])
+    # 3 rows: a shooting foul -> two free throws.
+    ctrl.possession = HOME
+    play(lambda: ctrl._do_foul(delta=3.0),
+         player=["F", "A"], type=[SHOOTING_2PT], result=["made", "made"])
+    # 1 row: a controller-forced substitution (never a continuation — it is masked by the
+    # separate event_target rule, and must not be double-counted here).
+    ctrl.sim.home_full = HOME_FIVE + ["K"]
+    ctrl.stint_start = {p: 0.0 for p in (*HOME_FIVE, *AWAY_FIVE)}
+    play(lambda: ctrl._do_substitution(delta=1.0),
+         player=["A"], incoming=["K"])
+    return ctrl, starts
+
+
+def test_continuation_rule_matches_the_controllers_own_expansion():
+    ctrl, starts = _drive_every_play_shape()
+    flags = _continuation_flags(ctrl)
+
+    emitted = len(rows(ctrl))
+    assert emitted > len(starts), "no play expanded — the fixture is not exercising the rule"
+
+    # Every play start is NOT a continuation; every other row IS.
+    got_starts = [i for i, f in enumerate(flags) if not f]
+    assert got_starts == starts, (
+        f"predicate and expansion disagree: predicate says plays start at {got_starts}, "
+        f"the controller's _append calls say {starts}")
+
+    # The same statement as a ledger, which is the form that survives a new play handler:
+    # rows appended minus plays sampled is exactly the continuation count.
+    assert sum(flags) == emitted - len(starts)
+
+
+def test_free_throw_trip_is_continuation_all_the_way_down():
+    """A three-shot trip is one query and two continuations, not three queries."""
+    ctrl = make_controller(HOME)
+    ctrl.sim.script(player=["F", "A"], type=[SHOOTING_3PT], result=["made", "made", "made"])
+    ctrl._do_foul(delta=3.0)
+
+    flags = _continuation_flags(ctrl)
+    assert [r["event"] for r in rows(ctrl)] == ["foul", "shot", "shot", "shot"]
+    assert flags == [False, True, True, True]
+
+
+def test_a_new_play_after_a_trip_is_not_a_continuation():
+    """The trip closes: the next sampled play is a question the controller really does ask."""
+    ctrl = make_controller(HOME)
+    ctrl.sim.script(player=["F", "A"], type=[SHOOTING_2PT], result=["made", "made"])
+    ctrl._do_foul(delta=3.0)
+    n = len(rows(ctrl))
+    ctrl.sim.script(player=["F"], type=["rim"], result=["missed"])
+    ctrl._do_shot(delta=6.0)
+
+    flags = _continuation_flags(ctrl)
+    assert flags[n] is False, "the shot after a free-throw trip must be a real query"

@@ -428,3 +428,203 @@ def test_an_unknown_shot_type_raises_in_both_scans():
         gs.derive_game_state(rows)
     with pytest.raises(KeyError):
         generate_box_score(rows)
+
+
+# ---------------------------------------------------------------------------
+# The free-throw trip survives dead-ball rows (correction M's hole)
+# ---------------------------------------------------------------------------
+
+def test_a_substitution_between_free_throws_does_not_split_the_trip():
+    """The rotation window is whistle-to-whistle, so a sub lands INSIDE a trip legally.
+
+    Closing the trip on it counted a two-shot trip twice. Measured over the cleaned corpus:
+    7,474 trips in 2022-23, ~7,500 a season in every era, 99.5% with the same shooter on both
+    sides of the gap -- one trip, not two.
+    """
+    rows = [
+        _row("foul", "A1", 10.0, type="shooting 2pt", result="free throw"),
+        _row("shot", "H1", 12.0, type="free throw", result="made"),
+        _row("substitution", "A2", 12.0, type="substitution", result="substitution"),
+        _row("shot", "H1", 15.0, type="free throw", result="made"),
+        _row("shot", "A3", 22.0, type="rim", result="missed"),
+    ]
+    assert _ends(rows) == 1
+    # Dated from the LAST made attempt, exactly as the uninterrupted trip is.
+    assert _clock(rows)[-1] == 7.0
+
+
+def test_a_timeout_between_free_throws_does_not_split_the_trip():
+    rows = [
+        _row("foul", "A1", 10.0, type="shooting 2pt", result="free throw"),
+        _row("shot", "H1", 12.0, type="free throw", result="made"),
+        _row("timeout", "none", 12.0, type="home", result="none"),
+        _row("shot", "H1", 15.0, type="free throw", result="made"),
+        _row("shot", "A3", 22.0, type="rim", result="missed"),
+    ]
+    assert _ends(rows) == 1
+
+
+def test_a_dead_ball_row_does_not_resurrect_the_and_one_double_count():
+    """Resolving early also CLEARED ft_after_basket, undoing correction M's and-1 rule.
+
+    This is the shape that produced most of the measured divergence: a sub or timeout between
+    the and-1 foul and its bonus free throw made the trip look like an ordinary one.
+    """
+    rows = [
+        _row("shot", "H1", 10.0, type="rim", result="made"),
+        _row("foul", "A1", 10.0, type="shooting 2pt", result="free throw"),
+        _row("substitution", "A2", 10.0, type="substitution", result="substitution"),
+        _row("shot", "H1", 14.0, type="free throw", result="made"),
+        _row("shot", "A3", 20.0, type="rim", result="missed"),
+    ]
+    assert _ends(rows) == 1          # the made basket ended it; the bonus shot cannot again
+
+
+def test_a_dead_ball_row_does_not_resurrect_the_retaining_foul_double_count():
+    rows = [
+        _row("foul", "A1", 10.0, type="personal take", result="free throw op"),
+        _row("substitution", "A2", 10.0, type="substitution", result="substitution"),
+        _row("shot", "H1", 14.0, type="free throw", result="made"),
+        _row("shot", "H2", 20.0, type="rim", result="missed"),
+    ]
+    assert _ends(rows) == 0          # the shooting team keeps the ball
+
+
+# ---------------------------------------------------------------------------
+# The continuation rule -- rows the controller emits itself
+# ---------------------------------------------------------------------------
+
+def _cont(rows):
+    return [bool(x) for x in gs.derive_game_state(rows)[gs.CONTINUATION_KEY]]
+
+
+def test_the_assisted_shot_and_the_block_are_continuations():
+    rows = [
+        _row("assist", "H1", 10.0, type="rim", result="score"),
+        _row("shot", "H2", 10.0, type="rim", result="made"),
+        _row("shot", "A1", 20.0, type="paint", result="blocked"),
+        _row("block", "H3", 20.0, type="paint", result="block"),
+        _row("rebound", "H4", 22.0, type="defensive", result="cop"),
+    ]
+    assert _cont(rows) == [False, True, False, True, False]
+
+
+def test_every_free_throw_of_a_trip_is_a_continuation():
+    rows = [
+        _row("foul", "A1", 10.0, type="shooting 3pt", result="free throw"),
+        _row("shot", "H1", 12.0, type="free throw", result="made"),
+        _row("shot", "H1", 14.0, type="free throw", result="missed"),
+        _row("shot", "H1", 16.0, type="free throw", result="made"),
+        _row("shot", "A2", 24.0, type="rim", result="missed"),
+    ]
+    assert _cont(rows) == [False, True, True, True, False]
+
+
+def test_a_bonus_free_throw_is_a_continuation_even_though_the_foul_says_nothing():
+    """The foul row cannot decide this: the bonus is the CONTROLLER's call, not the cleaner's.
+
+    ``determine_foul_result`` writes ``nothing`` on a common foul and the controller adds the
+    free throws from ``_in_bonus``. 3,375 personal/nothing fouls in 2022-23 are followed
+    directly by a free throw -- a predicate keyed on the foul's result token misses all of them.
+    """
+    rows = [
+        _row("foul", "A1", 10.0, type="personal", result="nothing"),
+        _row("shot", "H1", 12.0, type="free throw", result="made"),
+        _row("shot", "H1", 14.0, type="free throw", result="made"),
+    ]
+    assert _cont(rows) == [False, True, True]
+
+
+def test_a_free_throw_reached_across_dead_ball_rows_is_still_a_continuation():
+    """Roughly one free throw in five is separated from its foul by subs or timeouts."""
+    rows = [
+        _row("foul", "A1", 10.0, type="shooting 2pt", result="free throw"),
+        _row("substitution", "A2", 10.0, type="substitution", result="substitution"),
+        _row("timeout", "none", 10.0, type="home", result="none"),
+        _row("substitution", "H5", 10.0, type="substitution", result="substitution"),
+        _row("shot", "H1", 12.0, type="free throw", result="made"),
+        _row("substitution", "A3", 12.0, type="substitution", result="substitution"),
+        _row("shot", "H1", 15.0, type="free throw", result="made"),
+    ]
+    # The dead-ball rows themselves are not continuations -- they are masked by the separate
+    # substitution rule, and a timeout is genuinely sampled by the event head.
+    assert _cont(rows) == [False, False, False, False, True, False, True]
+
+
+def test_a_free_throw_after_live_play_is_not_a_continuation():
+    """A live row closes the trip, so an orphaned free throw is a real query."""
+    rows = [
+        _row("foul", "A1", 10.0, type="shooting 2pt", result="free throw"),
+        _row("shot", "H1", 12.0, type="free throw", result="made"),
+        _row("rebound", "A2", 14.0, type="defensive", result="cop"),
+        _row("shot", "H1", 18.0, type="free throw", result="made"),
+    ]
+    assert _cont(rows) == [False, True, False, False]
+
+
+def test_no_continuation_spans_a_period_boundary():
+    rows = [
+        _row("foul", "A1", gs.PERIOD_LENGTH - 2.0, type="shooting 2pt", result="free throw"),
+        _row("shot", "H1", gs.PERIOD_LENGTH + 5.0, type="free throw", result="made"),
+    ]
+    assert _cont(rows) == [False, False]
+
+
+# ---------------------------------------------------------------------------
+# The mask arrays merged over a frame
+# ---------------------------------------------------------------------------
+
+def test_merge_emits_both_mask_columns_positionally():
+    rows_a = [
+        _row("assist", "H1", 10.0, type="rim", result="score"),
+        _row("shot", "H2", 10.0, type="rim", result="made"),
+    ]
+    rows_b = [
+        _row("shot", "A1", gs.PERIOD_LENGTH - 3.0, type="rim", result="missed"),
+        _row("rebound", "A2", gs.PERIOD_LENGTH + 4.0, type="defensive", result="cop"),
+    ]
+    df = pd.DataFrame([{**r, "game_id": 1} for r in rows_a]
+                      + [{**r, "game_id": 2} for r in rows_b])
+    cols = {}
+    gs.merge_game_state_features(df, cols)
+    assert list(cols[gs.CONTINUATION_KEY]) == [0.0, 1.0, 0.0, 0.0]
+    # game 2's first row is the last of its period; game 1 has no break, and no flag leaks
+    # across the game boundary.
+    assert list(cols[gs.PERIOD_BREAK_KEY]) == [0.0, 0.0, 1.0, 0.0]
+
+
+def test_the_query_mask_shifts_by_one_and_the_knob_turns_it_off():
+    rows = [
+        _row("assist", "H1", 10.0, type="rim", result="score"),
+        _row("shot", "H2", 10.0, type="rim", result="made"),
+        _row("shot", "A1", 20.0, type="rim", result="missed"),
+    ]
+    df = pd.DataFrame([{**r, "game_id": 1} for r in rows])
+    cols = {}
+    gs.merge_game_state_features(df, cols)
+
+    SEQ = 5
+    batches = {k: [] for k in gs.QUERY_MASK_KEYS}
+    gs.append_query_mask_batches(batches, cols, np.arange(3), 3, SEQ)
+    split = {k: np.stack(v) for k, v in batches.items()}
+    # Position 0 predicts row 1, which IS the assisted shot.
+    assert list(split[gs.NEXT_CONTINUATION_KEY][0]) == [1.0, 0.0, 0.0, 0.0, 0.0]
+
+    loss = np.zeros((1, SEQ), dtype=np.float32)
+    loss[0, :2] = 1.0
+    masked = gs.apply_query_mask(loss, split, time_head=False)
+    assert list(masked[0]) == [0.0, 1.0, 0.0, 0.0, 0.0]
+
+    import config
+    original = config.MASK_CONTINUATION_ROWS
+    try:
+        config.MASK_CONTINUATION_ROWS = False
+        assert np.array_equal(gs.apply_query_mask(loss, split, time_head=False), loss)
+    finally:
+        config.MASK_CONTINUATION_ROWS = original
+
+
+def test_the_mask_is_a_no_op_on_a_split_that_predates_the_feature():
+    """An npz built before this workstream must still load and train."""
+    loss = np.ones((2, 4), dtype=np.float32)
+    assert np.array_equal(gs.apply_query_mask(loss, {}, time_head=True), loss)
