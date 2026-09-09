@@ -39,6 +39,7 @@ import ast
 
 import numpy as np
 
+import config
 from zones import points_for_shot
 
 # --- Period geometry (mirrors simulation/controller.py constants) ---
@@ -94,11 +95,17 @@ _LIVE_EVENTS = {"shot", "rebound", "turnover", "block", "assist"}
 # 99.5% of them with the same shooter on both sides of the gap, i.e. one trip and not two).
 _DEAD_BALL_EVENTS = {"substitution", "timeout"}
 
-# Per-row boolean written alongside the game-state scalars: this row is one the controller emits
-# itself, as the continuation of a play it already sampled. Not a model input -- it is the loss
-# mask (see the module docstring on masking below), so it is deliberately NOT in
-# GAME_STATE_KEYS.
+# Per-row booleans written alongside the game-state scalars. Neither is a model input -- both are
+# loss masks -- so they are deliberately NOT in GAME_STATE_KEYS.
+#
+#   CONTINUATION_KEY  this row is one the controller emits itself, as the continuation of a play
+#                     it already sampled (see GameStateScan._continuation_of).
+#   PERIOD_BREAK_KEY  this row is the last of its period within its game. The gap from here to
+#                     the next row spans a buzzer, and the controller never samples across one --
+#                     it clamps at the boundary and starts the new period fresh. Masks the TIME
+#                     head only: the event head is still asked what opens the next period.
 CONTINUATION_KEY = "is_continuation"
+PERIOD_BREAK_KEY = "period_break"
 
 
 def possession_boundary(event: str, etype: str, result: str):
@@ -458,15 +465,22 @@ def merge_game_state_features(df, cols) -> dict:
     n = len(df)
     raw = {k: np.zeros((n,), dtype=np.float32) for k in GAME_STATE_KEYS}
     cont = np.zeros((n,), dtype=np.float32)
+    brk = np.zeros((n,), dtype=np.float32)
     for pos, records in iter_game_rows(df):
         gs = derive_game_state(records)
         for k in GAME_STATE_KEYS:
             raw[k][pos] = gs[k]
         cont[pos] = gs[CONTINUATION_KEY]
+        # Last row of its period, WITHIN this game -- computed here, where the game's rows are
+        # the whole array, so no boundary can leak into the neighbouring game.
+        period = gs["period_idx"]
+        if len(period) > 1:
+            brk[pos[:-1]] = (period[1:] != period[:-1]).astype(np.float32)
     cols.update(normalize_game_state(raw))
-    # Not normalized: it is a 0/1 mask, and it rides the same single scan so no head pays for a
-    # second pass over the corpus to get it.
+    # Not normalized: they are 0/1 masks, and they ride the same single scan, so no head pays for
+    # a second pass over the corpus to get them.
     cols[CONTINUATION_KEY] = cont
+    cols[PERIOD_BREAK_KEY] = brk
     return cols
 
 
@@ -493,6 +507,50 @@ def append_game_state_batches(batches, cols, idx, n, SEQ) -> None:
         buf = np.zeros((SEQ, 1), dtype=np.float32)
         buf[:n, 0] = cols[k][idx]
         batches[k].append(buf)
+
+
+# --- Loss masking: train the next-step heads only where the sim actually asks ------------------
+#
+# Both arrays are per-POSITION, not per-row: position i predicts row i+1, so the continuation
+# flag is shifted the same way ``event_target`` is. They are stored in the npz unconditionally
+# and applied at dataset time (see :func:`apply_query_mask`), so turning the masking off is a
+# config change and two trains against the SAME preprocess -- not a re-clean.
+NEXT_CONTINUATION_KEY = "next_is_continuation"
+QUERY_MASK_KEYS = (NEXT_CONTINUATION_KEY, PERIOD_BREAK_KEY)
+
+
+def append_query_mask_batches(batches, cols, idx, n, SEQ) -> None:
+    """Pad/stack the loss-mask arrays for one game (mirrors append_game_state_batches).
+
+    ``next_is_continuation`` is shifted by one exactly as ``event_target`` is: the last real row
+    has no next row, and ``loss_mask`` already zeroes that position.
+    """
+    cont = np.zeros((SEQ,), dtype=np.float32)
+    if n > 1:
+        cont[: n - 1] = cols[CONTINUATION_KEY][idx][1:]
+    batches[NEXT_CONTINUATION_KEY].append(cont)
+
+    brk = np.zeros((SEQ,), dtype=np.float32)
+    brk[:n] = cols[PERIOD_BREAK_KEY][idx]
+    batches[PERIOD_BREAK_KEY].append(brk)
+
+
+def apply_query_mask(mask, split, *, time_head: bool):
+    """Zero a ``(N, SEQ)`` sample-weight mask at the positions the controller never queries.
+
+    One definition, called by every next-step head, for the reason corrections N and R were both
+    written down: a rule read in more than one place drifts. ``time_head`` adds the period-break
+    row, which is a time-head-only exclusion -- the event head IS asked what opens the next
+    period, it just is not asked how long the buzzer takes.
+
+    No-op when the knob is off or the split predates the feature (key absent), so an npz built
+    before this workstream still loads.
+    """
+    if config.MASK_CONTINUATION_ROWS and NEXT_CONTINUATION_KEY in split:
+        mask = mask * (1.0 - split[NEXT_CONTINUATION_KEY])
+    if time_head and config.MASK_PERIOD_BREAK_TIME and PERIOD_BREAK_KEY in split:
+        mask = mask * (1.0 - split[PERIOD_BREAK_KEY])
+    return mask.astype(np.float32)
 
 
 # =====================
@@ -543,14 +601,23 @@ def _percentile(values, q):
 
 
 def _scan_season(path):
-    """Per-game possession counts, durations, and the formula's estimate, for one season file."""
+    """Per-game possession counts, durations, the formula's estimate, and the mask shares.
+
+    The mask shares ride along because this pass already visits every row with the scan that
+    decides them, so the loss-mask number costs nothing extra. A *position* is a row that has a
+    next row in the same game -- what ``loss_mask`` marks, and what the event and time heads
+    actually train on. A position is masked when the row it predicts is one the controller emits
+    itself: a substitution (already masked at dataset time) or a continuation.
+    """
     import pandas as pd
 
     df = pd.read_csv(path)
     per_game_ends, lengths, clipped, rows = [], [], 0, 0
+    positions = sub_next = cont_next = either = 0
     for _, game in df.groupby("game_id", sort=False):
         scan = GameStateScan()
         before = 0
+        prev_seen = False
         for row in game.to_dict("records"):
             *_, clock = scan.step(row)
             rows += 1
@@ -559,8 +626,16 @@ def _scan_season(path):
             if scan.poss_ends != before:      # this row completed a possession
                 lengths.append(clock)
                 before = scan.poss_ends
+            if prev_seen:                     # the position BEFORE this row predicts this row
+                positions += 1
+                is_sub = _norm(row.get("event")) == "substitution"
+                sub_next += is_sub
+                cont_next += scan.is_continuation
+                either += is_sub or scan.is_continuation
+            prev_seen = True
         per_game_ends.append(scan.poss_ends)
-    return per_game_ends, lengths, clipped, rows, _formula_possessions(df)
+    return (per_game_ends, lengths, clipped, rows, _formula_possessions(df),
+            positions, sub_next, cont_next, either)
 
 
 def _non_ending_fta(df) -> int:
@@ -661,6 +736,7 @@ def _main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     rows = []
+    masks = []
     failures = []
     for label in (x.strip() for x in args.seasons.split(",") if x.strip()):
         path = os.path.join(args.data_dir, f"season{label}.csv")
@@ -668,7 +744,8 @@ def _main(argv=None) -> int:
             print(f"WARNING: no cleaned file at {path}")
             continue
         print(f"scanning {label}: {path} ...", flush=True)
-        ends, lengths, clipped, n, formula = _scan_season(path)
+        (ends, lengths, clipped, n, formula,
+         positions, sub_next, cont_next, either) = _scan_season(path)
         if not ends:
             failures.append(f"{label}: no games found")
             continue
@@ -678,6 +755,7 @@ def _main(argv=None) -> int:
                      sum(lengths) / len(lengths) if lengths else float("nan"),
                      _percentile(lengths, 0.50), _percentile(lengths, 0.95),
                      100.0 * clipped / n if n else 0.0))
+        masks.append((label, positions, sub_next, cont_next, either))
         if abs(per_team - formula) > PACE_TOLERANCE:
             failures.append(
                 f"{label}: {per_team:.1f} possessions per team per game against {formula:.1f} "
@@ -694,6 +772,16 @@ def _main(argv=None) -> int:
     for label, games, per_team, formula, mean, p50, p95, pct in rows:
         print(f"{label:>8} {games:>7} {per_team:>10.1f} {formula:>8.1f} {per_team-formula:>+6.1f} "
               f"{mean:>8.1f} {p50:>7.1f} {p95:>7.1f} {pct:>6.1f}%")
+
+    # Workstream 12's number: how much of what the event and time heads train on is a question
+    # the controller never asks. "before" is what ships today (the substitution mask alone).
+    print()
+    print(f"{'season':>8} {'positions':>11} {'sub':>8} {'contin.':>9} {'before':>8} {'after':>8}")
+    for label, positions, sub_next, cont_next, either in masks:
+        if not positions:
+            continue
+        print(f"{label:>8} {positions:>11,} {sub_next:>8,} {cont_next:>9,} "
+              f"{100.0*sub_next/positions:>7.1f}% {100.0*either/positions:>7.1f}%")
 
     print()
     if failures:

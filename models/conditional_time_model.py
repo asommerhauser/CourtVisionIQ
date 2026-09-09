@@ -58,8 +58,11 @@ from models.season_features import (
 )
 from models.game_state_features import (
     GAME_STATE_INPUT_KEYS,
+    QUERY_MASK_KEYS,
     merge_game_state_features,
     append_game_state_batches,
+    append_query_mask_batches,
+    apply_query_mask,
     make_game_state_inputs,
     game_state_projections,
 )
@@ -218,7 +221,8 @@ class ConditionalTimeModel(SubstitutionModel):
 
         batches = {k: [] for k in (*keys_1d, *keys_roster, *keys_cont, *SEASON_INPUT_KEYS,
                                    *GAME_STATE_INPUT_KEYS, *ROSTER_STATE_KEYS,
-                                   *keys_next_cat, "next_time_target", "pad_mask", "loss_mask")}
+                                   *keys_next_cat, *QUERY_MASK_KEYS,
+                                   "next_time_target", "pad_mask", "loss_mask")}
 
         game_ids_sorted = [g for g in np.unique(game_id) if g in games]
         for g in game_ids_sorted:
@@ -261,6 +265,7 @@ class ConditionalTimeModel(SubstitutionModel):
             loss_mask[: max(n - 1, 0)] = 1.0  # last real row has no next target
             batches["pad_mask"].append(pad_mask)
             batches["loss_mask"].append(loss_mask)
+            append_query_mask_batches(batches, cols, idx, n, SEQ)
 
         return {k: np.stack(v) if v else np.empty((0,)) for k, v in batches.items()}
 
@@ -357,6 +362,15 @@ class ConditionalTimeModel(SubstitutionModel):
         ``loss_mask`` zeroes PAD / no-next steps; we additionally zero every step whose next event is
         a substitution (subs are injected by the rotation scheduler at inference, never timed here),
         exactly mirroring ``EventTimeModel._make_dataset``.
+
+        And the same masking of continuation rows, for the same reason and by the same shared
+        rule. This head is the sim's actual time advancement -- ``_advance_for`` routes through
+        ``predict_delta`` whenever the conditional head is loaded -- and it is called ONCE per
+        sampled play, never at a continuation row: the block, the assisted shot and every free
+        throw are appended with no clock advance at all. So the positions it is asked about are
+        exactly the positions the event head is asked about, and leaving them in would train the
+        pace of the model on ~21% of gaps nobody ever requests. ``time_head=True`` also drops the
+        row before a period break, whose gap spans a buzzer the controller clamps at.
         """
         inputs = {k: split[k] for k in self.INPUT_KEYS}
         targets = {self.output_name: split["next_time_target"]}
@@ -364,7 +378,7 @@ class ConditionalTimeModel(SubstitutionModel):
         sub_id = self.encoder.encode_event(SUB_EVENT)
         mask = (split["loss_mask"] * (split["next_event"] != sub_id)).astype(np.float32)
         mask = apply_recency(mask, split)
-        sample_weights = {self.output_name: mask}
+        sample_weights = {self.output_name: apply_query_mask(mask, split, time_head=True)}
 
         ds = tf.data.Dataset.from_tensor_slices((inputs, targets, sample_weights))
         if shuffle:
