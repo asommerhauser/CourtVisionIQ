@@ -35,7 +35,7 @@ import ast
 
 import numpy as np
 
-from config import ROSTER_SIZE
+from config import BENCH_SIZE, ROSTER_SIZE
 from models.game_state_features import iter_game_rows
 
 # Technicals are bench/team fouls and do not count toward the personal-foul disqualification --
@@ -54,6 +54,19 @@ ROSTER_STATE_KEYS = (
     "court_fouls_home", "court_fouls_away",
 )
 
+# The bench bundle: who is available and not on the floor, and the state each of them carries.
+# ``bench_home`` / ``bench_away`` are player ids like the roster columns; the rest are
+# ``(SEQ, BENCH_SIZE)`` floats aligned to them slot for slot, and are the order
+# LineupScan.bench_state returns them in after the ids.
+BENCH_ID_KEYS = ("bench_home", "bench_away")
+BENCH_STATE_KEYS = (
+    "bench_rest_seconds_home", "bench_rest_seconds_away",
+    "bench_played_seconds_home", "bench_played_seconds_away",
+    "bench_fouls_home", "bench_fouls_away",
+    "bench_has_played_home", "bench_has_played_away",
+)
+BENCH_KEYS = (*BENCH_ID_KEYS, *BENCH_STATE_KEYS)
+
 # Fixed normalization: (clip_lo, clip_hi, divisor), chosen so typical values land ~[0, 1].
 _NORM = {
     # A stint past 20 minutes is a starter who has not come off; past that the exact value stops
@@ -67,6 +80,18 @@ _NORM = {
     # Six is disqualification (config.FOUL_OUT_LIMIT), so three -- foul trouble -- is 1.0.
     "court_fouls_home": (0.0, 6.0, 3.0),
     "court_fouls_away": (0.0, 6.0, 3.0),
+    # Seconds since a bench player sat down, or since tip-off if he has not played. "He sat down
+    # nine seconds ago" is the thing this exists to make learnable, so the scale is the short
+    # end: a ten-minute rest is 1.0 and everything longer clips.
+    "bench_rest_seconds_home": (0.0, 1800.0, 600.0),
+    "bench_rest_seconds_away": (0.0, 1800.0, 600.0),
+    "bench_played_seconds_home": (0.0, 3600.0, 1440.0),
+    "bench_played_seconds_away": (0.0, 3600.0, 1440.0),
+    "bench_fouls_home": (0.0, 6.0, 3.0),
+    "bench_fouls_away": (0.0, 6.0, 3.0),
+    # Already 0/1; the entry exists so every key normalizes through one path.
+    "bench_has_played_home": (0.0, 1.0, 1.0),
+    "bench_has_played_away": (0.0, 1.0, 1.0),
 }
 
 
@@ -106,14 +131,25 @@ class LineupScan:
     the clock of the row he first appears on.
     """
 
-    __slots__ = ("played", "entered_at", "fouls", "prev_time", "prev_five")
+    __slots__ = ("played", "entered_at", "fouls", "prev_time", "prev_five",
+                 "available", "left_at", "now")
 
-    def __init__(self) -> None:
+    def __init__(self, available: tuple[list, list] | None = None) -> None:
         self.played: dict[str, float] = {}
         self.entered_at: dict[str, float] = {}
         self.fouls: dict[str, int] = {}
         self.prev_time = None
         self.prev_five: tuple[list, list] = ([], [])
+        # Who could come on, per side. The bench is this minus the floor, so the scan cannot
+        # derive it from rows alone: at train time it is everyone who plays in the game (the
+        # same whole-game lookahead ``game_available_mask`` already takes), at rollout it is the
+        # simulator's full roster. Left as None the bench bundle is simply empty, which is what
+        # every on-court-only caller wants.
+        self.available: tuple[list, list] = available or ([], [])
+        # When each player last went off. Absent means he has not played, and his rest is
+        # measured from tip-off rather than from nothing.
+        self.left_at: dict[str, float] = {}
+        self.now = 0.0
 
     def step(self, row) -> tuple:
         """Fold one row in; return six roster-parallel lists in ``ROSTER_STATE_KEYS`` order."""
@@ -134,6 +170,7 @@ class LineupScan:
                 self.entered_at[name] = t
         for name in [n for n in self.entered_at if n not in on_court]:
             del self.entered_at[name]
+            self.left_at[name] = t
 
         # --- Fouls: inclusive of this row, matching the game-state features' convention. ---
         event = _norm_str(row.get("event"))
@@ -144,6 +181,7 @@ class LineupScan:
 
         self.prev_time = t
         self.prev_five = (home, away)
+        self.now = t
 
         return (
             [t - self.entered_at.get(p, t) for p in home],
@@ -155,30 +193,96 @@ class LineupScan:
         )
 
 
-def derive_lineup_state(rows) -> dict[str, np.ndarray]:
+    def bench_state(self, side: int) -> tuple:
+        """``(names, rest_seconds, played_seconds, fouls, has_played)`` for one side's bench.
+
+        Read after :meth:`step`, so it describes the floor as of the row just folded in. ``side``
+        is 0 for home, 1 for away.
+
+        The bench is ``available`` minus whoever is on the floor, in ``available`` order. That
+        order carries no meaning -- the set encoder pools permutation-invariantly -- but it has
+        to stay stable within a row so the ids and the scalars line up slot for slot.
+
+        Rest is measured from when a player last went off, or from tip-off if he has not played
+        yet. Those are different facts, which is why ``has_played`` rides alongside: a starter
+        resting two minutes and a deep bench player who has not moved all night both read as
+        "a long time", and only the flag separates them.
+        """
+        on_court = set(self.prev_five[0]) | set(self.prev_five[1])
+        names = [p for p in self.available[side] if p not in on_court][:BENCH_SIZE]
+        return (
+            names,
+            [self.now - self.left_at.get(p, 0.0) for p in names],
+            [self.played.get(p, 0.0) for p in names],
+            [float(self.fouls.get(p, 0)) for p in names],
+            [1.0 if p in self.left_at or self.played.get(p) else 0.0 for p in names],
+        )
+
+
+def game_available(rows) -> tuple[list, list]:
+    """Everyone who appears on each side's floor across ``rows``, in first-appearance order.
+
+    The training-time reading of "available", and the same whole-game lookahead
+    ``game_available_mask`` (``models/event_time_model.py:198``) already takes: a player the game
+    never puts on the floor is not on the bench in any sense the model can use. At rollout the
+    simulator's full roster plays this part instead.
+    """
+    home: dict = {}
+    away: dict = {}
+    for row in rows:
+        for seen, key in ((home, "roster_home"), (away, "roster_away")):
+            for name in _roster(row.get(key)):
+                seen.setdefault(name, None)
+    return list(home), list(away)
+
+
+def derive_lineup_state(rows, encode_bench=None) -> dict[str, np.ndarray]:
     """Per-row per-player on-court state for one game's ordered event ``rows``.
 
     Returns raw (un-normalized) ``(N, ROSTER_SIZE)`` float arrays keyed by ``ROSTER_STATE_KEYS``,
     slot-aligned to that row's ``roster_home`` / ``roster_away``. A thin driver over
     :class:`LineupScan`, exactly as ``derive_game_state`` is over ``GameStateScan``.
+
+    Given ``encode_bench`` -- a callable turning a list of names into ``BENCH_SIZE`` player ids --
+    the bench bundle comes too: ``(N, BENCH_SIZE)`` int32 ids under ``BENCH_ID_KEYS`` and
+    ``(N, BENCH_SIZE)`` floats under ``BENCH_STATE_KEYS``. One scan produces both, because the
+    bench state is the same bookkeeping read from the other side.
     """
     rows = list(rows)
     n = len(rows)
     out = {k: np.zeros((n, ROSTER_SIZE), dtype=np.float32) for k in ROSTER_STATE_KEYS}
-    scan = LineupScan()
+    if encode_bench is not None:
+        out.update({k: np.zeros((n, BENCH_SIZE), dtype=np.int32) for k in BENCH_ID_KEYS})
+        out.update({k: np.zeros((n, BENCH_SIZE), dtype=np.float32) for k in BENCH_STATE_KEYS})
+    scan = LineupScan(game_available(rows) if encode_bench is not None else None)
     for i, row in enumerate(rows):
         for k, values in zip(ROSTER_STATE_KEYS, scan.step(row)):
             for j, v in enumerate(values[:ROSTER_SIZE]):
                 out[k][i, j] = v
+        if encode_bench is None:
+            continue
+        for side, tag in ((0, "home"), (1, "away")):
+            names, *planes = scan.bench_state(side)
+            out[f"bench_{tag}"][i] = encode_bench(names)
+            for stem, values in zip(("bench_rest_seconds", "bench_played_seconds",
+                                     "bench_fouls", "bench_has_played"), planes):
+                for j, v in enumerate(values[:BENCH_SIZE]):
+                    out[f"{stem}_{tag}"][i, j] = v
     return out
 
 
 def normalize_lineup_state(raw: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """Clip + scale each raw array by its fixed constant (no train-fit stats)."""
+    """Clip + scale each raw array by its fixed constant (no train-fit stats).
+
+    Player-id arrays (the bench ids) pass through untouched: they are tokens, not quantities.
+    """
     out = {}
-    for k in ROSTER_STATE_KEYS:
-        lo, hi, div = _NORM[k]
-        out[k] = (np.clip(raw[k], lo, hi) / div).astype(np.float32)
+    for k, v in raw.items():
+        if k in _NORM:
+            lo, hi, div = _NORM[k]
+            out[k] = (np.clip(v, lo, hi) / div).astype(np.float32)
+        else:
+            out[k] = v
     return out
 
 
@@ -206,7 +310,7 @@ def normalize_lineup_state_row(raw_row) -> tuple:
 # --- Preprocessing ---
 # =====================
 
-def merge_rotation_features(df, cols) -> dict:
+def merge_rotation_features(df, cols, encode_bench=None) -> dict:
     """Derive, normalize, and merge the roster-parallel arrays into ``cols``.
 
     Scans each game (grouped, original row order preserved) and writes the six normalized
@@ -216,18 +320,36 @@ def merge_rotation_features(df, cols) -> dict:
     """
     n = len(df)
     raw = {k: np.zeros((n, ROSTER_SIZE), dtype=np.float32) for k in ROSTER_STATE_KEYS}
+    if encode_bench is not None:
+        raw.update({k: np.zeros((n, BENCH_SIZE), dtype=np.int32) for k in BENCH_ID_KEYS})
+        raw.update({k: np.zeros((n, BENCH_SIZE), dtype=np.float32) for k in BENCH_STATE_KEYS})
     for pos, records in iter_game_rows(df):
-        ls = derive_lineup_state(records)
-        for k in ROSTER_STATE_KEYS:
+        ls = derive_lineup_state(records, encode_bench=encode_bench)
+        for k in raw:
             raw[k][pos] = ls[k]
     cols.update(normalize_lineup_state(raw))
     return cols
 
 
-def append_rotation_batches(batches, cols, idx, n, SEQ) -> None:
-    """Pad/stack the roster-parallel arrays for one game (mirrors append_season_batches)."""
+def append_rotation_batches(batches, cols, idx, n, SEQ, pad_player: int = 0) -> None:
+    """Pad/stack the roster-parallel arrays for one game (mirrors append_season_batches).
+
+    Bench ids pad with ``pad_player`` rather than zero, the way the roster columns do -- the set
+    encoder derives its slot mask from ``ids != pad_token``, so a padded slot has to carry the
+    PAD id or it pools an unrelated player into the bench vector.
+    """
     for k in ROSTER_STATE_KEYS:
         buf = np.zeros((SEQ, ROSTER_SIZE), dtype=np.float32)
+        buf[:n] = cols[k][idx]
+        batches[k].append(buf)
+    if BENCH_ID_KEYS[0] not in batches:
+        return
+    for k in BENCH_ID_KEYS:
+        buf = np.full((SEQ, BENCH_SIZE), pad_player, dtype=np.int32)
+        buf[:n] = cols[k][idx]
+        batches[k].append(buf)
+    for k in BENCH_STATE_KEYS:
+        buf = np.zeros((SEQ, BENCH_SIZE), dtype=np.float32)
         buf[:n] = cols[k][idx]
         batches[k].append(buf)
 
@@ -242,6 +364,28 @@ def make_rotation_inputs(SEQ) -> dict:
 
     return {k: Input(shape=(SEQ, ROSTER_SIZE), dtype="float32", name=k)
             for k in ROSTER_STATE_KEYS}
+
+
+def make_bench_inputs(SEQ) -> dict:
+    """Keras Inputs for the bench bundle: int32 ids plus (SEQ, BENCH_SIZE) float planes."""
+    from keras import Input  # local import: keep the preprocessing helpers TF-free.
+
+    out = {k: Input(shape=(SEQ, BENCH_SIZE), dtype="int32", name=k) for k in BENCH_ID_KEYS}
+    out.update({k: Input(shape=(SEQ, BENCH_SIZE), dtype="float32", name=k)
+                for k in BENCH_STATE_KEYS})
+    return out
+
+
+def bench_scalars(bench_inputs, side: str) -> list:
+    """One side's bench scalars, in the order the bench encoder expects them."""
+    return [bench_inputs[f"{stem}_{side}"]
+            for stem in ("bench_rest_seconds", "bench_played_seconds",
+                         "bench_fouls", "bench_has_played")]
+
+
+# Per-player scalars the bench encoder is built for: rest since sitting, minutes, fouls, and
+# whether he has played at all. A different four from the on-court set, and a separate encoder.
+NUM_BENCH_SCALARS = 4
 
 
 def side_scalars(rest, rotation_inputs, side: str) -> list:

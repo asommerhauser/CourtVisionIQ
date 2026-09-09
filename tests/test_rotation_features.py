@@ -15,6 +15,8 @@ import pytest
 
 from config import ROSTER_SIZE
 from models.rotation_features import (
+    BENCH_ID_KEYS,
+    BENCH_STATE_KEYS,
     NUM_ROSTER_SCALARS,
     ROSTER_STATE_KEYS,
     LineupScan,
@@ -261,3 +263,83 @@ def test_the_scalars_reach_the_encoder_with_rest_first():
         "<rest_home>", "<stint_seconds_home>", "<played_seconds_home>", "<court_fouls_home>",
     ]
     assert len(side_scalars("<rest_away>", rotation, "away")) == NUM_ROSTER_SCALARS
+
+
+# ---------------------------------------------------------------------------
+# The bench bundle
+# ---------------------------------------------------------------------------
+
+BENCH = ["Kate", "Liam", "Mia"]
+
+
+def _avail():
+    return (HOME + BENCH, list(AWAY))
+
+
+def test_the_bench_is_who_is_available_and_not_on_the_floor():
+    scan = LineupScan(_avail())
+    scan.step(_row(0, event="start", player="start"))
+    names, *_ = scan.bench_state(0)
+    assert names == BENCH
+
+    scan.step(_row(300, home=["Kate"] + HOME[1:]))
+    names, *_ = scan.bench_state(0)
+    assert set(names) == {"Alice", "Liam", "Mia"}, "Alice sat down, Kate came on"
+
+
+def test_bench_rest_runs_from_sitting_down_and_has_played_says_which():
+    """A starter resting two minutes and a deep bench player who has not moved all night both
+    read as a long time; only the flag separates them."""
+    scan = LineupScan(_avail())
+    scan.step(_row(0, event="start", player="start"))
+    scan.step(_row(300, home=["Kate"] + HOME[1:]))          # Alice off at 300
+    scan.step(_row(500, home=["Kate"] + HOME[1:]))
+
+    names, rest, played, fouls, has_played = scan.bench_state(0)
+    by_name = dict(zip(names, rest))
+    assert by_name["Alice"] == pytest.approx(200.0)          # sat down at 300, now 500
+    assert by_name["Liam"] == pytest.approx(500.0)           # never played: measured from tip-off
+    flags = dict(zip(names, has_played))
+    assert flags["Alice"] == 1.0
+    assert flags["Liam"] == 0.0
+    assert dict(zip(names, played))["Alice"] == pytest.approx(300.0)
+
+
+def test_a_scan_with_no_available_set_has_no_bench():
+    """Every on-court-only caller builds LineupScan bare, and must not pay for a bench."""
+    scan = LineupScan()
+    scan.step(_row(0, event="start", player="start"))
+    names, *_ = scan.bench_state(0)
+    assert names == []
+
+
+def test_bench_ids_are_encoded_and_pad_filled_to_bench_size():
+    from config import BENCH_SIZE
+
+    rows = [_row(0, event="start", player="start"), _row(300)]
+    seen = {}
+    encode = lambda names: (
+        [seen.setdefault(n, len(seen) + 1) for n in names[:BENCH_SIZE]]
+        + [0] * (BENCH_SIZE - len(names[:BENCH_SIZE])))
+
+    out = derive_lineup_state(rows, encode_bench=encode)
+    for key in BENCH_ID_KEYS:
+        assert out[key].shape == (len(rows), BENCH_SIZE)
+        assert out[key].dtype == np.int32
+    for key in BENCH_STATE_KEYS:
+        assert out[key].shape == (len(rows), BENCH_SIZE)
+    # Only the five who appear on the floor are available in this fixture, so with the five on
+    # court the bench is empty and every slot is PAD.
+    assert not out["bench_home"].any()
+
+
+def test_bench_ids_are_not_normalized():
+    """They are tokens, not quantities: a clip-and-divide would corrupt every player id."""
+    raw = {
+        "bench_home": np.array([[7, 9, 0]], dtype=np.int32),
+        "bench_fouls_home": np.array([[3.0, 99.0, 0.0]], dtype=np.float32),
+    }
+    out = normalize_lineup_state(raw)
+    assert np.array_equal(out["bench_home"], raw["bench_home"])
+    assert out["bench_fouls_home"][0, 0] == pytest.approx(1.0)
+    assert out["bench_fouls_home"][0, 1] == pytest.approx(2.0)      # clipped at the foul limit

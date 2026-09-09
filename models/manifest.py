@@ -41,7 +41,7 @@ SCHEMA = 1
 # mismatch -- just quietly wrong attention in every rollout. Recording them is the only thing
 # that makes that mismatch visible.
 ARCH_KEYS = ("MODEL_DIM", "NUM_LAYERS", "NUM_HEADS", "FF_DIM", "ROSTER_SAB_LAYERS",
-             "MAX_SEQUENCE_LENGTH", "ROSTER_SIZE",
+             "MAX_SEQUENCE_LENGTH", "ROSTER_SIZE", "BENCH_SIZE",
              "LOCAL_ATTENTION_HEADS", "LOCAL_ATTENTION_WINDOW")
 
 
