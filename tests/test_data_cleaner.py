@@ -837,11 +837,16 @@ def test_substitution_home_away_identifies_team(tmp_path):
 
 
 def test_substitution_only_incoming_present(tmp_path):
-    """Only `entered` present: outgoing unknown → player='null', incoming kept."""
+    """Only `entered` present, and the lineup does not move: outgoing stays unknown.
+
+    The token is "none", not "null": data_loading reads the cleaned CSVs with pandas' default
+    NA list, which contains "null", so that sentinel becomes NaN before any vocabulary is built
+    and appears in none of the five. "none" is a real token in all of them.
+    """
     row = {"event_type": "substitution", "entered": "Zach", "left": None}
     cleaned = _parse(tmp_path, [row])
     sub = cleaned[cleaned["event"] == "substitution"].iloc[0]
-    assert sub["player"] == "null"              # no outgoing → "null" token
+    assert sub["player"] == "none"              # no outgoing, and none recoverable
     assert sub["type"] == "substitution"        # clean type (not the leaving player)
     assert sub["secondary_player"] == "Zach"    # incoming player
 
@@ -970,3 +975,137 @@ def test_shot_away_player_has_home_indicator_2(tmp_path):
     cleaned = _parse(tmp_path, [row])
     shot = cleaned[cleaned["event"] == "shot"].iloc[0]
     assert shot["home/away"] == 2  # home_indicator: 1=home, 2=away
+
+
+# ---------------------------------------------------------------------------
+# On-court five repair (_repair_fives)
+# ---------------------------------------------------------------------------
+#
+# The raw lineup snapshots do not agree with the substitution rows: a free-throw row following
+# a substitution carries the pre-substitution five, and quarter-break changes have no
+# substitution row at all. Everything the rotation model derives from the five depends on this.
+
+def test_a_one_row_stale_lineup_does_not_move_the_five(tmp_path):
+    """A snapshot that reverts on the very next row is stale, not a substitution."""
+    rows = [
+        {"event_type": "substitution", "elapsed": "0:00:30",
+         "left": "Alice", "entered": "Kate", "h1": "Kate"},
+        # The raw file writes the FT that follows with the pre-substitution five.
+        {"event_type": "shot", "elapsed": "0:00:30", "player": "Frank", "h1": "Alice"},
+        {"event_type": "shot", "elapsed": "0:00:40", "player": "Bob", "h1": "Kate"},
+    ]
+    cleaned = _parse(tmp_path, rows)
+    subs = cleaned[cleaned["event"] == "substitution"]
+    assert len(subs) == 1, "the flicker must not produce a second substitution"
+    for _, row in cleaned[cleaned["time"] >= 30].iterrows():
+        assert "Kate" in _roster_list(row["roster_home"])
+        assert "Alice" not in _roster_list(row["roster_home"])
+
+
+def test_two_stale_rows_in_a_row_still_do_not_undo_a_substitution(tmp_path):
+    """The case a stability test alone gets wrong.
+
+    A two-shot trip writes BOTH free throws with the pre-substitution five, so the stale
+    snapshot is repeated and looks stable. Substitution rows are authoritative: a snapshot
+    naming a player at the same instant a substitution took them off is the stale one.
+    """
+    rows = [
+        {"event_type": "substitution", "elapsed": "0:00:30",
+         "left": "Alice", "entered": "Kate", "h1": "Kate"},
+        {"event_type": "free throw", "elapsed": "0:00:30", "player": "Frank",
+         "result": "made", "h1": "Alice"},
+        {"event_type": "free throw", "elapsed": "0:00:30", "player": "Frank",
+         "result": "made", "h1": "Alice"},
+        {"event_type": "shot", "elapsed": "0:00:45", "player": "Bob", "h1": "Kate"},
+    ]
+    cleaned = _parse(tmp_path, rows)
+    subs = cleaned[cleaned["event"] == "substitution"]
+    assert len(subs) == 1, "the trip must not undo and redo the substitution"
+    assert subs.iloc[0]["player"] == "Alice"
+    assert subs.iloc[0]["secondary_player"] == "Kate"
+
+
+def test_a_lineup_change_with_no_substitution_row_becomes_one(tmp_path):
+    """Quarter-break changes are recorded as a changed snapshot and nothing else."""
+    rows = [
+        {"event_type": "shot", "elapsed": "0:00:30", "player": "Alice"},
+        {"event_type": "shot", "elapsed": "0:00:40", "player": "Bob", "h1": "Kate"},
+        {"event_type": "shot", "elapsed": "0:00:50", "player": "Bob", "h1": "Kate"},
+    ]
+    cleaned = _parse(tmp_path, rows)
+    subs = cleaned[cleaned["event"] == "substitution"]
+    assert len(subs) == 1
+    assert subs.iloc[0]["player"] == "Alice"
+    assert subs.iloc[0]["secondary_player"] == "Kate"
+    assert subs.iloc[0]["home/away"] == 1
+
+
+def test_simultaneous_derived_substitutions_carry_progressive_rosters(tmp_path):
+    """Two changes at one instant are two rows, each showing only the swaps made so far.
+
+    A row naming one swap while its roster already shows both is a state nothing can fold
+    forward, which is exactly what the measurement pass checks.
+    """
+    rows = [
+        {"event_type": "shot", "elapsed": "0:00:30", "player": "Alice"},
+        {"event_type": "shot", "elapsed": "0:00:40", "player": "Charlie",
+         "h1": "Kate", "h2": "Liam"},
+        {"event_type": "shot", "elapsed": "0:00:50", "player": "Charlie",
+         "h1": "Kate", "h2": "Liam"},
+    ]
+    cleaned = _parse(tmp_path, rows)
+    subs = cleaned[cleaned["event"] == "substitution"]
+    assert len(subs) == 2
+    first, second = _roster_list(subs.iloc[0]["roster_home"]), _roster_list(subs.iloc[1]["roster_home"])
+    assert sum(p in first for p in ("Kate", "Liam")) == 1, "the first row shows one swap, not both"
+    assert all(p in second for p in ("Kate", "Liam"))
+
+
+def test_a_lineup_that_loses_a_player_emits_a_substitution_with_no_incoming(tmp_path):
+    """Four `entered` and two `left` nulls a season; the five must not silently shrink twice."""
+    rows = [
+        {"event_type": "shot", "elapsed": "0:00:30", "player": "Alice"},
+        {"event_type": "shot", "elapsed": "0:00:40", "player": "Bob", "h1": None},
+        {"event_type": "shot", "elapsed": "0:00:50", "player": "Bob", "h1": None},
+    ]
+    cleaned = _parse(tmp_path, rows)
+    subs = cleaned[cleaned["event"] == "substitution"]
+    assert len(subs) == 1
+    assert subs.iloc[0]["player"] == "Alice"
+    assert subs.iloc[0]["secondary_player"] == "none"
+    assert len(_roster_list(cleaned.iloc[-2]["roster_home"])) == 4
+
+
+def test_player_names_are_trimmed_so_a_lineup_can_match_a_substitution(tmp_path):
+    """2002-03 spells Nene as "Nene " in `entered` and "Nene" in the lineup columns.
+
+    Untrimmed, the two never match: the substitution cannot be applied to the five, and the
+    player vocabulary carries one player as two tokens with two embeddings.
+    """
+    rows = [
+        {"event_type": "substitution", "elapsed": "0:00:30",
+         "left": "Alice ", "entered": " Kate", "h1": "Kate"},
+        {"event_type": "shot", "elapsed": "0:00:40", "player": "Bob", "h1": "Kate"},
+    ]
+    cleaned = _parse(tmp_path, rows)
+    subs = cleaned[cleaned["event"] == "substitution"]
+    assert len(subs) == 1, "an untrimmed name resyncs instead of applying the substitution"
+    assert subs.iloc[0]["player"] == "Alice"
+    assert subs.iloc[0]["secondary_player"] == "Kate"
+
+
+def test_a_substitution_missing_its_outgoing_player_recovers_him_from_the_lineup(tmp_path):
+    """The raw row names only who came on; the five says who that replaced.
+
+    Better than the "none" sentinel wherever the lineup moves, because a substitution naming
+    nobody outgoing is one the player head can never learn to produce.
+    """
+    rows = [
+        {"event_type": "substitution", "elapsed": "0:00:30",
+         "left": None, "entered": "Kate", "h1": "Kate"},
+        {"event_type": "shot", "elapsed": "0:00:40", "player": "Bob", "h1": "Kate"},
+    ]
+    cleaned = _parse(tmp_path, rows)
+    sub = cleaned[cleaned["event"] == "substitution"].iloc[0]
+    assert sub["player"] == "Alice"
+    assert sub["secondary_player"] == "Kate"
