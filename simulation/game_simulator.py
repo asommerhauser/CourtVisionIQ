@@ -59,6 +59,9 @@ from models.season_features import (
 from models.game_state_features import (
     GAME_STATE_KEYS, derive_game_state, normalize_game_state,
 )
+from models.rotation_features import (
+    ROSTER_STATE_KEYS, derive_lineup_state, normalize_lineup_state,
+)
 from models.stint_length_model import StintLengthModel
 from models.substitution_model import START_TOKEN, SUB_EVENT, SubstitutionModel
 from simulation.input_cache import HistoryEncoder
@@ -945,6 +948,18 @@ class GameSimulator:
         for name in GAME_STATE_KEYS:
             buf = np.zeros((SEQ, 1), dtype=np.float32)
             buf[:n, 0] = gs_norm[name][-SEQ:]
+            inputs[name] = buf
+
+        # Per-player on-court state -- stint seconds, minutes played, personal fouls. Same shape
+        # as rest and derived the same way as the game state: over the FULL history with the scan
+        # preprocess uses, then windowed. Deliberately not read off the controller's own
+        # player_seconds / player_fouls counters, which exist for the fatigue nudge: one scan
+        # driven by both sides is what makes train and inference agree by construction rather
+        # than by two implementations happening to match.
+        ls_norm = normalize_lineup_state(derive_lineup_state(self.history))
+        for name in ROSTER_STATE_KEYS:
+            buf = np.zeros((SEQ, ROSTER_SIZE), dtype=np.float32)
+            buf[:n] = ls_norm[name][-SEQ:]
             inputs[name] = buf
 
         # 1 for real steps, 0 for padding (attention key-padding mask).

@@ -80,6 +80,14 @@ from models.game_state_features import (
     make_game_state_inputs,
     game_state_projections,
 )
+from models.rotation_features import (
+    NUM_ROSTER_SCALARS,
+    ROSTER_STATE_KEYS,
+    merge_rotation_features,
+    append_rotation_batches,
+    make_rotation_inputs,
+    side_scalars,
+)
 from reporting import ReportCollector, RunConfig
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
 from zones import ZONE_TOKENS
@@ -132,7 +140,7 @@ _PROCESSED = {"train": "cond_train.npz", "test": "cond_test.npz", "holdout": "co
 _BASE_INPUT_KEYS = (
     "event", "player", "type", "result", "season", "secondary_player",
     "home_roster", "away_roster", "time_abs", "delta_time",
-    *SEASON_INPUT_KEYS, *GAME_STATE_INPUT_KEYS, "pad_mask",
+    *SEASON_INPUT_KEYS, *GAME_STATE_INPUT_KEYS, *ROSTER_STATE_KEYS, "pad_mask",
 )
 
 
@@ -271,6 +279,7 @@ class ConditionalTypeModel:
             refit=refit_norm_stats,
         )
         merge_game_state_features(df, cols)  # running score / period-clock / team fouls
+        merge_rotation_features(df, cols)  # per-player stint / minutes / fouls
         train = self._build_split(cols, game_id, train_games)
         test = self._build_split(cols, game_id, test_games)
         holdout = self._build_split(cols, game_id, holdout_games)
@@ -334,7 +343,7 @@ class ConditionalTypeModel:
         keys_next_cat = ["next_event", "next_player", "next_type", "next_result"]
 
         batches = {k: [] for k in (*keys_1d, *keys_roster, *keys_cont, *SEASON_INPUT_KEYS,
-                                   *GAME_STATE_INPUT_KEYS,
+                                   *GAME_STATE_INPUT_KEYS, *ROSTER_STATE_KEYS,
                                    *keys_next_cat, "next_delta_time",
                                    "pad_mask", "loss_mask")}
 
@@ -364,6 +373,7 @@ class ConditionalTypeModel:
 
             append_season_batches(batches, cols, idx, n, SEQ)
             append_game_state_batches(batches, cols, idx, n, SEQ)
+            append_rotation_batches(batches, cols, idx, n, SEQ)
 
             # Conditioning / target arrays: next-step shift within this game.
             for k in keys_next_cat:
@@ -399,6 +409,7 @@ class ConditionalTypeModel:
             num_heads=4,
             d_ff=256,
             dropout=dropout,
+            num_scalars=NUM_ROSTER_SCALARS,
         )
         return SequenceRosterEncoder(params, name="roster_vec")
 
@@ -432,6 +443,7 @@ class ConditionalTypeModel:
         time_abs = Input(shape=(SEQ, 1), dtype="float32", name="time_abs")
         delta_time = Input(shape=(SEQ, 1), dtype="float32", name="delta_time")
         rest_home, rest_away, team_inputs = make_season_inputs(SEQ)
+        rotation_inputs = make_rotation_inputs(SEQ)
         game_state_inputs = make_game_state_inputs(SEQ)
         next_event = Input(shape=(SEQ,), dtype="int32", name="next_event")
         next_delta_time = Input(shape=(SEQ, 1), dtype="float32", name="next_delta_time")
@@ -467,8 +479,10 @@ class ConditionalTypeModel:
             )
 
         # ---- Roster encoding across the sequence (shared home/away, with per-player rest) ----
-        home_vec = self.roster_encoder([home_roster, rest_home])
-        away_vec = self.roster_encoder([away_roster, rest_away])
+        home_vec = self.roster_encoder(
+            [home_roster, *side_scalars(rest_home, rotation_inputs, "home")])
+        away_vec = self.roster_encoder(
+            [away_roster, *side_scalars(rest_away, rotation_inputs, "away")])
 
         # ---- Continuous projections ----
         t_abs = layers.Dense(16, name="time_abs_proj")(time_abs)
@@ -493,6 +507,7 @@ class ConditionalTypeModel:
             "time_abs": time_abs, "delta_time": delta_time,
             "rest_home": rest_home, "rest_away": rest_away, **team_inputs,
             **game_state_inputs,
+            **rotation_inputs,
             "next_event": next_event, "next_delta_time": next_delta_time,
             **cond_inputs,
             "pad_mask": pad_mask,

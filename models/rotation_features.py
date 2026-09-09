@@ -36,6 +36,7 @@ import ast
 import numpy as np
 
 from config import ROSTER_SIZE
+from models.game_state_features import iter_game_rows
 
 # Technicals are bench/team fouls and do not count toward the personal-foul disqualification --
 # the same rule ``simulation/controller.py:_charge_foul`` applies, and the reason this set lives
@@ -179,6 +180,83 @@ def normalize_lineup_state(raw: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         lo, hi, div = _NORM[k]
         out[k] = (np.clip(raw[k], lo, hi) / div).astype(np.float32)
     return out
+
+
+def normalize_lineup_state_row(raw_row) -> tuple:
+    """Normalize ONE row's raw values (``LineupScan.step`` output) to ``ROSTER_STATE_KEYS`` order.
+
+    Routed through :func:`normalize_lineup_state` on length-1 arrays rather than hand-rolled, for
+    the reason ``game_state_features.normalize_game_state_row`` gives: the batch path stores raw
+    values into a float32 array before clipping, and going through the same float32 clip/divide
+    is what makes the incremental simulator path bit-identical to preprocessing.
+
+    Each entry of ``raw_row`` is a per-slot list, which may be shorter than ``ROSTER_SIZE``; the
+    remaining slots stay at zero, matching the PAD slots the roster encoder masks out anyway.
+    """
+    one = {}
+    for k, values in zip(ROSTER_STATE_KEYS, raw_row):
+        buf = np.zeros((1, ROSTER_SIZE), dtype=np.float32)
+        buf[0, :len(values)] = values[:ROSTER_SIZE]
+        one[k] = buf
+    out = normalize_lineup_state(one)
+    return tuple(out[k][0] for k in ROSTER_STATE_KEYS)
+
+
+# =====================
+# --- Preprocessing ---
+# =====================
+
+def merge_rotation_features(df, cols) -> dict:
+    """Derive, normalize, and merge the roster-parallel arrays into ``cols``.
+
+    Scans each game (grouped, original row order preserved) and writes the six normalized
+    ``(N, ROSTER_SIZE)`` arrays into ``cols`` aligned to ``df``'s positional index -- the layout
+    ``merge_game_state_features`` uses, at the shape ``merge_season_features`` uses for rest.
+    Needs no train mask and no ``norm_stats`` (fixed-constant normalization). Mutates ``cols``.
+    """
+    n = len(df)
+    raw = {k: np.zeros((n, ROSTER_SIZE), dtype=np.float32) for k in ROSTER_STATE_KEYS}
+    for pos, records in iter_game_rows(df):
+        ls = derive_lineup_state(records)
+        for k in ROSTER_STATE_KEYS:
+            raw[k][pos] = ls[k]
+    cols.update(normalize_lineup_state(raw))
+    return cols
+
+
+def append_rotation_batches(batches, cols, idx, n, SEQ) -> None:
+    """Pad/stack the roster-parallel arrays for one game (mirrors append_season_batches)."""
+    for k in ROSTER_STATE_KEYS:
+        buf = np.zeros((SEQ, ROSTER_SIZE), dtype=np.float32)
+        buf[:n] = cols[k][idx]
+        batches[k].append(buf)
+
+
+# =====================
+# --- Model graph   ---
+# =====================
+
+def make_rotation_inputs(SEQ) -> dict:
+    """Keras Inputs for the roster-parallel scalars (shape (SEQ, ROSTER_SIZE) each)."""
+    from keras import Input  # local import: keep the preprocessing helpers TF-free.
+
+    return {k: Input(shape=(SEQ, ROSTER_SIZE), dtype="float32", name=k)
+            for k in ROSTER_STATE_KEYS}
+
+
+def side_scalars(rest, rotation_inputs, side: str) -> list:
+    """The per-player scalars for one side, in the order the roster encoder expects them.
+
+    Rest first, so the single-scalar ordering the encoder had before 2.0 is a prefix of this one
+    and the meaning of scalar 0 does not move. The rest follow ``ROSTER_STATE_KEYS``.
+    """
+    return [rest] + [rotation_inputs[f"{stem}_{side}"]
+                     for stem in ("stint_seconds", "played_seconds", "court_fouls")]
+
+
+# Number of per-player scalars the roster encoder is built for: rest plus the three above.
+# Feeds RosterEncoderParams.num_scalars, whose kernel shape then encodes the count.
+NUM_ROSTER_SCALARS = 4
 
 
 # =====================

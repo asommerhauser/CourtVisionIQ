@@ -63,6 +63,14 @@ from models.game_state_features import (
     make_game_state_inputs,
     game_state_projections,
 )
+from models.rotation_features import (
+    NUM_ROSTER_SCALARS,
+    ROSTER_STATE_KEYS,
+    merge_rotation_features,
+    append_rotation_batches,
+    make_rotation_inputs,
+    side_scalars,
+)
 from models.substitution_model import SubstitutionModel, SUB_EVENT, _BASE_INPUT_KEYS
 from reporting import ReportCollector, RunConfig
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
@@ -161,6 +169,7 @@ class ConditionalTimeModel(SubstitutionModel):
             refit=refit_norm_stats,
         )
         merge_game_state_features(df, cols)  # running score / period-clock / team fouls
+        merge_rotation_features(df, cols)  # per-player stint / minutes / fouls
 
         train = self._build_split(cols, game_id, train_games)
         test = self._build_split(cols, game_id, test_games)
@@ -208,7 +217,7 @@ class ConditionalTimeModel(SubstitutionModel):
         keys_next_cat = ["next_event", "next_player"]
 
         batches = {k: [] for k in (*keys_1d, *keys_roster, *keys_cont, *SEASON_INPUT_KEYS,
-                                   *GAME_STATE_INPUT_KEYS,
+                                   *GAME_STATE_INPUT_KEYS, *ROSTER_STATE_KEYS,
                                    *keys_next_cat, "next_time_target", "pad_mask", "loss_mask")}
 
         game_ids_sorted = [g for g in np.unique(game_id) if g in games]
@@ -234,6 +243,7 @@ class ConditionalTimeModel(SubstitutionModel):
 
             append_season_batches(batches, cols, idx, n, SEQ)
             append_game_state_batches(batches, cols, idx, n, SEQ)
+            append_rotation_batches(batches, cols, idx, n, SEQ)
 
             for k in keys_next_cat:
                 buf = np.full((SEQ,), next_pad[k], dtype=np.int32)
@@ -282,6 +292,7 @@ class ConditionalTimeModel(SubstitutionModel):
         time_abs = Input(shape=(SEQ, 1), dtype="float32", name="time_abs")
         delta_time = Input(shape=(SEQ, 1), dtype="float32", name="delta_time")
         rest_home, rest_away, team_inputs = make_season_inputs(SEQ)
+        rotation_inputs = make_rotation_inputs(SEQ)
         game_state_inputs = make_game_state_inputs(SEQ)
         next_event = Input(shape=(SEQ,), dtype="int32", name="next_event")
         next_player = Input(shape=(SEQ,), dtype="int32", name="next_player")
@@ -306,8 +317,10 @@ class ConditionalTimeModel(SubstitutionModel):
         ]
 
         # ---- Roster encoding across the sequence (shared home/away, with per-player rest) ----
-        home_vec = self.roster_encoder([home_roster, rest_home])
-        away_vec = self.roster_encoder([away_roster, rest_away])
+        home_vec = self.roster_encoder(
+            [home_roster, *side_scalars(rest_home, rotation_inputs, "home")])
+        away_vec = self.roster_encoder(
+            [away_roster, *side_scalars(rest_away, rotation_inputs, "away")])
 
         # ---- Continuous projections ----
         t_abs = layers.Dense(16, name="time_abs_proj")(time_abs)
@@ -331,6 +344,7 @@ class ConditionalTimeModel(SubstitutionModel):
             "time_abs": time_abs, "delta_time": delta_time,
             "rest_home": rest_home, "rest_away": rest_away, **team_inputs,
             **game_state_inputs,
+            **rotation_inputs,
             "next_event": next_event, "next_player": next_player,
             "pad_mask": pad_mask,
         }

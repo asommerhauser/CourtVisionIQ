@@ -359,33 +359,36 @@ def normalize_game_state_row(raw_row) -> tuple:
 def merge_game_state_features(df, cols) -> dict:
     """Derive, normalize, and merge the game-state arrays into ``cols`` (positional over ``df``).
 
-    Scans each game (grouped, original row order preserved) and writes the six normalized
+    Scans each game (grouped, original row order preserved) and writes the seven normalized
     per-row arrays into ``cols`` aligned to ``df``'s positional index — the same layout as the
     encoded categorical / season columns. Needs no train mask or ``norm_stats`` (fixed-constant
     normalization). Mutates and returns ``cols``.
     """
     n = len(df)
-    game_ids = df["game_id"].to_numpy()
-    records = df.to_dict("records")
     raw = {k: np.zeros((n,), dtype=np.float32) for k in GAME_STATE_KEYS}
-    for g in _ordered_unique(game_ids):
-        pos = np.where(game_ids == g)[0]
-        gs = derive_game_state([records[i] for i in pos])
+    for pos, records in iter_game_rows(df):
+        gs = derive_game_state(records)
         for k in GAME_STATE_KEYS:
             raw[k][pos] = gs[k]
     cols.update(normalize_game_state(raw))
     return cols
 
 
-def _ordered_unique(arr):
-    """Unique values in first-appearance order (game groups stay in the cleaned-file order)."""
-    seen = set()
-    order = []
-    for v in arr:
-        if v not in seen:
-            seen.add(v)
-            order.append(v)
-    return order
+def iter_game_rows(df):
+    """Yield ``(positions, records)`` for each game in file order, one game live at a time.
+
+    The obvious form of this — ``df.to_dict("records")`` once, then ``np.where(game_ids == g)``
+    per game — is quadratic and enormous at corpus scale, and both costs are paid on every
+    preprocess. Over 21 seasons that is 13.4M row dicts held at once (tens of GB), plus one
+    17ms full-array scan per game across 27k games, twice over between here and ``_build_split``:
+    about sixteen minutes of pure index scanning before any work happens. Grouping once and
+    mapping index labels to positions is linear and keeps only one game's dicts alive.
+    """
+    import pandas as pd  # local: the derivation helpers above stay import-light.
+
+    pos_of = pd.Series(np.arange(len(df)), index=df.index)
+    for _, game in df.groupby("game_id", sort=False):
+        yield pos_of.loc[game.index].to_numpy(), game.to_dict("records")
 
 
 def append_game_state_batches(batches, cols, idx, n, SEQ) -> None:

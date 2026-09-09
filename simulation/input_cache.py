@@ -34,11 +34,19 @@ from models.event_time_model import CATEGORICAL_FIELDS, EventTimeModel
 from models.game_state_features import (
     GAME_STATE_KEYS, GameStateScan, normalize_game_state_row,
 )
+from models.rotation_features import (
+    ROSTER_STATE_KEYS, LineupScan, normalize_lineup_state_row,
+)
 from models.season_features import DEFAULT_REST_DAYS, REST_CLIP_DAYS, TEAM_SCALAR_COLS
 
 # Roster snapshots repeat for long stretches (a roster changes ~60-80 times in a ~900-row game), so
 # memoizing the encode + rest standardization per distinct five removes ~10 vocab lookups and a
 # clip/divide on >90% of rows. Cached arrays are only ever copied *into* a buffer, never handed out.
+#
+# The cache is keyed by the five names alone, which is sound ONLY for quantities that are constant
+# for the whole game. Rest is; stint seconds, minutes played and personal fouls change on every
+# row for the same five, so they are deliberately NOT cached -- a hit would serve a stale value
+# with no error anywhere. Keep that in mind before adding anything to the cached tuple.
 _ROSTER_CACHE_MAX = 64
 
 _REST_COL = {"home_roster": "rest_home", "away_roster": "rest_away"}
@@ -91,6 +99,9 @@ class HistoryEncoder:
         for name in ("rest_home", "rest_away"):
             self._pads[name] = 0.0
             buf[name] = np.zeros((CAP, ROSTER_SIZE), dtype=np.float32)
+        for name in ROSTER_STATE_KEYS:
+            self._pads[name] = 0.0
+            buf[name] = np.zeros((CAP, ROSTER_SIZE), dtype=np.float32)
         for name in ("time_abs", "delta_time", *TEAM_SCALAR_COLS, *GAME_STATE_KEYS):
             self._pads[name] = 0.0
             buf[name] = np.zeros((CAP, 1), dtype=np.float32)
@@ -102,6 +113,7 @@ class HistoryEncoder:
         self._k = 0                 # next write index into the buffers
         self._prev_time = 0.0
         self._scan = GameStateScan()
+        self._lineup = LineupScan()
         self._roster_cache: dict[tuple, tuple] = {}
         self._base: dict[str, np.ndarray] | None = None
 
@@ -177,6 +189,11 @@ class HistoryEncoder:
 
         for name, value in zip(GAME_STATE_KEYS, normalize_game_state_row(self._scan.step(row))):
             buf[name][k, 0] = value
+
+        # Per-player state. Not memoized: unlike rest, every one of these moves on every row.
+        for name, values in zip(ROSTER_STATE_KEYS,
+                                normalize_lineup_state_row(self._lineup.step(row))):
+            buf[name][k] = values
 
         buf["pad_mask"][k] = 1.0
 
