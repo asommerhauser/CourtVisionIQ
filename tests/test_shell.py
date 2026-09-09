@@ -144,9 +144,10 @@ def _fake_model_dir(root, name, heads):
     return d
 
 
-ALL_HEADS = ("event_time", "player", "substitution", "shot_type", "shot_result",
-             "assist_type", "turnover_type", "foul_type", "rebound_type",
-             "event_time_cond", "stint_length")
+# Every head a complete model carries: the ones LOAD requires, plus the two it does not
+# (event_time is implicit in the bundle, event_time_cond is optional). Built from
+# config.REQUIRED_HEADS so a new head cannot silently escape the LOAD gate here.
+ALL_HEADS = ("event_time", "event_time_cond", "timeout_team", *config.REQUIRED_HEADS)
 
 
 @pytest.fixture

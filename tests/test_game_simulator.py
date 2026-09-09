@@ -17,12 +17,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from config import ROSTER_SIZE, STINT_MAX_SECONDS
+from config import ROSTER_SIZE
 from encoder.encoder import Encoder
 from models.event_time_model import EventTimeModel
-from models.stint_length_model import StintLengthModel
+from models.rotation_features import SUB_COUNT_CLASSES
+from models.sub_decision_model import SubDecisionModel
 from models.substitution_model import SubstitutionModel
-from simulation.game_simulator import GameSimulator
+from simulation.game_simulator import GameSimulator, HOME, AWAY
 
 TEST_SEQ_LEN = 16
 HOME_FIVE = ["A", "B", "C", "D", "E"]
@@ -224,7 +225,7 @@ def test_opening_bootstrap_builds_five_from_full_rosters(tmp_path):
 
 
 def test_conditioned_inputs_carry_incoming_player(tmp_path):
-    """The stint-head conditioning attaches next_secondary_player (the decided incoming player)."""
+    """Conditioning attaches next_secondary_player (the decided incoming player)."""
     sim = _load_sim(tmp_path)
     sim.start_game(HOME_FIVE, AWAY_FIVE, season="2003")
     sim.append_event("shot", "A", "paint", "missed")
@@ -239,8 +240,8 @@ def test_conditioned_inputs_carry_incoming_player(tmp_path):
     assert inputs["next_player"][0, n - 1] == enc.encode_player("B")
 
 
-def _train_tiny_with_stint(tmp_path: Path):
-    """Train event_time + substitution + stint_length into one artifacts dir."""
+def _train_tiny_with_subdec(tmp_path: Path):
+    """Train event_time + substitution + sub_decision into one artifacts dir."""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     _make_csv(data_dir / "season_clean.csv")
@@ -254,7 +255,7 @@ def _train_tiny_with_stint(tmp_path: Path):
     et.train(epochs=1, batch_size=2, artifacts_root=str(artifacts_root),
              mixed_precision=False, report=False)
 
-    for cls in (SubstitutionModel, StintLengthModel):
+    for cls in (SubstitutionModel, SubDecisionModel):
         m = cls(Encoder(vocab_dir=vocab_dir), sequence_length=TEST_SEQ_LEN,
                 path=str(data_dir), processed_dir=str(processed_dir))
         m.preprocess(rebuild_vocabs=False, test_frac=0.34, holdout_frac=0.0)
@@ -263,21 +264,22 @@ def _train_tiny_with_stint(tmp_path: Path):
     return artifacts_root, vocab_dir, data_dir, processed_dir
 
 
-def test_predict_stint_length_is_finite_and_capped(tmp_path):
-    """The stint head loads, carries its own log-stint norm stats, and yields a capped, finite,
-    non-negative stint length in seconds."""
-    artifacts_root, vocab_dir, data_dir, processed_dir = _train_tiny_with_stint(tmp_path)
+def test_predict_sub_count_is_a_legal_class(tmp_path):
+    """The sub-decision head loads and yields a count inside the class range, for either side,
+    from one forward pass. It needs no norm stats of its own -- it classifies, it does not
+    regress, which is one thing the stint head it replaces did need."""
+    artifacts_root, vocab_dir, data_dir, processed_dir = _train_tiny_with_subdec(tmp_path)
     sim = GameSimulator.load(
         artifacts_root=str(artifacts_root), encoder=Encoder(vocab_dir=vocab_dir),
         sequence_length=TEST_SEQ_LEN, path=str(data_dir), processed_dir=str(processed_dir),
     )
-    assert StintLengthModel.KEY in sim.heads
-    assert "stint_log_mean" in sim.stint_norm_stats and "stint_log_std" in sim.stint_norm_stats
+    assert SubDecisionModel.KEY in sim.heads
 
     sim.start_game(HOME_FIVE, AWAY_FIVE, season="2003")
-    length = sim.predict_stint_length("K", "B", greedy=True)  # greedy: no sampling noise
-    assert np.isfinite(length)
-    assert 0.0 <= length <= STINT_MAX_SECONDS
+    for team in (HOME, AWAY):
+        count = sim.predict_sub_count(team, greedy=True)   # greedy: no sampling noise
+        assert isinstance(count, int)
+        assert 0 <= count < SUB_COUNT_CLASSES
 
 
 def test_constrained_sample_respects_candidates(tmp_path):

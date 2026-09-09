@@ -62,7 +62,9 @@ from models.game_state_features import (
 from models.rotation_features import (
     BENCH_KEYS, ROSTER_STATE_KEYS, derive_lineup_state, normalize_lineup_state,
 )
-from models.stint_length_model import StintLengthModel
+from models.sub_decision_model import (
+    SubDecisionModel, HOME_OUTPUT as _SUBDEC_HOME, AWAY_OUTPUT as _SUBDEC_AWAY,
+)
 from models.substitution_model import START_TOKEN, SUB_EVENT, SubstitutionModel
 from simulation.input_cache import HistoryEncoder
 
@@ -151,9 +153,6 @@ class GameSimulator:
 
         # Extra model heads (Player / Substitution / …), keyed by KEY.
         self.heads: dict = {}
-        # Stint-length head's normalization stats (its own log-stint mean/std), populated at
-        # load() from that head's wrapper. Empty -> predict_stint_length reads raw (mean 0/std 1).
-        self.stint_norm_stats: dict = {}
         # Conditional-time head's Δt normalization stats (its own delta mean/std), populated at
         # load(). Empty -> predict_delta falls back to the shared (event_time) norm stats.
         self.condtime_norm_stats: dict = {}
@@ -212,11 +211,8 @@ class GameSimulator:
         sim = cls(bundle.models[EventTimeModel.KEY], bundle.instances[EventTimeModel.KEY])
         # Stash any other loaded heads for future use (none consumed yet).
         sim.heads = {k: m for k, m in bundle.models.items() if k != EventTimeModel.KEY}
-        # The stint-length head carries its own log-stint norm stats (separate from the shared
-        # time/rest stats); keep them on hand to denormalize its predictions.
-        stint_inst = bundle.instances.get(StintLengthModel.KEY)
-        if stint_inst is not None:
-            sim.stint_norm_stats = dict(stint_inst.norm_stats or {})
+        # The sub-decision head needs no norm stats of its own: it is a classifier over counts,
+        # not a regression, which is one thing the stint head it replaces did need.
         # The conditional-time head carries its own Δt norm stats (delta_mean/std on the raw stream).
         ct_inst = bundle.instances.get(ConditionalTimeModel.KEY)
         if ct_inst is not None:
@@ -606,37 +602,29 @@ class GameSimulator:
                                           greedy=greedy)
         return outgoing, incoming
 
-    def predict_stint_length(self, incoming: str, outgoing: str, *,
-                             delta_seconds: float = 0.0, greedy: bool = False,
-                             sigma: float | None = None) -> float:
-        """Predict how long ``incoming`` will stay on the floor (game-seconds), via StintLengthModel.
+    def predict_sub_count(self, team: str, *, greedy: bool = False) -> int:
+        """How many substitutions ``team`` makes at this opportunity, via SubDecisionModel.
 
-        Conditions on the fully decided substitution — ``next_player`` (outgoing, ``"start"``
-        for an opener) and ``next_secondary_player`` (incoming) — and regresses standardized
-        log-stint. Denormalizes with the head's own ``stint_log_mean`` / ``stint_log_std``, then
-        (unless ``greedy``) adds multiplicative log-space noise (``STINT_SAMPLE_SIGMA``) for
-        rotation variety, and scales by ``STINT_LENGTH_SCALE`` (the log-regression's point
-        estimate is the geometric mean, which under-shoots the arithmetic mean of a skewed
-        duration distribution). Capped at ``STINT_MAX_SECONDS``; there is **no** lower bound — a
-        short specialist stint is legitimate.
+        Replaces ``predict_stint_length``, which regressed how long an entering player would stay
+        on and was consumed by a scheduler. This asks the question the controller actually has:
+        does anyone come off here, and how many.
+
+        Both sides come from one forward pass -- the head emits a softmax per side over
+        ``0 / 1 / 2 / 3+`` -- so asking for the away count right after the home one costs nothing
+        beyond the argmax. Sampled from the distribution unless ``greedy``: the counts are a
+        genuine distribution (81% zero, 13% one) and taking the mode everywhere would mean never
+        substituting at all.
         """
-        inputs = self._conditioned_inputs(
-            next_event=SUB_EVENT, delta_seconds=delta_seconds,
-            next_player=outgoing, next_secondary_player=incoming,
-        )
-        pred = self._head_logits(StintLengthModel.KEY, "stint_output", inputs)
-        log_norm = float(np.ravel(pred)[0])  # (1,) regression scalar at position n-1
-
-        mean = float(self.stint_norm_stats.get("stint_log_mean", 0.0))
-        std = float(self.stint_norm_stats.get("stint_log_std", 1.0)) or 1.0
-        log_stint = log_norm * std + mean
-
-        s = config.STINT_SAMPLE_SIGMA if sigma is None else sigma
-        if not greedy and s > 0:
-            log_stint += float(self.rng.normal(0.0, s))
-
-        seconds = float(np.expm1(log_stint)) * config.STINT_LENGTH_SCALE
-        return max(0.0, min(seconds, config.STINT_MAX_SECONDS))
+        # Base history plus the bench, and deliberately NOT _conditioned_inputs: this head
+        # declares no next_event / next_delta_time, and a functional model refuses a dict
+        # carrying keys its graph has no inputs for.
+        inputs = {**self.build_model_inputs(), **self._bench_inputs()}
+        output = _SUBDEC_HOME if team == HOME else _SUBDEC_AWAY
+        logits = self._head_logits(SubDecisionModel.KEY, output, inputs)
+        probs = _softmax(np.asarray(logits, dtype=np.float64))
+        if greedy:
+            return int(np.argmax(probs))
+        return int(self.rng.choice(len(probs), p=probs / probs.sum()))
 
     # ===================================================================== #
     # --- Conditional heads (player / type / result) for the rollout       --

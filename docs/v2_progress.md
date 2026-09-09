@@ -132,7 +132,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | 11a | `fix/roster-snapshot-flicker` | 3 | §8 | [x] | c9c1d2d |
 | 11b | `feature/lineup-state` | 3 | §8 | [x] | 4fa3713 |
 | 11c | `feature/bench-bundle` | 3 | §8 | [x] | 402c182 |
-| 11d | `feature/sub-decision-head` | 3 | §8 | [ ] | |
+| 11d | `feature/sub-decision-head` | 3 | §8 | [x] | 1b48794 |
 | 12 | `feature/training-changes` | 3 | §10 | [ ] | |
 | 13 | `feature/quarter-eval-splits` | 4 | §11 | [ ] | |
 | — | **Gate C — pre-train checklist, then the 2.0 train** | 4 | | [ ] | |
@@ -988,41 +988,64 @@ the spec agreed with the cheaper answer -- §8 only ever asks for the bench on t
 
 ### 11d. `feature/sub-decision-head` — §8, the head
 
-**Scope.** The largest branch. Substitutions move inside the model; the stint-length scheduler and
-the fatigue nudge retire.
+**Scope.** The rotation trigger. At every position Rule 3 permits a substitution, predict how
+many each side makes before play resumes (`0 / 1 / 2 / 3+`) — replacing a timer that sampled a
+stint length per entering player and pulled him when the clock reached it.
 
-- Three more per-player scalars alongside `rest_proj` in `models/roster_set_encoder.py` (`:71`,
-  `:99-102`, `:110-120`): seconds in the current stint, minutes played, personal fouls. Every head
-  sees them wherever it consumes the lineup.
-- A bench bundle: up to ten available bench players through the same set encoder, each with seconds
-  since they sat, minutes played, fouls, and whether they have played.
-- A new `models/sub_decision_model.py`, registered in `models/registry.py:23,41`, asked only at dead
-  balls: per team, how many substitutions follow before the ball is live (`0 / 1 / 2 / 3+`).
-- Retire `_schedule_stint` (`controller.py:538`), `_process_scheduled_subs` (`:547`), `_fatigue_bias`
-  (`:516`) and `models/stint_length_model.py`. `_maybe_force_sub` (`:577`) stays as the single
-  backstop. `STINT_SAMPLE_SIGMA`, `STINT_LENGTH_SCALE`, `STINT_MAX_SECONDS` and `SUB_FATIGUE_WEIGHT`
-  leave `_TUNING_KEYS`.
+- `models/sub_decision_model.py`: two softmaxes on one backbone, so both sides come from a
+  single forward pass and the rollout pays one extra head call rather than two. It takes the
+  bench bundle and, deliberately, **no next-step conditioning** — the question is about the
+  position, not about an event already decided.
+- **It does not augment in the opening lineup.** `SubstitutionModel` synthesises ten opening
+  substitutions so the incoming-pick head learns starters; a tip-off is not a stoppage, and
+  feeding them here would teach it that games open with five substitutions a side.
+- Retired: `models/stint_length_model.py`, `_schedule_stint`, `_process_scheduled_subs`,
+  `_fatigue_bias`, and four dials — `SUB_FATIGUE_WEIGHT`, `STINT_SAMPLE_SIGMA`,
+  `STINT_LENGTH_SCALE`, `STINT_MAX_SECONDS` — with tombstones and a guard test, on the
+  `DEADBALL_REBOUND_PROB` precedent. `_maybe_force_sub` stays as the cadence backstop.
 
-**Two traps.**
-- `RosterEncoderParams` is a frozen dataclass with a `get_config` / `from_config` round-trip
-  (`:131-146`, `:148-153`). Every new param must be in **both** or weight reload breaks.
-- `encoder/vocabs/norm_stats.json` carries exactly one per-player pair today (`rest_mean`,
-  `rest_std`). Three new scalars need normalization stats plumbed through `models/norm_stats_io.py`
-  — a step the spec's next-steps list does not mention.
+**Nine registration sites**, and missing any one is silent rather than loud: both registry
+lists, `run_all` **and** `run_stage` (only `run_stage` is on `train.py`'s path),
+`LARGE_OUTPUT_MODELS`, `REQUIRED_HEADS`, the controller's required set, a `predict_sub_count`
+on `GameSimulator`, and a `ModelTestAdapter` — without which the head gets zero save/load
+coverage.
 
-**Smaller version, if this proves too much for one train:** keep the stint scheduler but gate it on
-dead balls, and ship only the two set-encoder bundles. Bench rest is still learned, no new head.
-Does not block anything else.
+**Two dials worth remembering.** `SUB_FATIGUE_WEIGHT` was a hand-written stand-in for exactly
+what the roster encoder now reads directly, since every head sees stint seconds, minutes and
+fouls per player. `STINT_LENGTH_SCALE` existed because the head regressed LOG stint, so its
+point estimate was a geometric mean under-predicting a right-skewed duration by ~30%, and the
+dial multiplied the gap away. **A dial correcting a distributional artefact of the target is a
+sign the target is wrong**, and it was: the question was never how long a player stays on.
 
 **Verify**
 ```bash
-pytest tests/ -q
+python -m pytest tests/ -q
 ```
-Watch `test_model_persistence.py`, `test_substitution_model.py`, `test_oncourt_mask.py`.
+`test_model_persistence` bites first (a real one-epoch train plus a full `.keras` reload of the
+two-output graph); `test_backbone` catches a head that builds at the wrong width;
+`test_dials` iterates `_TUNING_KEYS` live, so the four removals have to be clean.
 
-**Result:**
+**Result:** Full suite green, on the third run. The two before it are the Notes below.
 
-**Notes:**
+**Notes:** Two rounds of failures, and both were the same mistake rather than anything about
+rotation.
+
+The first round was 90 failures, 87 of them one thing: `tests/test_controller.py` kept its own
+literal copy of the head list its `FakeSim` provides, so adding `sub_decision` to the shell's
+copy and the controller's left the third stale and every test that builds a controller died.
+That list existed **four** times, counting `test_shell.py`'s `ALL_HEADS`, which still named
+`stint_length`. It lives in `config` now — the only module the shell, the controller and the
+tests can all import without pulling in TensorFlow.
+
+The second round was six, of which four came from writing something fresh instead of from the
+copy that already worked: `_build_split` called `np.stack` on an empty split where
+`EventTimeModel._build_split` already guards it, and `model()` read `MODEL_DIM` where every
+other head reads `self.model_dim`. The remaining two were test fixtures scripting one half of
+what `sample_substitution` pops, and setting a bench before a `start()` stub that silently
+resets it.
+
+Recorded because correction N in this same branch is the identical lesson — two `ARCH_KEYS`
+lists that drifted — and it was reproduced twice more within days of writing it down.
 
 ### 12. `feature/training-changes` — §10
 
@@ -1291,6 +1314,18 @@ becomes NaN before a vocabulary is built. Checked against the frozen 2.0 vocabul
 is in none of the five, while `"none"` is in all of them. The substitution path is switched to
 `"none"` on 11a, because there it decides who is on the floor; the other sites are left, the same
 defect with a wider blast radius and nothing depending on them structurally. **Not yet fixed.**
+
+**R. The same list existed four times, and adding to it broke 87 tests.** The heads
+`GameController` requires were a literal in `shell/actions.py`, another in the controller's own
+constructor, a third in `tests/test_controller.py`'s FakeSim and a fourth in
+`tests/test_shell.py`'s `ALL_HEADS`. Registering `sub_decision` in two of them left the other
+two stale, and every test that builds a controller died on a missing head — a failure with
+nothing to do with the change that caused it. It lives in `config.REQUIRED_HEADS` now, the only
+module all four can import without TensorFlow.
+
+This is correction N a second time (two `ARCH_KEYS` lists that drifted), and it was reproduced
+within the same branch that recorded N. **When a list is read in more than one place, put it
+somewhere both can import before adding to it, not after.**
 
 **Q. A substitution row can name the wrong incoming player, and applying it grows the five to
 six.** 2002-03 has rows like "Gerald Wallace out, Jim Jackson in" where Jim Jackson is already on

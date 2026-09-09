@@ -29,7 +29,10 @@ from models.conditional_type_model import _PROCESSED, CONDITIONAL_MODEL_CLASSES
 from models.event_time_model import EventTimeModel
 from models.model_bundle import ModelBundle
 from models.player_model import PlayerModel
-from models.stint_length_model import _PROCESSED as _STINT_PROCESSED, StintLengthModel
+from models.rotation_features import SUB_COUNT_CLASSES
+from models.sub_decision_model import (
+    _PROCESSED as _SUBDEC_PROCESSED, HOME_OUTPUT, AWAY_OUTPUT, SubDecisionModel,
+)
 from models.substitution_model import (
     _PROCESSED as _SUB_PROCESSED,
     SUB_EVENT,
@@ -338,11 +341,11 @@ SUBSTITUTION_ADAPTER = ModelTestAdapter(
 
 
 # --------------------------------------------------------------------------- #
-# Stint-length head (regresses an entering player's realized stint; same data as subs)
+# Sub-decision head (how many substitutions each side makes at an opportunity)
 # --------------------------------------------------------------------------- #
 
-def _stint_build(encoder, data_dir, processed_dir):
-    return StintLengthModel(
+def _subdec_build(encoder, data_dir, processed_dir):
+    return SubDecisionModel(
         encoder,
         sequence_length=TEST_SEQ_LEN,
         path=str(data_dir),
@@ -350,36 +353,39 @@ def _stint_build(encoder, data_dir, processed_dir):
     )
 
 
-def _stint_forward(inst, model) -> dict:
-    split = inst._load_processed(_STINT_PROCESSED["test"])
+def _subdec_forward(inst, model) -> dict:
+    split = inst._load_processed(_SUBDEC_PROCESSED["test"])
     inputs = {k: split[k] for k in inst.INPUT_KEYS}
     out = model(inputs, training=False)
     return {k: np.asarray(v) for k, v in out.items()}
 
 
-def _stint_assert(inst, outputs) -> None:
-    assert set(outputs.keys()) == {inst.output_name}      # "stint_output"
-    o = outputs[inst.output_name]
-    assert o.ndim == 3 and o.shape[1] == TEST_SEQ_LEN and o.shape[2] == 1  # one regression scalar
-    assert o.shape[0] >= 1
+def _subdec_assert(inst, outputs) -> None:
+    # Two softmaxes, one per side, from a single forward pass.
+    assert set(outputs.keys()) == {HOME_OUTPUT, AWAY_OUTPUT}
+    for name in (HOME_OUTPUT, AWAY_OUTPUT):
+        o = outputs[name]
+        assert o.ndim == 3 and o.shape[1] == TEST_SEQ_LEN
+        assert o.shape[2] == SUB_COUNT_CLASSES
+        assert o.shape[0] >= 1
     assert np.isfinite(o).all()
 
 
-STINT_ADAPTER = ModelTestAdapter(
-    key=StintLengthModel.KEY,
-    model_cls=StintLengthModel,
+SUBDEC_ADAPTER = ModelTestAdapter(
+    key=SubDecisionModel.KEY,
+    model_cls=SubDecisionModel,
     seq_len=TEST_SEQ_LEN,
-    make_csv=_substitution_csv,     # same start+sub fixture; stint targets derive from it
-    build=_stint_build,
-    forward=_stint_forward,
-    assert_outputs=_stint_assert,
+    make_csv=_substitution_csv,     # same start+sub fixture; the counts derive from it
+    build=_subdec_build,
+    forward=_subdec_forward,
+    assert_outputs=_subdec_assert,
 )
 
 
 # New models: append their adapter here to inherit the round-trip coverage below.
 MODEL_TEST_ADAPTERS = [EVENT_TIME_ADAPTER, PLAYER_ADAPTER] + [
     _conditional_adapter(cls) for cls in CONDITIONAL_MODEL_CLASSES
-] + [SUBSTITUTION_ADAPTER, STINT_ADAPTER]
+] + [SUBSTITUTION_ADAPTER, SUBDEC_ADAPTER]
 
 
 # --------------------------------------------------------------------------- #

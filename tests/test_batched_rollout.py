@@ -112,7 +112,6 @@ class _StubMaster:
         self.model = object()
         self.instance = None
         self.heads = {}
-        self.stint_norm_stats = {}
         self.condtime_norm_stats = {}
         self.batch_widths: list[int] = []
 

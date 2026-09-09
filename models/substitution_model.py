@@ -140,9 +140,9 @@ class SubstitutionModel:
     @property
     def INPUT_KEYS(self) -> tuple:
         # Base history + always-on conditioning + the decided outgoing player + availability.
-        # BENCH_KEYS ride on THIS head's keys, not on _BASE_INPUT_KEYS: stint_length and
-        # conditional_time share the base and make no rotation decision, so handing them ten
-        # more slots per side would be capacity spent on a question they are never asked.
+        # BENCH_KEYS ride on THIS head's keys, not on _BASE_INPUT_KEYS: conditional_time shares
+        # the base and makes no rotation decision, so handing it ten more slots per side
+        # would be capacity spent on a question it is never asked.
         return (*_BASE_INPUT_KEYS, *BENCH_KEYS,
                 "next_event", "next_delta_time", "next_player", "avail_mask")
 

@@ -25,26 +25,22 @@ from zones import ZONE_TOKENS
 
 HOME_FIVE = ["A", "B", "C", "D", "E"]
 AWAY_FIVE = ["F", "G", "H", "I", "J"]
-REQUIRED_HEADS = {"player", "substitution", "shot_type", "shot_result",
-                  "assist_type", "turnover_type", "foul_type", "rebound_type"}
+REQUIRED_HEADS = config.REQUIRED_HEADS   # one list, so a new head cannot drift
 
 
 class FakeSim:
     """Scripted stand-in for GameSimulator — no TF graph, no artifacts."""
 
-    def __init__(self, scheduler: bool = False, stint_seconds: float = 300.0,
-                 timeouts: bool = False):
+    def __init__(self, sub_count: int = 0, timeouts: bool = False):
         self.home_roster = list(HOME_FIVE)
         self.away_roster = list(AWAY_FIVE)
         self.home_full = list(HOME_FIVE)
         self.away_full = list(AWAY_FIVE)
         self.history: list[dict] = []
         self.heads = {k: object() for k in REQUIRED_HEADS}
-        if scheduler:                       # opt-in to the stint-length scheduler path
-            self.heads["stint_length"] = object()
         if timeouts:                        # opt-in to the timeout_team head
             self.heads["timeout_team"] = object()
-        self.stint_seconds = stint_seconds  # fixed length returned by predict_stint_length
+        self.sub_count = sub_count          # fixed count returned by predict_sub_count
         self.rng = np.random.default_rng(0)
         self.calls: list[tuple] = []
         self._q: dict[str, list] = {"player": [], "type": [], "result": [], "incoming": [],
@@ -87,10 +83,9 @@ class FakeSim:
         self.calls.append(("sub", team, outgoing_bias))
         return self._pop("player"), self._pop("incoming")
 
-    def predict_stint_length(self, incoming, outgoing, *, delta_seconds=0.0, greedy=False,
-                             sigma=None):
-        self.calls.append(("stint", incoming, outgoing))
-        return self.stint_seconds
+    def predict_sub_count(self, team, *, greedy=False):
+        self.calls.append(("sub_count", team))
+        return self.sub_count
 
     def start_alternating(self, home_full, away_full, *, season="2003",
                           tipoff_time=0.0, greedy=False, greedy_starters=False,
@@ -872,20 +867,18 @@ def test_the_clamp_does_not_stall_the_clock_at_a_boundary():
     assert ctrl.clock > PERIOD_LENGTH
 
 
-def test_scheduled_subs_wait_for_a_dead_ball():
-    ctrl = GameController(FakeSim(scheduler=True, stint_seconds=300.0), seed=0)
+def test_substitutions_wait_for_a_legal_opportunity():
+    ctrl = GameController(FakeSim(sub_count=1), seed=0)
     ctrl.sim.home_full = HOME_FIVE + ["K"]
-    ctrl.stint_target_clock = {p: 100.0 for p in HOME_FIVE}
-    ctrl.clock = 400.0                          # everybody is overdue
 
-    ctrl.ball_dead = False
-    ctrl._process_scheduled_subs()
-    assert ctrl.sim.home_roster == HOME_FIVE    # live ball: nobody moves
+    ctrl.can_sub = False
+    ctrl._run_substitutions()
+    assert ctrl.sim.home_roster == HOME_FIVE    # no opportunity: nobody moves
 
-    ctrl.ball_dead = True
-    ctrl.sim.script(incoming=["K"])
-    ctrl._process_scheduled_subs()
-    assert "K" in ctrl.sim.home_roster          # the next whistle catches it
+    ctrl.can_sub = True
+    ctrl.sim.script(player=["A"], incoming=["K"])
+    ctrl._run_substitutions()
+    assert "K" in ctrl.sim.home_roster          # the next opportunity catches it
 
 
 def test_game_ends_at_regulation_when_not_tied():
@@ -913,7 +906,7 @@ def test_missing_heads_raises():
 
 
 # ===================================================================== #
-# Sampling temperature / minutes / fatigue-driven substitutions
+# Sampling temperature / minutes / substitution bookkeeping
 # ===================================================================== #
 
 def test_player_temperature_passed_to_actor_picks():
@@ -1043,27 +1036,18 @@ def test_advance_clock_accrues_on_court_minutes():
     assert ctrl.player_seconds["A"] == pytest.approx(tick + config.MAX_DELTA)  # second tick clamped to MAX_DELTA
 
 
-def test_fatigue_bias_weights_long_stints():
-    ctrl = GameController(FakeSim(), seed=0, sub_fatigue_weight=0.1)
-    ctrl.clock = 600.0
-    ctrl.stint_start = {p: 0.0 for p in (*HOME_FIVE, *AWAY_FIVE)}
-    ctrl.stint_start["C"] = 540.0           # C just checked in (short stint)
-    bias = ctrl._fatigue_bias()
-    assert bias["A"] == 0.1 * 600.0         # long stint → big nudge toward coming off
-    assert bias["C"] == 0.1 * 60.0          # short stint → small nudge
-    assert bias["A"] > bias["C"]
-
-
-def test_do_substitution_applies_bias_and_updates_tracking():
-    ctrl = GameController(FakeSim(), seed=0, sub_fatigue_weight=0.1)
+def test_do_substitution_updates_the_stint_and_cadence_tracking():
+    ctrl = GameController(FakeSim(), seed=0)
     ctrl.sim.home_full = HOME_FIVE + ["K"]
     ctrl.clock = 300.0
     ctrl.stint_start = {p: 0.0 for p in (*HOME_FIVE, *AWAY_FIVE)}
     ctrl.sim.script(player=["A"], incoming=["K"])
     ctrl._do_substitution(delta=0.0)
 
+    # No outgoing_bias any more: SUB_FATIGUE_WEIGHT is retired, and the stint seconds it
+    # approximated are an input the roster encoder reads directly.
     sub_call = [c for c in ctrl.sim.calls if c[0] == "sub"][0]
-    assert sub_call[2]["A"] == 0.1 * 300.0          # bias passed for the outgoing pick
+    assert sub_call[2] is None
     assert "K" in ctrl.sim.home_roster and "A" not in ctrl.sim.home_roster
     assert ctrl.stint_start["K"] == 300.0           # incoming starts a fresh stint
     assert "A" not in ctrl.stint_start              # outgoing's stint cleared
@@ -1085,82 +1069,78 @@ def test_force_sub_fires_when_team_starved():
     assert ctrl.sim.away_roster == AWAY_FIVE
 
 
-def test_force_sub_skips_while_the_ball_is_live():
+def test_force_sub_skips_where_the_rules_do_not_permit_a_substitution():
     ctrl = GameController(FakeSim(), seed=0, sub_max_gap=300.0)
     ctrl.sim.home_full = HOME_FIVE + ["K"]
     ctrl.clock = 400.0
     ctrl.last_sub_clock = {HOME: 0.0, AWAY: 0.0}
-    ctrl.ball_dead = False                   # mid-play: no subbing at a live ball
+    ctrl.can_sub = False                     # no legal window: even the backstop waits
     ctrl._maybe_force_sub()
     assert ctrl.sim.home_roster == HOME_FIVE
-    # ...and the same team gets its sub at the next whistle.
-    ctrl.ball_dead = True
+    # ...and the same team gets its sub at the next opportunity.
+    ctrl.can_sub = True
     ctrl.sim.script(player=["A"], incoming=["K"])
     ctrl._maybe_force_sub()
     assert "K" in ctrl.sim.home_roster
 
-
 # ===================================================================== #
-# Stint-length scheduler (hybrid rotation timing)
+# Rotation: the sub-decision head
 # ===================================================================== #
 
 def test_substitution_is_never_in_the_event_menu():
-    """The event head is not trained to emit substitution, so it's never a sampled event —
-    regardless of whether the stint scheduler is loaded. Subs are owned by the scheduler /
-    cadence backstop, not the event stream."""
-    for scheduler in (False, True):
-        ctrl = GameController(FakeSim(scheduler=scheduler), seed=0)
-        assert ctrl.use_scheduler is scheduler
-        assert "substitution" not in ctrl.open_play_events
-        assert "substitution" not in OPEN_PLAY_EVENTS
+    """The event head is not trained to emit substitution, so it is never a sampled event.
+    Rotation is owned by the sub-decision head and the cadence backstop, not the event stream."""
+    ctrl = GameController(FakeSim(), seed=0)
+    assert "substitution" not in ctrl.open_play_events
+    assert "substitution" not in OPEN_PLAY_EVENTS
 
 
-def test_start_schedules_an_opening_stint_for_all_ten():
-    ctrl = GameController(FakeSim(scheduler=True, stint_seconds=300.0), seed=0)
-    ctrl.start(HOME_FIVE, AWAY_FIVE)
-    # Every starter is committed to a stint, scheduled to expire at clock(0) + length.
-    assert set(ctrl.stint_target_clock) == set(HOME_FIVE + AWAY_FIVE)
-    assert all(t == 300.0 for t in ctrl.stint_target_clock.values())
-    # Each opener was scheduled with the "start" token as the outgoing conditioning.
-    stint_calls = [c for c in ctrl.sim.calls if c[0] == "stint"]
-    assert len(stint_calls) == 10 and all(c[2] == "start" for c in stint_calls)
+def test_the_head_is_asked_once_per_side_at_an_opportunity():
+    ctrl = GameController(FakeSim(sub_count=0), seed=0)
+    ctrl.can_sub = True
+    ctrl._run_substitutions()
+    asked = [c for c in ctrl.sim.calls if c[0] == "sub_count"]
+    assert [c[1] for c in asked] == [HOME, AWAY]
 
 
-def test_scheduled_sub_does_not_fire_before_target():
-    ctrl = GameController(FakeSim(scheduler=True, stint_seconds=300.0), seed=0)
+def test_no_substitution_happens_where_the_rules_do_not_permit_one():
+    """can_sub, not ball_dead: a made field goal is a dead ball and never an opportunity."""
+    ctrl = GameController(FakeSim(sub_count=3), seed=0)
     ctrl.sim.home_full = HOME_FIVE + ["K"]
-    ctrl.start(HOME_FIVE, AWAY_FIVE)
-    ctrl.ball_dead = True                    # the scheduler only ever runs at a dead ball
-    ctrl.clock = 200.0                       # before any 300s target
-    ctrl._process_scheduled_subs()
-    assert ctrl.sim.home_roster == HOME_FIVE  # nobody is due yet
+    ctrl.can_sub = False
+    ctrl.ball_dead = True
+    ctrl._run_substitutions()
+    assert ctrl.sim.home_roster == HOME_FIVE
+    assert not [c for c in ctrl.sim.calls if c[0] == "sub_count"]
 
 
-def test_scheduled_sub_pulls_most_overdue_at_target():
-    ctrl = GameController(FakeSim(scheduler=True, stint_seconds=300.0), seed=0)
-    ctrl.sim.home_full = HOME_FIVE + ["K"]
-    ctrl.start(HOME_FIVE, AWAY_FIVE)
-    ctrl.ball_dead = True                    # the scheduler only ever runs at a dead ball
-    ctrl.stint_target_clock["A"] = 250.0     # A is the most overdue on the home five
-    ctrl.clock = 300.0
-    ctrl.sim.script(incoming=["K"])
-    ctrl._process_scheduled_subs()
-
-    assert "K" in ctrl.sim.home_roster and "A" not in ctrl.sim.home_roster
-    assert "A" not in ctrl.stint_target_clock          # outgoing's schedule cleared
-    assert ctrl.stint_target_clock["K"] == 300.0 + 300.0  # incoming committed to a fresh stint
-    # Exactly one player was pulled from the home five (one sub per team per dead ball).
-    assert sum(1 for p in ctrl.sim.home_roster if p in HOME_FIVE) == ROSTER_SIZE - 1
+def test_the_head_decides_how_many_come_off():
+    ctrl = GameController(FakeSim(sub_count=2), seed=0)
+    # Rosters set directly rather than through start(): FakeSim.start_alternating is a stub
+    # that records the call and sets nothing, so a bench established before it would vanish.
+    ctrl.sim.home_full = HOME_FIVE + ["K", "L"]
+    ctrl.sim.away_full = AWAY_FIVE + ["M", "N"]
+    ctrl.stint_start = {p: 0.0 for p in (*HOME_FIVE, *AWAY_FIVE)}
+    ctrl.can_sub = True
+    ctrl.sim.script(player=["A", "B", "F", "G"], incoming=["K", "L", "M", "N"])
+    before = len([r for r in ctrl.sim.history if r["event"] == "substitution"])
+    ctrl._run_substitutions()
+    after = [r for r in ctrl.sim.history if r["event"] == "substitution"]
+    assert len(after) - before == 4          # two a side
 
 
-def test_scheduled_sub_skips_when_no_bench():
-    ctrl = GameController(FakeSim(scheduler=True, stint_seconds=300.0), seed=0)
-    ctrl.start(HOME_FIVE, AWAY_FIVE)         # full == on-court, no bench either side
-    ctrl.ball_dead = True                    # the scheduler only ever runs at a dead ball
-    ctrl.clock = 400.0                       # everyone overdue
-    ctrl._process_scheduled_subs()
-    # Nobody to bring in → no sub happened, the substitution head was never queried, and the
-    # most-overdue player's target was pushed out so the scheduler doesn't spin on it.
-    assert ctrl.sim.home_roster == HOME_FIVE and ctrl.sim.away_roster == AWAY_FIVE
-    assert not [c for c in ctrl.sim.calls if c[0] == "incoming"]
-    assert max(ctrl.stint_target_clock.values()) > 400.0
+def test_a_side_with_no_bench_is_skipped_rather_than_forced():
+    ctrl = GameController(FakeSim(sub_count=2), seed=0)
+    ctrl.sim.home_full = list(HOME_FIVE)     # nobody available
+    ctrl.can_sub = True
+    ctrl._run_substitutions()
+    assert ctrl.sim.home_roster == HOME_FIVE
+
+
+def test_the_retired_stint_dials_are_gone():
+    """The scheduler they served is gone; a dial left behind is a second opinion on the
+    rotation that nothing reconciles. Follows the DEADBALL_REBOUND_PROB precedent."""
+    for name in ("SUB_FATIGUE_WEIGHT", "STINT_SAMPLE_SIGMA",
+                 "STINT_LENGTH_SCALE", "STINT_MAX_SECONDS"):
+        assert not hasattr(config, name), name
+        assert name not in config._TUNING_KEYS, name

@@ -18,7 +18,7 @@ from encoder.encoder import Encoder
 from models.event_time_model import EventTimeModel
 from models.conditional_type_model import ConditionalTypeModel, TYPE_GEN_SPECS
 from models.conditional_time_model import ConditionalTimeModel
-from models.stint_length_model import StintLengthModel
+from models.sub_decision_model import SubDecisionModel
 from models.game_state_features import GAME_STATE_KEYS
 
 from test_oncourt_mask import _make_cleaned_csv  # shared synthetic two-game cleaned CSV
@@ -85,12 +85,12 @@ def test_conditional_time_head_builds_and_forward_passes(tmp_path):
     assert np.isfinite(out["time_output"].numpy()).all()
 
 
-def test_stint_length_head_builds_and_forward_passes(tmp_path):
+def test_sub_decision_head_builds_and_forward_passes(tmp_path):
     enc = _setup(tmp_path)
     EventTimeModel(enc, **_kwargs(tmp_path)).preprocess(
         rebuild_vocabs=True, test_frac=0.0, holdout_frac=0.0)
 
-    m = StintLengthModel(enc, **_kwargs(tmp_path))
+    m = SubDecisionModel(enc, **_kwargs(tmp_path))
     train, _ = m.preprocess(rebuild_vocabs=False, test_frac=0.0, holdout_frac=0.0)
     model = m.model(num_layers=1, num_heads=2, ff_dim=32)
     _assert_consumes_game_state(model)

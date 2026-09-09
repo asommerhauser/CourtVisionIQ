@@ -166,14 +166,14 @@ TYPE_BIAS: dict[str, dict[str, float]] = {
 # of that swing is noise. Split the difference via linear interpolation between the two known
 # (dial, bias) points, targeting bias ~0.
 HOME_COURT_SHOT_BIAS = 0.055
-# Logit bonus per second of a player's current on-court stint, added to the outgoing-sub pick so
-# a long-tenured player (a star included) is *nudged* — not forced — toward coming off. 0 = off.
-# Lowered from 0.15 so starters are pulled for tenure less aggressively (the stage eval under-played
-# the top of the rotation); lets stars hold longer stints.
-SUB_FATIGUE_WEIGHT = 0.08
+# SUB_FATIGUE_WEIGHT is GONE (2.0, workstream 11). It was a logit bonus per second of a player's
+# on-court stint, nudging the outgoing pick toward whoever had been on longest -- a hand-written
+# stand-in for exactly what the roster encoder now sees directly, since every head reads stint
+# seconds, minutes played and fouls per player. Do not bring it back to 'help' the rotation: the
+# model has the input, and a dial on top of it is a second opinion that nothing reconciles.
 # Max game-seconds a team may go without a substitution before the Controller forces one (the
 # event head never targets a team, so this safety net keeps a team from playing five men 48 min).
-# Raised 420 -> 600 alongside STINT_LENGTH_SCALE: real teams average one sub every ~2 min, so the
+# Raised 420 -> 600 when the stint scheduler still set the cadence: real teams average one sub
 # backstop should stay rare; at 420 it would re-create the churn the longer stints remove.
 SUB_MAX_GAP_SECONDS = 600.0
 
@@ -215,25 +215,16 @@ EVAL_MAX_CONSECUTIVE_GAME_FAILURES = 3
 # records while the shards are still running, so a 36-hour run is queryable long before it ends.
 EVAL_REPORT_EVERY_SEC = 300
 
-# --- Stint-length scheduler (StintLengthModel + GameController hybrid scheduler) ---
-# When the stint-length head is loaded, the Controller commits each entering player to a stint:
-# it samples a length (game-seconds on the floor) and schedules the player's exit at
-# clock + length; at each dead ball a player past their scheduled exit is subbed out. The model
-# regresses log-stint, so we sample with multiplicative log-space noise for rotation variety.
-# STINT_SAMPLE_SIGMA is the std of that log-space noise (0 = deterministic / point estimate).
-STINT_SAMPLE_SIGMA = 0.25
-# Multiplicative calibration on the predicted stint length (applied in predict_stint_length before
-# the cap) — the rotation sibling of DELTA_TIME_SCALE. The head regresses LOG-stint, so its point
-# estimate is the geometric mean, which systematically under-predicts the arithmetic mean of a
-# right-skewed duration distribution. Measured on v1.0 trial1: sim stints averaged 366s vs 474s
-# real (ratio 1.30), producing 79 subs/game vs 46 real and over-playing the 9th-13th men by 2-3x
-# while starters ran ~5 min short. Tune to match subs/game (~46) in the eval report; 1.0 = raw.
-STINT_LENGTH_SCALE = 1.30
-# Numerical cap on a sampled stint (game-seconds). There is intentionally NO lower bound — a
-# short specialist stint (a one-possession 3pt shooter / rebounder) is legitimate basketball.
-# Raised 900 -> 2400: real stints run to ~2600s (p90 886s), so the old cap truncated the real
-# tail right where long starter stints live and clipped the sim's max stint to ~938s.
-STINT_MAX_SECONDS = 2400.0
+# STINT_SAMPLE_SIGMA / STINT_LENGTH_SCALE / STINT_MAX_SECONDS are GONE (2.0, workstream 11),
+# with the stint-length head and the scheduler that consumed it. The Controller used to commit
+# each entering player to a sampled stint and pull him when the clock reached it; rotation is
+# now a decision the sub-decision head makes wherever Rule 3 permits a substitution.
+#
+# STINT_LENGTH_SCALE is the one worth remembering. It existed because the head regressed LOG
+# stint, so its point estimate was a geometric mean that under-predicted a right-skewed
+# duration by ~30%, and the dial multiplied the gap away. A dial correcting a distributional
+# artefact of the target is a sign the target is wrong, and it was: the question was never how
+# long a player will stay on, it was whether anyone comes off here.
 # Personal fouls that disqualify a player for the rest of the game (NBA standard: 6). Offensive
 # fouls count toward this; technicals do not.
 FOUL_OUT_LIMIT = 6
@@ -266,8 +257,7 @@ MARGIN_CALIBRATION_INTERCEPT = -0.31
 _TUNING_KEYS = (
     "DELTA_TIME_SCALE", "MAX_DELTA",
     "PLAYER_TEMPERATURE", "EVENT_TEMPERATURE", "TYPE_TEMPERATURE", "RESULT_TEMPERATURE",
-    "SUB_TEMPERATURE", "SUB_INCOMING_TEMPERATURE", "SUB_FATIGUE_WEIGHT", "SUB_MAX_GAP_SECONDS",
-    "STINT_SAMPLE_SIGMA", "STINT_LENGTH_SCALE", "STINT_MAX_SECONDS", "FOUL_OUT_LIMIT",
+    "SUB_TEMPERATURE", "SUB_INCOMING_TEMPERATURE", "SUB_MAX_GAP_SECONDS", "FOUL_OUT_LIMIT",
     "SHOT_RESULT_BIAS", "SHOT_RESULT_BIAS_BY_ZONE", "EVENT_BIAS", "TYPE_BIAS",
     "HOME_COURT_SHOT_BIAS",
 )
@@ -423,6 +413,15 @@ HOLDOUT_FRAC = 0.1
 # Filename of the holdout game-id manifest, written under each model's processed_dir.
 HOLDOUT_MANIFEST_NAME = "holdout_games.json"
 
+# The heads GameController needs to play a game. Checked at LOAD (shell/actions.py) so a
+# missing head fails immediately rather than mid-rollout, and again in the controller's own
+# constructor. Defined HERE because three copies of it existed -- the shell's, the
+# controller's, and the FakeSim in tests/test_controller.py -- and adding sub_decision to two
+# of them broke 87 tests that had nothing to do with rotation. config is the one module all
+# three can import without pulling in TensorFlow.
+REQUIRED_HEADS = ("player", "substitution", "sub_decision", "shot_type", "shot_result",
+                  "assist_type", "turnover_type", "foul_type", "rebound_type")
+
 # --- Chronological schedule helpers (training/chronology.py) ---
 # Utilities for contiguous, cumulative training slices + sequential (next-N) holdouts. Retained as
 # building blocks (build_schedule / sequential_partition); the single full train (full_run) is the
@@ -493,7 +492,7 @@ DEFAULT_VERSION = DEFAULT_MODEL
 # the modern game (so current players are well-learned) and decays gently for older seasons, but it
 # stays coverage-complete: every player who appears in the train pool is guaranteed at least one
 # game, so no embedding goes starved. The big player-vocab heads (player / substitution /
-# stint_length) keep the full corpus — they actually need the data.
+# sub_decision) keep the full corpus — they actually need the data.
 #
 # Per-season sample rate for the most recent seasons, NEWEST FIRST. Raised for v1.1
 # ((0.70, 0.40, 0.25) -> (1.0, 0.70, 0.50)): the subset heads (shot_result especially) under-fit
@@ -511,7 +510,7 @@ SUBSET_SEED = 42                     # deterministic subset selection
 SUBSET_GAMES_PATH = "./training/subset_games.json"  # persisted subset manifest (one extract step)
 # Heads trained on the representative subset rather than the full corpus. All six conditional
 # type/result heads share one preprocess file, so they move as a group. Everything NOT listed here
-# (event_time, player, substitution, stint_length) trains on the full corpus.
+# (event_time, player, substitution, sub_decision) trains on the full corpus.
 SUBSET_MODEL_KEYS = (
     "event_time_cond",
     "shot_type", "shot_result", "assist_type", "turnover_type", "foul_type", "rebound_type",
