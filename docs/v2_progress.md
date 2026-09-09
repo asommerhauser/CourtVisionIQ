@@ -130,7 +130,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | — | `fix/jump-ball-team-binding` | 2 | — | [x] | fac7095 |
 | — | `fix/free-throw-possessions` | 3 | §9 | [x] | bfb52c1 |
 | 11a | `fix/roster-snapshot-flicker` | 3 | §8 | [x] | c9c1d2d |
-| 11b | `feature/lineup-state` | 3 | §8 | [ ] | |
+| 11b | `feature/lineup-state` | 3 | §8 | [~] | |
 | 11c | `feature/bench-bundle` | 3 | §8 | [ ] | |
 | 11d | `feature/sub-decision-head` | 3 | §8 | [ ] | |
 | 12 | `feature/training-changes` | 3 | §10 | [ ] | |
@@ -895,7 +895,54 @@ Every row now encodes to 2152, so 232 is simply a dead embedding row. Not worth 
 on its own; **Gate C re-establishes the freeze and is the place to do it**, and a wholesale
 rebuild before then would destroy the byte-identical check that has been useful twice already.
 
-### 11b–11d. `feature/rotation-model` — §8, the model side
+### 11b. `feature/lineup-state` — §8, the per-player scalars
+
+**Scope.** Three more per-player scalars beside rest — seconds in the current stint, seconds
+played, personal fouls — through the shared roster encoder, so every head sees them wherever it
+consumes the lineup.
+
+- `RosterEncoderParams.num_scalars`, and **one** `Dense` over a stacked `(B, N, S)` tensor rather
+  than one per scalar. Those are the same function, but the kernel's first dimension is then the
+  count, so a graph rebuilt with the wrong number fails on shapes. That is why `num_scalars` does
+  **not** need an `ARCH_KEYS` entry, unlike `LOCAL_ATTENTION_*` (correction K), which changed no
+  shapes. **11c's `BENCH_SIZE` will need one** — set sizes change masks, not weight shapes.
+- `num_scalars` is in all four config sites (dataclass, `get_config`, `_params_to_config`,
+  `_config_to_params`). It is the only key read with `.get`, defaulting to 1, because a model
+  saved before this carries no such key.
+- `models/rotation_features.py` gains `merge_rotation_features` / `append_rotation_batches` /
+  `make_rotation_inputs`, mirroring the season and game-state pairs. Fixed-constant
+  normalization, so there is nothing in `norm_stats.json` and **correction C does not apply**.
+- Inference: `HistoryEncoder` gets its own `LineupScan`; the uncached oracle derives over the
+  full history and windows it. **Not** read off the controller's `player_seconds` / `player_fouls`
+  — one scan driven by both sides is train/inference parity by construction.
+
+**The trap was the roster memo cache** (`simulation/input_cache.py:145`). It is keyed by the five
+names alone, which is sound only for game-constant quantities. Rest is one; stint, minutes and
+fouls move on every row for the same five, so a cache hit would serve a stale value with no error
+anywhere. They are written outside it.
+
+Also fixed here, because this branch adds a second per-game scan and would otherwise have doubled
+it: `merge_game_state_features` built one dict per row for the whole frame up front (**8.6 GB**
+over 21 seasons, measured) and found each game with `np.where` over the full array (**17ms × 27,415
+games = 7.8 minutes**). `iter_game_rows` groups once and keeps one game alive. Output is
+bit-identical on a full season. `_build_split` still does the same `np.where` scan across its
+three calls, another ~7.8 minutes — **not fixed**, six copies, and a clean follow-up.
+
+**Verify**
+```bash
+python -m pytest tests/test_model_persistence.py tests/test_input_cache.py tests/test_game_state_wiring.py -q
+python -m pytest tests/ -q
+```
+`test_full_keras_model_loads` is the one that matters — the only test that catches a missed
+config round-trip site, and it fails as an opaque Keras shape error rather than naming the key.
+`test_input_cache` is the second: it asserts the incremental path and the oracle agree array for
+array, which is where the memo-cache trap would surface.
+
+**Result:**
+
+**Notes:**
+
+### 11c–11d. `feature/rotation-model` — §8, the bench and the head
 
 **Scope.** The largest branch. Substitutions move inside the model; the stint-length scheduler and
 the fatigue nudge retire.
