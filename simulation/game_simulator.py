@@ -615,8 +615,10 @@ class GameSimulator:
         genuine distribution (81% zero, 13% one) and taking the mode everywhere would mean never
         substituting at all.
         """
-        inputs = self._conditioned_inputs(next_event=SUB_EVENT, delta_seconds=0.0)
-        inputs.update(self._bench_inputs())
+        # Base history plus the bench, and deliberately NOT _conditioned_inputs: this head
+        # declares no next_event / next_delta_time, and a functional model refuses a dict
+        # carrying keys its graph has no inputs for.
+        inputs = {**self.build_model_inputs(), **self._bench_inputs()}
         output = _SUBDEC_HOME if team == HOME else _SUBDEC_AWAY
         logits = self._head_logits(SubDecisionModel.KEY, output, inputs)
         probs = _softmax(np.asarray(logits, dtype=np.float64))

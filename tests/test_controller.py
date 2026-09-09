@@ -876,7 +876,7 @@ def test_substitutions_wait_for_a_legal_opportunity():
     assert ctrl.sim.home_roster == HOME_FIVE    # no opportunity: nobody moves
 
     ctrl.can_sub = True
-    ctrl.sim.script(incoming=["K"])
+    ctrl.sim.script(player=["A"], incoming=["K"])
     ctrl._run_substitutions()
     assert "K" in ctrl.sim.home_roster          # the next opportunity catches it
 
@@ -1036,7 +1036,7 @@ def test_advance_clock_accrues_on_court_minutes():
     assert ctrl.player_seconds["A"] == pytest.approx(tick + config.MAX_DELTA)  # second tick clamped to MAX_DELTA
 
 
-def test_do_substitution_applies_bias_and_updates_tracking():
+def test_do_substitution_updates_the_stint_and_cadence_tracking():
     ctrl = GameController(FakeSim(), seed=0)
     ctrl.sim.home_full = HOME_FIVE + ["K"]
     ctrl.clock = 300.0
@@ -1044,8 +1044,10 @@ def test_do_substitution_applies_bias_and_updates_tracking():
     ctrl.sim.script(player=["A"], incoming=["K"])
     ctrl._do_substitution(delta=0.0)
 
+    # No outgoing_bias any more: SUB_FATIGUE_WEIGHT is retired, and the stint seconds it
+    # approximated are an input the roster encoder reads directly.
     sub_call = [c for c in ctrl.sim.calls if c[0] == "sub"][0]
-    assert sub_call[2]["A"] == 0.1 * 300.0          # bias passed for the outgoing pick
+    assert sub_call[2] is None
     assert "K" in ctrl.sim.home_roster and "A" not in ctrl.sim.home_roster
     assert ctrl.stint_start["K"] == 300.0           # incoming starts a fresh stint
     assert "A" not in ctrl.stint_start              # outgoing's stint cleared
@@ -1067,16 +1069,16 @@ def test_force_sub_fires_when_team_starved():
     assert ctrl.sim.away_roster == AWAY_FIVE
 
 
-def test_force_sub_skips_while_the_ball_is_live():
+def test_force_sub_skips_where_the_rules_do_not_permit_a_substitution():
     ctrl = GameController(FakeSim(), seed=0, sub_max_gap=300.0)
     ctrl.sim.home_full = HOME_FIVE + ["K"]
     ctrl.clock = 400.0
     ctrl.last_sub_clock = {HOME: 0.0, AWAY: 0.0}
-    ctrl.ball_dead = False                   # mid-play: no subbing at a live ball
+    ctrl.can_sub = False                     # no legal window: even the backstop waits
     ctrl._maybe_force_sub()
     assert ctrl.sim.home_roster == HOME_FIVE
-    # ...and the same team gets its sub at the next whistle.
-    ctrl.ball_dead = True
+    # ...and the same team gets its sub at the next opportunity.
+    ctrl.can_sub = True
     ctrl.sim.script(player=["A"], incoming=["K"])
     ctrl._maybe_force_sub()
     assert "K" in ctrl.sim.home_roster
@@ -1095,7 +1097,6 @@ def test_substitution_is_never_in_the_event_menu():
 
 def test_the_head_is_asked_once_per_side_at_an_opportunity():
     ctrl = GameController(FakeSim(sub_count=0), seed=0)
-    ctrl.start(HOME_FIVE, AWAY_FIVE)
     ctrl.can_sub = True
     ctrl._run_substitutions()
     asked = [c for c in ctrl.sim.calls if c[0] == "sub_count"]
@@ -1106,7 +1107,6 @@ def test_no_substitution_happens_where_the_rules_do_not_permit_one():
     """can_sub, not ball_dead: a made field goal is a dead ball and never an opportunity."""
     ctrl = GameController(FakeSim(sub_count=3), seed=0)
     ctrl.sim.home_full = HOME_FIVE + ["K"]
-    ctrl.start(HOME_FIVE, AWAY_FIVE)
     ctrl.can_sub = False
     ctrl.ball_dead = True
     ctrl._run_substitutions()
@@ -1116,10 +1116,13 @@ def test_no_substitution_happens_where_the_rules_do_not_permit_one():
 
 def test_the_head_decides_how_many_come_off():
     ctrl = GameController(FakeSim(sub_count=2), seed=0)
+    # Rosters set directly rather than through start(): FakeSim.start_alternating is a stub
+    # that records the call and sets nothing, so a bench established before it would vanish.
     ctrl.sim.home_full = HOME_FIVE + ["K", "L"]
     ctrl.sim.away_full = AWAY_FIVE + ["M", "N"]
-    ctrl.start(HOME_FIVE, AWAY_FIVE)
+    ctrl.stint_start = {p: 0.0 for p in (*HOME_FIVE, *AWAY_FIVE)}
     ctrl.can_sub = True
+    ctrl.sim.script(player=["A", "B", "F", "G"], incoming=["K", "L", "M", "N"])
     before = len([r for r in ctrl.sim.history if r["event"] == "substitution"])
     ctrl._run_substitutions()
     after = [r for r in ctrl.sim.history if r["event"] == "substitution"]
@@ -1129,7 +1132,6 @@ def test_the_head_decides_how_many_come_off():
 def test_a_side_with_no_bench_is_skipped_rather_than_forced():
     ctrl = GameController(FakeSim(sub_count=2), seed=0)
     ctrl.sim.home_full = list(HOME_FIVE)     # nobody available
-    ctrl.start(HOME_FIVE, AWAY_FIVE)
     ctrl.can_sub = True
     ctrl._run_substitutions()
     assert ctrl.sim.home_roster == HOME_FIVE

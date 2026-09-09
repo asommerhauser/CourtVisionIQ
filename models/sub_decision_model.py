@@ -236,7 +236,7 @@ class SubDecisionModel(SubstitutionModel):
     def model(self, num_layers=NUM_LAYERS, num_heads=NUM_HEADS, ff_dim=FF_DIM, dropout=0.2):
         """Two softmaxes over ``SUB_COUNT_CLASSES``, one per side, on a shared backbone."""
         SEQ = self.sequence_length
-        D = MODEL_DIM
+        D = self.model_dim
         vocab = self.encoder.vocabs
         self.roster_encoder = self.build_roster_encoder(dropout=dropout)
         self.bench_encoder = self.build_bench_encoder(dropout=dropout)
