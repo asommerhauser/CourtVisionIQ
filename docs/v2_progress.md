@@ -868,9 +868,32 @@ python -m models.game_state_features --seasons 2003,2013,2023
 python -m zones --seasons 2003,2013,2023
 ```
 
-**Result:**
+**Result:** Verified end to end without a full pipeline run: each of the three era master files
+was cleaned in process and the gate run over the result. All four checks pass with margin.
 
-**Notes:**
+| era | disagree/g | dup rows | short % | min fails | subs/team | top10 min | 10+ min |
+|---|---|---|---|---|---|---|---|
+| 2002-03 | 0.0000 | 0 | 0.0022 | 0 | 22.0 | 34.2 | 8.5 |
+| 2012-13 | 0.0000 | 0 | 0.0025 | 0 | 24.0 | 32.9 | 8.9 |
+| 2022-23 | 0.0000 | 0 | 0.0000 | 0 | 27.2 | 32.5 | 8.9 |
+
+The possession-clock gate re-run against the first re-clean is unchanged from workstream 10b —
+94.1 / 94.6 / 99.2 against 93.9 / 94.2 / 99.4 — so the repair moved nothing it should not have.
+The vocabularies came back byte-identical (no token added or removed); `norm_stats.json` moved as
+expected, `delta_mean` 5.930 → 5.839, tracking the ~1.5% extra rows sitting at existing
+timestamps. **A second clean is still owed** — the data on disk predates corrections Q.
+
+**Notes:** The first full-season run of the gate is what found correction Q, and it found it by
+failing a threshold calibrated on an 86-game slice: 0.0573% short lineups against an allowance of
+0.05%. Widening the allowance would have buried a defect touching 12 games. `SHORT_LINEUP_PCT` is
+now 0.01, four times the worst era's real rate and no more, and a player in two slots has its own
+check and its own message rather than surfacing as a short-lineup rate.
+
+`Nene ` is still in the player vocabulary at token 232, with `Nene` at 2152. `--rebuild-vocabs`
+*appends* — the vocabs are append-only, which is why Gate B's procedure deletes the files first.
+Every row now encodes to 2152, so 232 is simply a dead embedding row. Not worth an hour to purge
+on its own; **Gate C re-establishes the freeze and is the place to do it**, and a wholesale
+rebuild before then would destroy the byte-identical check that has been useful twice already.
 
 ### 11b–11d. `feature/rotation-model` — §8, the model side
 
@@ -1177,6 +1200,23 @@ becomes NaN before a vocabulary is built. Checked against the frozen 2.0 vocabul
 is in none of the five, while `"none"` is in all of them. The substitution path is switched to
 `"none"` on 11a, because there it decides who is on the floor; the other sites are left, the same
 defect with a wider blast radius and nothing depending on them structurally. **Not yet fixed.**
+
+**Q. A substitution row can name the wrong incoming player, and applying it grows the five to
+six.** 2002-03 has rows like "Gerald Wallace out, Jim Jackson in" where Jim Jackson is already on
+the floor; the lineup snapshot shows the real arrival was Doug Christie. `_repair_fives` checked
+only that the *outgoing* player was on the floor, so it applied the row and put one player in two
+slots. Every comparison downstream is by membership, so the five then grew to six and never
+recovered — 12 games in 2002-03, one of them for 148 rows, 359 short/duplicated rows out of 9 bad
+rows in the source. A substitution is now applicable only if the outgoing player is on the floor
+**and** the incoming one is not; otherwise the pairing is refused, the transition is recovered
+from the lineup, and the raw row is dropped.
+
+The refusal has to be a **flag**, not something inferred from whether the recovery emitted
+anything: where the lineup never moves the recovery emits nothing, and reading it that way let
+the contradictory row out. That version measured 0.088 disagreeing rows a game in 2002-03 — a
+*pass* against the 0.1 tolerance, and worth nothing. The rule it encodes is the one the whole
+branch rests on: **the lineup is the authority, and a substitution the five does not corroborate
+is not emitted.**
 
 **P. 2002-03 spells one player two ways, and the vocabulary carries both.** The raw `entered` /
 `left` columns give `"Nene "` where `h1..h5` give `"Nene"`. The two never matched, so folding the
