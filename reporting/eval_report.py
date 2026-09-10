@@ -13,6 +13,7 @@ training reports (``<reports_root>/evaluation/<run_id>/``):
   * ``games.parquet``      — one row per holdout game (win/spread/score scalars).
   * ``box_players.parquet``— one row per (game, side, player): predicted mean & std + actual.
   * ``summary.parquet``    — long-format aggregate metrics (scope, metric, predicted, actual, …).
+  * ``box_quarters.parquet``— one row per (game, period, side, stat): predicted vs actual.
 
 Self-contained and TensorFlow-free so it can be unit-tested without trained models.
 """
@@ -541,6 +542,97 @@ def _progression_section(agg: dict) -> str:
     return f"<h2>Tuning progression</h2><p class='sub'>{note}</p>{table}{img}"
 
 
+# Stats worth reading a quarter at a time. Deliberately shorter than _STAT_LABELS: the
+# per-quarter question is "does the model play end-game basketball?", which is pace, shot mix,
+# free throws and scoring -- not a per-quarter steals column nobody reads.
+_QUARTER_STATS = ("pts", "fga", "fgm", "tpa", "tpm", "fta", "ftm", "oreb", "dreb", "ast", "tov", "pf")
+
+_PERIOD_LABELS = {0: "Q1", 1: "Q2", 2: "Q3", 3: "Q4"}
+
+
+def _period_label(period) -> str:
+    p = int(period)
+    return _PERIOD_LABELS.get(p, f"OT{p - 3}")
+
+
+def quarter_rows(records: list[dict]) -> list[dict]:
+    """Long-format (game, period, side, stat) -> predicted / actual, over every record.
+
+    Shared by the HTML section and ``box_quarters.parquet`` so the page and the queryable frame
+    cannot disagree. Records written before workstream 13 carry no quarter block and are skipped
+    rather than faked -- an old run is partially readable, not silently wrong.
+    """
+    out = []
+    for r in records:
+        actual = r.get("quarter_actual") or {}
+        pred = r.get("quarter_pred") or {}
+        for period in sorted(set(actual) | set(pred), key=lambda x: int(x)):
+            for side in ("home", "away"):
+                a = (actual.get(period) or {}).get(side) or {}
+                q = (pred.get(period) or {}).get(side) or {}
+                for stat in _QUARTER_STATS:
+                    if stat not in a and stat not in q:
+                        continue
+                    out.append({
+                        "game_id": r["game_id"],
+                        "period": int(period),
+                        "period_label": _period_label(period),
+                        "side": side,
+                        "stat": stat,
+                        "pred": float(q[stat]) if stat in q else float("nan"),
+                        "actual": float(a[stat]) if stat in a else float("nan"),
+                    })
+    return out
+
+
+def _box_quarters_frame(records: list[dict]) -> pd.DataFrame:
+    rows = quarter_rows(records)
+    if not rows:
+        return pd.DataFrame(columns=["game_id", "period", "period_label", "side",
+                                     "stat", "pred", "actual"])
+    return pd.DataFrame(rows)
+
+
+def _quarter_section(records: list[dict]) -> str:
+    """Per-quarter team accuracy: what the model does early against what it does late.
+
+    This is the only view in the report that can answer whether end-game basketball is modelled
+    at all -- whether a trailing team fouls, whether threes get hunted late. It is also the
+    evidence the clutch loss weighting was deferred to wait for rather than guessed at.
+    """
+    frame = _box_quarters_frame(records)
+    if frame.empty:
+        return ("<h2>Per-quarter team accuracy</h2>"
+                "<p class='sub'>No quarter data in these records — they predate the per-quarter "
+                "split. Re-run the eval to populate it.</p>")
+
+    both = frame.dropna(subset=["pred", "actual"])
+    if both.empty:
+        return ("<h2>Per-quarter team accuracy</h2>"
+                "<p class='sub'>These records carry the actual per-quarter box but no predicted "
+                "one — they were built without the per-sim histories.</p>")
+
+    rows = []
+    for period, chunk in both.groupby("period", sort=True):
+        cells = [_period_label(period)]
+        for stat in ("pts", "fga", "tpa", "fta", "tov", "pf"):
+            part = chunk[chunk["stat"] == stat]
+            if part.empty:
+                cells.append("—")
+                continue
+            pred, actual = part["pred"].mean(), part["actual"].mean()
+            # _table escapes every cell, so this stays plain text rather than markup.
+            cells.append(f"{pred:.1f} / {actual:.1f} ({pred - actual:+.1f})")
+        rows.append(cells)
+
+    table = _table(["period", "PTS", "FGA", "3PA", "FTA", "TO", "PF"], rows)
+    note = ("Predicted / actual per team per period, averaged over the holdout, bias in "
+            "brackets. A model that does not play end-game basketball shows it here: flat FTA and "
+            "3PA into Q4 means no intentional fouling and no three-point hunting when trailing. "
+            "Also written to box_quarters.parquet, one row per (game, period, side, stat).")
+    return f"<h2>Per-quarter team accuracy</h2><p class='sub'>{_esc(note)}</p>" + table
+
+
 def _tuning_section(report: dict) -> str:
     """Run-configuration / tuning dials used for this eval (recorded for cross-run analysis)."""
     tuning = report.get("tuning") or {}
@@ -606,6 +698,7 @@ def render_html(report: dict) -> str:
                           "Players matched by name across sims and the real game (absent = 0). MIN "
                           "is the rotation prediction — how many minutes the sims gave each player "
                           "vs how many they actually played."),
+        _quarter_section(records),
         _player_minutes_section(records),
         _example_box_section(records),
         _tuning_section(report),
@@ -767,6 +860,8 @@ def write_eval_report(report: dict, *, reports_root: str = DEFAULT_REPORTS_ROOT,
     _games_frame(report["records"]).to_parquet(data_dir / "games.parquet", index=False)
     _box_players_frame(report["records"]).to_parquet(data_dir / "box_players.parquet", index=False)
     _summary_frame(report["aggregate"]).to_parquet(data_dir / "summary.parquet", index=False)
+    _box_quarters_frame(report["records"]).to_parquet(data_dir / "box_quarters.parquet",
+                                                      index=False)
     _run_summary_frame(report).to_parquet(data_dir / "run_summary.parquet", index=False)
     prog = _progression_frame(report["aggregate"])
     if not prog.empty:

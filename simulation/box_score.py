@@ -33,6 +33,8 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
+from models.game_state_features import period_index, period_start
+
 from zones import FREE_THROW, is_three, points_for_shot
 
 # Foul types that do NOT count as a personal foul on the box score (technicals are
@@ -178,8 +180,24 @@ def _totals_row(lines: list[PlayerLine], *, team_oreb: int = 0, team_dreb: int =
     }
 
 
+def side_membership(events) -> tuple[set, set]:
+    """(home names, away names) over every roster snapshot in ``events``.
+
+    Which side a player is on is a fact about the GAME, not about any slice of it. Deriving it
+    per slice drops a player who records a stat in a period he was not on the floor for -- his
+    side resolves to None and his line is never emitted, so his stats vanish from that period's
+    team total. Rare but real: one game in 1500 over the cleaned corpus.
+    """
+    home: set = set()
+    away: set = set()
+    for row in _as_rows(events):
+        home.update(_roster(row.get("roster_home")))
+        away.update(_roster(row.get("roster_away")))
+    return home, away
+
+
 def generate_box_score(events, *, home_team: str = "HOME",
-                       away_team: str = "AWAY") -> BoxScore:
+                       away_team: str = "AWAY", seed_row=None, sides=None) -> BoxScore:
     """Aggregate a game's event sequence into a :class:`BoxScore`.
 
     ``events`` is an iterable of dict rows (or a ``pandas.DataFrame``) carrying at least
@@ -189,6 +207,17 @@ def generate_box_score(events, *, home_team: str = "HOME",
 
     Plus/minus is credited per scoring play to the lineups on the floor at that moment: the
     scoring team's five gets ``+pts``, the opponents' five ``−pts``.
+
+    ``sides`` is ``(home_names, away_names)`` from :func:`side_membership`, seeding which side
+    each player is on. Only :func:`period_box_scores` passes it, and only because side membership
+    is a game-level fact that a single period may not witness. It never invents a stat line: a
+    player with no line in this slice is still not emitted.
+
+    ``seed_row`` establishes where the first minutes interval starts, WITHOUT contributing any
+    stats of its own. It exists for :func:`period_box_scores`: a slice that begins mid-game has
+    real elapsed time before its first event, and with no seed that interval is credited to
+    nobody -- so per-period minutes would not sum to the game's. Pass the last row of the
+    preceding slice.
     """
     rows = _as_rows(events)
 
@@ -208,8 +237,21 @@ def generate_box_score(events, *, home_team: str = "HOME",
             lines[name] = PlayerLine(player=name)
         return lines[name]
 
+    if sides is not None:
+        home_players.update(sides[0])
+        away_players.update(sides[1])
+
     prev_time = None
     prev_roster = ([], [])  # (home, away) on-court at the start of the current interval
+    if seed_row is not None:
+        prev_time = _as_float(seed_row.get("time"))
+        prev_roster = (_roster(seed_row.get("roster_home")), _roster(seed_row.get("roster_away")))
+        # The seed's lineup counts as having appeared in this slice: it is on the floor for the
+        # interval the seed opens. Without this, a player substituted off AT the period break is
+        # credited those seconds by `line()` and then dropped from the box, because the players
+        # sets are built only from rows in the slice -- and his minutes vanish from the total.
+        home_players.update(prev_roster[0])
+        away_players.update(prev_roster[1])
 
     for row in rows:
         home_roster = _roster(row.get("roster_home"))
@@ -371,4 +413,94 @@ def _as_float(value):
     return None if pd.isna(f) else f
 
 
-__all__ = ["PlayerLine", "BoxScore", "generate_box_score", "box_score_for_game"]
+# ===================================================================== #
+# Period slicing                                                       --
+# ===================================================================== #
+#
+# Nothing in the repo split a game by quarter before 2.0: eval_metrics is game-level, and the
+# report's "progression" segments a run by dial changes, not by game periods. Without this,
+# "is end-game mis-modelled?" has no answer -- which is the whole reason the clutch loss
+# weighting was deferred rather than guessed at (correction S).
+#
+# The period rule is imported from models.game_state_features rather than restated. It exists
+# twice already (there and GameController._period_index, which reads self.clock instead of a
+# parameter and sits on the rollout's hot path); a third copy is how corrections N and R both
+# started.
+
+
+def split_by_period(events):
+    """Partition an ordered event sequence into per-period slices.
+
+    Yields ``(period, rows, seed_row)`` in period order, where ``seed_row`` is the last row of
+    the preceding period (``None`` for the first). Feed that straight to
+    :func:`generate_box_score` so the minutes interval spanning the buzzer is credited to the
+    lineup that was on the floor for it -- otherwise per-period minutes do not sum to the game's.
+
+    Rows with no usable ``time`` inherit the current period rather than forming one of their own:
+    a period is a stretch of the clock, and a row that cannot say where it sits belongs with its
+    neighbours. Periods are emitted in first-appearance order, which for time-ordered rows is
+    numeric order; a game with no rows yields nothing.
+
+    **A trailing slice with no elapsed time is not a period.** ``period_index`` treats a period as
+    half-open, so a clock landing exactly on a boundary opens the next one -- right for the game
+    STATE (at 2880 the state really is "a new period, 300 seconds left") and wrong for an EVENT,
+    because a shot at 0.0 is a buzzer-beater belonging to the quarter it ended. Every regulation
+    game carries such rows: the final shot, its block, and the ``end`` sentinel all sit at exactly
+    2880, and left alone they invent a fifth period in every game that never went to overtime.
+    Merging a zero-duration tail back into the period it ends says that without a second copy of
+    the period arithmetic, and it generalises: an OT game's own buzzer rows sit at 3180 and are
+    folded the same way. A mid-game slice is never zero-duration in a real game, and one that was
+    would be a data fault worth seeing, so only the tail is folded.
+    """
+    rows = _as_rows(events)
+    slices: list[tuple[int, list, object]] = []
+    current = None
+    prev_row = None
+    for row in rows:
+        t = _as_float(row.get("time"))
+        period = current if t is None else period_index(t)
+        if period is None:                     # leading rows with no clock at all
+            period = 0
+        if period != current:
+            slices.append((period, [], prev_row))
+            current = period
+        slices[-1][1].append(row)
+        prev_row = row
+
+    if len(slices) > 1:
+        _, tail, _ = slices[-1]
+        times = [t for t in (_as_float(r.get("time")) for r in tail) if t is not None]
+        # Every row sitting exactly on the period's own start, and no time elapsing: that is a
+        # buzzer, not a period. Testing the boundary as well as the duration matters -- a short
+        # trailing run that merely happens to share one clock reading is a real (if tiny) period,
+        # and folding it would hide an out-of-order game rather than report it.
+        if times and max(times) == min(times) == period_start(times[0]):
+            slices[-2][1].extend(tail)
+            slices.pop()
+    return slices
+
+
+def period_box_scores(events, *, home_team: str = "HOME",
+                      away_team: str = "AWAY") -> dict[int, BoxScore]:
+    """Per-period :class:`BoxScore` for one game, keyed by period index (0-3, then OT).
+
+    Every counting stat sums across the returned boxes to the whole-game box, and so do minutes
+    -- that identity is the check this is verified by, over the real cleaned corpus, and it is
+    the reason ``seed_row`` exists.
+    """
+    rows = _as_rows(events)
+    sides = side_membership(rows)
+    out: dict[int, BoxScore] = {}
+    for period, part, seed in split_by_period(rows):
+        box = generate_box_score(part, home_team=home_team, away_team=away_team,
+                                 seed_row=seed, sides=sides)
+        if period in out:
+            # Contiguous runs, so a repeat means the clock went backwards across a period
+            # boundary. Overwriting would silently lose a whole run of rows; refusing says so.
+            raise ValueError(f"period {period} appears twice: the event times are out of order")
+        out[period] = box
+    return out
+
+
+__all__ = ["PlayerLine", "BoxScore", "generate_box_score", "box_score_for_game",
+           "split_by_period", "period_box_scores", "side_membership"]

@@ -44,7 +44,7 @@ from config import HOLDOUT_MANIFEST_NAME, ROLLOUT_BATCH_SIZE, tuning_snapshot
 from data_loading import load_all_cleaned
 from models.artifacts import DEFAULT_ARTIFACTS_ROOT
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
-from simulation.box_score import BoxScore, generate_box_score
+from simulation.box_score import BoxScore, generate_box_score, period_box_scores
 from simulation.controller import GameController
 from simulation.game_input import extract_game_input
 from simulation.game_simulator import GameSimulator
@@ -312,7 +312,8 @@ def evaluate_game(sim: GameSimulator, game_df, *, n_sims: int, seed0: int,
 
 def build_game_record(game_df, boxes: list[BoxScore], *, n_sims: int,
                       home_team: str = "HOME", away_team: str = "AWAY",
-                      seed_base: int | None = None) -> dict:
+                      seed_base: int | None = None,
+                      period_boxes: list[dict] | None = None) -> dict:
     """Assemble one game's evaluation record from its (already-simulated) box scores.
 
     Split out from ``evaluate_game`` so the stage evaluator can run the sims itself (keeping the
@@ -320,6 +321,13 @@ def build_game_record(game_df, boxes: list[BoxScore], *, n_sims: int,
 
     ``seed_base`` is recorded so a run says which RNG streams produced it (see :func:`sim_seed`);
     records written before that existed simply carry ``None``.
+
+    ``period_boxes`` is the per-sim period split (``[{period: BoxScore}, ...]``, aligned to
+    ``boxes``), which only a caller holding the histories can produce -- the streaming evaluator
+    computes it as each sim lands rather than keeping histories alive. The ACTUAL game's split is
+    always derived here, because ``game_df`` is always to hand: a record therefore carries the
+    real per-quarter box even when the predicted one is unavailable, which is what makes an old
+    run partially readable rather than not readable at all.
     """
     if not boxes:
         # Otherwise this is a ZeroDivisionError three lines down, from a caller that has no idea
@@ -393,7 +401,55 @@ def build_game_record(game_df, boxes: list[BoxScore], *, n_sims: int,
         "adv_pred": adv_pred, "adv_actual": adv_actual,
         "players": players,
         "player_avg": player_avg, "player_std": player_std, "player_actual": player_actual,
+        **_quarter_block(game_df, period_boxes, home_team, away_team),
     }
+
+
+# --------------------------------------------------------------------------- period splits
+
+def _period_team_totals(box: BoxScore, side: str) -> dict:
+    return team_totals(_side_lines(box, side))
+
+
+def _quarter_block(game_df, period_boxes, home_team: str, away_team: str) -> dict:
+    """The per-quarter half of a game record: team totals per period, actual and predicted.
+
+    Kept to team totals rather than per-player lines. A per-player per-quarter frame is 4x the
+    biggest table the report already carries, for a number nobody reads a player at a time -- and
+    the per-quarter question this exists to answer ("does the model play end-game basketball?")
+    is a team question: pace, shot mix, free throws, who is scoring when it is close.
+
+    Periods are the keys, as strings, because this lands in JSON.
+    """
+    actual = period_box_scores(game_df, home_team=home_team, away_team=away_team)
+    out = {
+        "quarter_actual": {str(p): {side: _period_team_totals(b, side)
+                                    for side in ("home", "away")}
+                           for p, b in actual.items()},
+    }
+    if not period_boxes:
+        out["quarter_pred"] = None
+        return out
+
+    # Mean over sims, per period, per side. A sim that reached fewer periods than another
+    # contributes only to the periods it has -- the divisor is per period for that reason.
+    acc: dict[str, dict[str, dict[str, list]]] = {}
+    for per_sim in period_boxes:
+        for period, box in per_sim.items():
+            key = str(period)
+            for side in ("home", "away"):
+                totals = _period_team_totals(box, side)
+                bucket = acc.setdefault(key, {}).setdefault(side, {})
+                for stat, value in totals.items():
+                    bucket.setdefault(stat, []).append(value)
+    out["quarter_pred"] = {
+        period: {side: {stat: float(np.mean(vals)) for stat, vals in stats.items()}
+                 for side, stats in sides.items()}
+        for period, sides in acc.items()
+    }
+    out["quarter_n_sims"] = {period: max(len(next(iter(sides["home"].values()), [])), 0)
+                             for period, sides in acc.items()}
+    return out
 
 
 def evaluate_holdout(*, n_sims: int = DEFAULT_SIMS, games: int | None = None,

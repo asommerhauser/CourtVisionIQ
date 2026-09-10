@@ -351,7 +351,7 @@ def derive_sub_decisions(rows) -> dict[str, np.ndarray]:
     opportunity instead, so every substitution is counted and every count lands somewhere the
     controller will actually ask.
     """
-    from models.game_state_features import _period_index
+    from models.game_state_features import period_index
 
     rows = list(rows)
     n = len(rows)
@@ -380,7 +380,7 @@ def derive_sub_decisions(rows) -> dict[str, np.ndarray]:
         nxt = i + 1
         while nxt < n and events[nxt] == "substitution":
             nxt += 1
-        if nxt < n and _period_index(times[nxt]) != _period_index(times[i]):
+        if nxt < n and period_index(times[nxt]) != period_index(times[i]):
             legal = True
         out["can_sub"][i] = 1.0 if legal else 0.0
 

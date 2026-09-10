@@ -139,7 +139,7 @@ def possession_boundary(event: str, etype: str, result: str):
     return None
 
 
-def _period_index(t: float) -> int:
+def period_index(t: float) -> int:
     """Monotonic period id at clock ``t`` (0–3 regulation, then one per OT)."""
     if t < REGULATION:
         return int(t // PERIOD_LENGTH)
@@ -153,7 +153,7 @@ def _period_end(t: float) -> float:
     return REGULATION + (int((t - REGULATION) // OT_LENGTH) + 1) * OT_LENGTH
 
 
-def _period_start(t: float) -> float:
+def period_start(t: float) -> float:
     """Clock at the start of the period containing ``t``.
 
     Where a possession is taken to begin when there is no earlier evidence -- the game's first
@@ -330,7 +330,7 @@ class GameStateScan:
     def step(self, row) -> tuple:
         """Fold one event row in; return its raw state values in ``GAME_STATE_KEYS`` order."""
         t = float(row.get("time") or 0.0)
-        period = _period_index(t)
+        period = period_index(t)
         if period != self.cur_period:       # per-period team-foul reset (controller parity)
             self.fouls_home = self.fouls_away = 0
             self.cur_period = period
@@ -338,7 +338,7 @@ class GameStateScan:
             # whenever the first event of the period happens to land. Covers the game's first
             # row too, since period -1 never matches. Not counted as a possession end: nobody
             # completed a trip, the clock simply restarts.
-            self.poss_start = _period_start(t)
+            self.poss_start = period_start(t)
             self.ft_made_at = None
             self.ft_retains = False
             self.ft_after_basket = False
