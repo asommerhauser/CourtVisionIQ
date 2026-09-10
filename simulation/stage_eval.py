@@ -40,6 +40,7 @@ from reporting.game_report import render_game_html
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
 from simulation.box_score import BoxScore, PlayerLine, generate_box_score
 from simulation.eval_metrics import _aggregate, print_summary, reported_sims
+from simulation.box_score import period_box_scores
 from simulation.evaluation import build_game_record, simulate_games
 from simulation.game_input import extract_game_input
 from simulation.game_simulator import GameSimulator
@@ -152,6 +153,12 @@ class _PbpSink:
         # Width from the REQUESTED sim count, not from a finished list (there isn't one any more).
         # At 100 sims a fixed :02d sorts sim_9 after sim_100.
         self.width = max(2, len(str(n_sims)))
+        # Per-period team totals, accumulated here because this is the only place a history is
+        # in hand. Splitting the history NOW and keeping the small result is what lets the
+        # per-quarter record exist without holding every history alive to the end of the chunk --
+        # which is the 8.6 GB record spike the lineup-state branch removed, and not worth
+        # reintroducing for a table of team totals.
+        self.period_boxes: list[list] = [[None] * n_sims for _ in chunk]
 
     def prepare(self) -> None:
         """Create each game's playbyplay/ dir, clear any stale sims, write the actual play-by-play.
@@ -178,6 +185,11 @@ class _PbpSink:
 
     def __call__(self, g: int, s: int, history, box) -> None:
         p = self.chunk[g]
+        try:
+            self.period_boxes[g][s] = period_box_scores(
+                history, home_team=p["home_team"], away_team=p["away_team"])
+        except Exception as e:      # noqa: BLE001 - a bad split costs the quarter table, not the sim
+            print(f"  game {p['gid']} sim {s + 1}: could not split by period ({e!r})")
         try:
             frame = history_to_cleaned_frame(history, p["spec"], game_id=int(p["gid"]))
             path = p["out_dir"] / "playbyplay" / f"sim_{s + 1:0{self.width}d}_playbyplay.csv"
@@ -421,7 +433,7 @@ def evaluate_stage(stage_name: str, *, sim=None, df=None, run_label: str | None 
                                          batch_size=batch_size, show_progress=True,
                                          game_ids=[p["gid"] for p in chunk],
                                          on_sim=sink, boxes_out=boxes_out)
-                for p, (boxes, _) in zip(chunk, results):
+                for _ci, (p, (boxes, _)) in enumerate(zip(chunk, results)):
                     try:
                         if not boxes:
                             print(f"  game {p['gid']}: every sim failed; skipping "
@@ -432,9 +444,11 @@ def evaluate_stage(stage_name: str, *, sim=None, df=None, run_label: str | None 
                                   f"failed; recording it at {len(boxes)} sims.")
                         # len(boxes), not n_sims: a record must say what it was actually built
                         # from, or the report's precision is a fiction.
-                        record = build_game_record(p["game"], boxes, n_sims=len(boxes),
-                                                   seed_base=seed0, home_team=p["home_team"],
-                                                   away_team=p["away_team"])
+                        record = build_game_record(
+                            p["game"], boxes, n_sims=len(boxes), seed_base=seed0,
+                            home_team=p["home_team"], away_team=p["away_team"],
+                            period_boxes=[q for q in sink.period_boxes[_ci]
+                                          if q is not None])
                         _write_game_folder(p["out_dir"], p["game"], boxes, record,
                                            p["home_team"], p["away_team"])
                         records.append(record)
