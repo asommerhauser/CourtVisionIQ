@@ -79,8 +79,8 @@ executed under pytest yet.
 | | |
 |---|---|
 | branch | `feature/version2`, clean tree, everything merged |
-| cleaned data | 2.0, all 21 seasons — **one clean behind**, see below |
-| vocabularies | frozen and committed, `0ab3956`, byte-identical through the last clean |
+| cleaned data | 2.0, all 21 seasons, **current** — re-cleaned at workstream 12 (correction Q) |
+| vocabularies | frozen and committed, **`be87b39`** — re-frozen at workstream 12's clean, which purged `Nene ` (one token, 2153 -> 2152); the other four are byte-identical to `0ab3956` |
 | suite | green (~719) |
 | weights | **none usable** — see standing rule 5 |
 
@@ -173,7 +173,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | 11b | `feature/lineup-state` | 3 | §8 | [x] | 4fa3713 |
 | 11c | `feature/bench-bundle` | 3 | §8 | [x] | 402c182 |
 | 11d | `feature/sub-decision-head` | 3 | §8 | [x] | 1b48794 |
-| 12 | `feature/training-changes` | 3 | §10† | [x] | PENDING |
+| 12 | `feature/training-changes` | 3 | §10† | [x] | be87b39 |
 | 13 | `feature/quarter-eval-splits` | 4 | §11 | [ ] | |
 | — | **Gate C — pre-train checklist, then the 2.0 train** | 4 | | [ ] | |
 
@@ -1649,4 +1649,4 @@ Append one line per merge. Newest last.
 | 2026-09-09 | `feature/bench-bundle` | 402c182 | ten bench slots per side, second set encoder; BENCH_SIZE into ARCH_KEYS |
 | 2026-09-09 | `feature/sub-decision-head` | 1b48794 | rotation is a decision, not a timer; stint head + 4 dials retired (correction R) |
 | 2026-09-09 | — | — | clutch weighting rejected before building (correction S); workstream 11 complete |
-| 2026-09-09 | `feature/training-changes` | PENDING | mask 10.6% -> 31.5% of event-head positions; free-throw trip unified and the pace reference de-biased (correction T) |
+| 2026-09-09 | `feature/training-changes` | be87b39 | mask 10.6% -> 31.5% of event-head positions; free-throw trip unified and the pace reference de-biased (correction T) |
