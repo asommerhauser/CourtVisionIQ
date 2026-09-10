@@ -33,8 +33,11 @@ from models.season_features import (
 )
 from models.game_state_features import (
     GAME_STATE_INPUT_KEYS,
+    QUERY_MASK_KEYS,
     merge_game_state_features,
     append_game_state_batches,
+    append_query_mask_batches,
+    apply_query_mask,
     make_game_state_inputs,
     game_state_projections,
 )
@@ -439,7 +442,7 @@ class EventTimeModel:
         keys_cont = ["time_abs", "delta_time"]
 
         batches = {k: [] for k in (*keys_1d, *keys_roster, *keys_cont, *SEASON_INPUT_KEYS,
-                                   *GAME_STATE_INPUT_KEYS, *ROSTER_STATE_KEYS,
+                                   *GAME_STATE_INPUT_KEYS, *ROSTER_STATE_KEYS, *QUERY_MASK_KEYS,
                                    "event_target", "time_target", "pad_mask", "loss_mask")}
 
         game_ids_sorted = [g for g in np.unique(game_id) if g in games]
@@ -469,6 +472,7 @@ class EventTimeModel:
             append_season_batches(batches, cols, idx, n, SEQ)
             append_game_state_batches(batches, cols, idx, n, SEQ)
             append_rotation_batches(batches, cols, idx, n, SEQ)
+            append_query_mask_batches(batches, cols, idx, n, SEQ)
 
             # Targets: next-step shift within this game.
             event_t = np.full((SEQ,), PAD_EVENT, dtype=np.int32)
@@ -630,8 +634,16 @@ class EventTimeModel:
         # time head never predicts the gap to a sub). Sub rows stay in the sequence as context.
         sub_id = self.encoder.encode_event("substitution")
         mask = (split["loss_mask"] * (split["event_target"] != sub_id)).astype(np.float32)
+        # Same argument, the rest of the way: the controller expands one sampled play into
+        # several rows and never asks "what next" at the intermediate ones. Substitutions were
+        # simply the one case visible from event_target alone; the others need the scan.
+        # 10.6% -> 31.5% of positions on 2022-23. The time head additionally skips the row before
+        # a period break, whose gap spans a buzzer the controller never samples across.
         mask = apply_recency(mask, split)
-        sample_weights = {"event_output": mask, "time_output": mask}
+        sample_weights = {
+            "event_output": apply_query_mask(mask, split, time_head=False),
+            "time_output": apply_query_mask(mask, split, time_head=True),
+        }
 
         ds = tf.data.Dataset.from_tensor_slices((inputs, targets, sample_weights))
         if shuffle:

@@ -39,6 +39,7 @@ import ast
 
 import numpy as np
 
+import config
 from zones import points_for_shot
 
 # --- Period geometry (mirrors simulation/controller.py constants) ---
@@ -87,6 +88,24 @@ _RETAINING_FOUL_TYPES = {"technical"}
 # Events that count as live play when deciding whether a foul was drawn on a made basket.
 # Substitutions, timeouts and the game sentinels can sit between the basket and the foul.
 _LIVE_EVENTS = {"shot", "rebound", "turnover", "block", "assist"}
+# Dead-ball rows that can be injected INSIDE a free-throw trip without ending it. The trip is a
+# whistle-to-whistle unit: the ball is dead for its whole length, which is exactly when the
+# rotation scheduler is allowed to substitute and when a coach may call timeout. Measured over
+# the cleaned corpus, ~7,500 trips a season are split this way in every era (7,474 in 2022-23,
+# 99.5% of them with the same shooter on both sides of the gap, i.e. one trip and not two).
+_DEAD_BALL_EVENTS = {"substitution", "timeout"}
+
+# Per-row booleans written alongside the game-state scalars. Neither is a model input -- both are
+# loss masks -- so they are deliberately NOT in GAME_STATE_KEYS.
+#
+#   CONTINUATION_KEY  this row is one the controller emits itself, as the continuation of a play
+#                     it already sampled (see GameStateScan._continuation_of).
+#   PERIOD_BREAK_KEY  this row is the last of its period within its game. The gap from here to
+#                     the next row spans a buzzer, and the controller never samples across one --
+#                     it clamps at the boundary and starts the new period fresh. Masks the TIME
+#                     head only: the event head is still asked what opens the next period.
+CONTINUATION_KEY = "is_continuation"
+PERIOD_BREAK_KEY = "period_break"
 
 
 def possession_boundary(event: str, etype: str, result: str):
@@ -180,7 +199,8 @@ class GameStateScan:
     """
 
     __slots__ = ("home_pts", "away_pts", "fouls_home", "fouls_away", "cur_period", "poss_start",
-                 "ft_made_at", "ft_retains", "ft_after_basket", "prev_live", "poss_ends")
+                 "ft_made_at", "ft_retains", "ft_after_basket", "prev_live", "poss_ends",
+                 "ft_trip_open", "prev_row", "is_continuation")
 
     def __init__(self) -> None:
         self.home_pts = 0
@@ -196,6 +216,14 @@ class GameStateScan:
         self.ft_retains = False         # technical / flagrant / take: the shooting team keeps it
         self.ft_after_basket = False    # an and-1: the basket it followed already ended it
         self.prev_live = None           # (event, type, result) of the last live-play row
+        # Whether a free-throw trip is open right now. One notion, shared by the possession
+        # clock and the continuation rule -- see _track_free_throws and is_continuation.
+        self.ft_trip_open = False
+        self.prev_row = None            # (event, type, result) of the immediately preceding row
+        # Set by step(): this row is a continuation the controller emits itself (see
+        # _continuation_of). Read off the scan rather than returned, so step()'s tuple stays
+        # exactly GAME_STATE_KEYS for the simulator's incremental path.
+        self.is_continuation = False
         # Possessions completed so far. Not a feature -- it is what the pace check counts, and it
         # lives here so the check counts the same events the clock resets on, by construction.
         self.poss_ends = 0
@@ -211,6 +239,12 @@ class GameStateScan:
 
         A missed free throw clears the pending time: the trip's outcome is no longer settled by
         the trip, it is settled by the rebound that follows, which decides on its own.
+
+        ``ft_trip_open`` is the trip's extent, and it is deliberately NOT "the last row was a
+        free throw": a substitution or a timeout sits inside the trip without ending it. Closing
+        on one counted a two-shot trip twice, the very error correction M was written to remove
+        -- ~7,500 trips a season in every era, because the rotation scheduler's window and a
+        coach's timeout are both whistle-to-whistle events.
         """
         if event == "foul":
             self.ft_retains = (result in _RETAINING_FOUL_RESULTS
@@ -218,10 +252,15 @@ class GameStateScan:
             prev = self.prev_live
             self.ft_after_basket = bool(
                 prev and prev[0] == "shot" and prev[1] != "free throw" and prev[2] == "made")
+            self.ft_trip_open = True
             return
         if event == "shot" and etype == "free throw":
             self.ft_made_at = t if result == "made" else None
+            self.ft_trip_open = True
             return
+        if event in _DEAD_BALL_EVENTS:
+            return                      # injected mid-trip; leaves the trip open
+        self.ft_trip_open = False
         if event in _LIVE_EVENTS:
             self.prev_live = (event, etype, result)
 
@@ -245,6 +284,48 @@ class GameStateScan:
         self.ft_made_at = None
         self.ft_retains = False
         self.ft_after_basket = False
+        self.ft_trip_open = False
+
+    def _continuation_of(self, event, etype, result) -> bool:
+        """Is this row one the controller emits itself, rather than sampling from the event head?
+
+        The controller expands ONE sampled play into several emitted rows. At the intermediate
+        rows it never asks "what happens next" -- it already knows, because it is mid-expansion.
+        Training the event and time heads at those positions teaches them a question that is
+        never asked at inference. From the ``_append`` calls in ``simulation/controller.py`` the
+        expansions are exactly three shapes:
+
+          * ``assist`` -> ``shot``           (``_do_assist``: the assisted basket)
+          * ``shot`` (blocked) -> ``block``  (``_do_shot``: the blocker)
+          * an open trip -> ``free throw``   (``_free_throws``, from either foul path)
+
+        The free-throw arm is a **trip** question, not a row-pair question, and that is why it
+        reads ``ft_trip_open`` rather than the previous row. Two measured reasons, either alone
+        fatal to the pairwise form:
+
+          * the foul row does not say whether free throws followed. The cleaner writes
+            ``nothing`` on a common foul and the bonus is the controller's own decision
+            (``_foul_outcome`` -> ``_in_bonus``); 3,375 ``personal``/``nothing`` fouls in 2022-23
+            are followed directly by a free throw, plus 714 ``loose ball``/``op`` and 100
+            ``away from play``/``nothing``.
+          * substitutions and timeouts sit inside the trip, at depths up to six or more. Roughly
+            one free throw in five is separated from its foul that way, and the position AT the
+            interposed row is one the controller never queries either.
+
+        Together those are 13-16% of the whole mask -- a pairwise predicate keyed on the foul's
+        result token silently misses 17,000-21,000 positions a season.
+
+        Substitutions are NOT handled here. They are controller-forced too, but the heads already
+        zero them at dataset time from ``event_target`` alone, which needs no scan.
+        """
+        prev = self.prev_row
+        if event == "shot" and etype == "free throw":
+            return self.ft_trip_open
+        if prev is None:
+            return False
+        if event == "shot" and prev[0] == "assist":
+            return True
+        return event == "block" and prev[0] == "shot" and prev[2] == "blocked"
 
     def step(self, row) -> tuple:
         """Fold one event row in; return its raw state values in ``GAME_STATE_KEYS`` order."""
@@ -261,13 +342,23 @@ class GameStateScan:
             self.ft_made_at = None
             self.ft_retains = False
             self.ft_after_basket = False
+            # No play expansion spans a buzzer, so neither the trip nor the previous row carries
+            # across one. The controller enforces the same thing by clamping at the boundary.
+            self.ft_trip_open = False
+            self.prev_row = None
 
         boundary = None
         event = _norm(row.get("event"))
         etype_raw = _norm(row.get("type"))
-        # A trip resolves on the first row that is not one of its own free throws, so its outcome
-        # is known (last shot seen, foul kind, what preceded it) before this row's clock is read.
-        if not (event == "shot" and etype_raw == "free throw"):
+        result_raw = _norm(row.get("result"))
+        # Decided BEFORE the trip is advanced or resolved: "is this row part of the play the
+        # previous row started" is a question about the state as of the previous row.
+        self.is_continuation = self._continuation_of(event, etype_raw, result_raw)
+        # A trip resolves on the first row that is neither one of its own free throws nor a
+        # dead-ball row injected inside it, so its outcome is known (last shot seen, foul kind,
+        # what preceded it) before this row's clock is read.
+        if not (event == "shot" and etype_raw == "free throw") and not (
+                self.ft_trip_open and event in _DEAD_BALL_EVENTS):
             self._resolve_free_throws()
         if event not in _SKIP_EVENTS:
             player = _norm(row.get("player"))
@@ -275,8 +366,8 @@ class GameStateScan:
             away_roster = _roster(row.get("roster_away"))
             team = ("home" if player in home_roster
                     else "away" if player in away_roster else None)
-            etype = _norm(row.get("type"))
-            result = _norm(row.get("result"))
+            etype = etype_raw
+            result = result_raw
             boundary = possession_boundary(event, etype, result)
             self._track_free_throws(event, etype, result, t)
             if event == "shot" and result == "made":
@@ -301,6 +392,7 @@ class GameStateScan:
             if boundary == POSSESSION_END:
                 self.poss_ends += 1
 
+        self.prev_row = (event, etype_raw, result_raw)
         return (self.home_pts - self.away_pts,
                 self.home_pts + self.away_pts,
                 period,
@@ -318,15 +410,21 @@ def derive_game_state(rows) -> dict[str, np.ndarray]:
     shape produced by both the cleaned data and ``GameSimulator`` history. Scoring follows the
     box-score semantics (made shot -> 2 / 3 / 1 by type; scoring team = the player's side by
     roster membership). Returns raw (un-normalized) ``(N,)`` float arrays keyed by
-    ``GAME_STATE_KEYS``. A thin driver over :class:`GameStateScan`.
+    ``GAME_STATE_KEYS``, plus ``CONTINUATION_KEY`` -- which is a loss mask, not a model input,
+    and so is carried alongside the seven rather than among them. Callers that want only the
+    inputs iterate ``GAME_STATE_KEYS`` and never see it. A thin driver over
+    :class:`GameStateScan`.
     """
     rows = list(rows)
     n = len(rows)
     out = {k: np.zeros((n,), dtype=np.float32) for k in GAME_STATE_KEYS}
+    cont = np.zeros((n,), dtype=np.float32)
     scan = GameStateScan()
     for i, row in enumerate(rows):
         for k, v in zip(GAME_STATE_KEYS, scan.step(row)):
             out[k][i] = v
+        cont[i] = scan.is_continuation
+    out[CONTINUATION_KEY] = cont
     return out
 
 
@@ -366,11 +464,23 @@ def merge_game_state_features(df, cols) -> dict:
     """
     n = len(df)
     raw = {k: np.zeros((n,), dtype=np.float32) for k in GAME_STATE_KEYS}
+    cont = np.zeros((n,), dtype=np.float32)
+    brk = np.zeros((n,), dtype=np.float32)
     for pos, records in iter_game_rows(df):
         gs = derive_game_state(records)
         for k in GAME_STATE_KEYS:
             raw[k][pos] = gs[k]
+        cont[pos] = gs[CONTINUATION_KEY]
+        # Last row of its period, WITHIN this game -- computed here, where the game's rows are
+        # the whole array, so no boundary can leak into the neighbouring game.
+        period = gs["period_idx"]
+        if len(period) > 1:
+            brk[pos[:-1]] = (period[1:] != period[:-1]).astype(np.float32)
     cols.update(normalize_game_state(raw))
+    # Not normalized: they are 0/1 masks, and they ride the same single scan, so no head pays for
+    # a second pass over the corpus to get them.
+    cols[CONTINUATION_KEY] = cont
+    cols[PERIOD_BREAK_KEY] = brk
     return cols
 
 
@@ -397,6 +507,50 @@ def append_game_state_batches(batches, cols, idx, n, SEQ) -> None:
         buf = np.zeros((SEQ, 1), dtype=np.float32)
         buf[:n, 0] = cols[k][idx]
         batches[k].append(buf)
+
+
+# --- Loss masking: train the next-step heads only where the sim actually asks ------------------
+#
+# Both arrays are per-POSITION, not per-row: position i predicts row i+1, so the continuation
+# flag is shifted the same way ``event_target`` is. They are stored in the npz unconditionally
+# and applied at dataset time (see :func:`apply_query_mask`), so turning the masking off is a
+# config change and two trains against the SAME preprocess -- not a re-clean.
+NEXT_CONTINUATION_KEY = "next_is_continuation"
+QUERY_MASK_KEYS = (NEXT_CONTINUATION_KEY, PERIOD_BREAK_KEY)
+
+
+def append_query_mask_batches(batches, cols, idx, n, SEQ) -> None:
+    """Pad/stack the loss-mask arrays for one game (mirrors append_game_state_batches).
+
+    ``next_is_continuation`` is shifted by one exactly as ``event_target`` is: the last real row
+    has no next row, and ``loss_mask`` already zeroes that position.
+    """
+    cont = np.zeros((SEQ,), dtype=np.float32)
+    if n > 1:
+        cont[: n - 1] = cols[CONTINUATION_KEY][idx][1:]
+    batches[NEXT_CONTINUATION_KEY].append(cont)
+
+    brk = np.zeros((SEQ,), dtype=np.float32)
+    brk[:n] = cols[PERIOD_BREAK_KEY][idx]
+    batches[PERIOD_BREAK_KEY].append(brk)
+
+
+def apply_query_mask(mask, split, *, time_head: bool):
+    """Zero a ``(N, SEQ)`` sample-weight mask at the positions the controller never queries.
+
+    One definition, called by every next-step head, for the reason corrections N and R were both
+    written down: a rule read in more than one place drifts. ``time_head`` adds the period-break
+    row, which is a time-head-only exclusion -- the event head IS asked what opens the next
+    period, it just is not asked how long the buzzer takes.
+
+    No-op when the knob is off or the split predates the feature (key absent), so an npz built
+    before this workstream still loads.
+    """
+    if config.MASK_CONTINUATION_ROWS and NEXT_CONTINUATION_KEY in split:
+        mask = mask * (1.0 - split[NEXT_CONTINUATION_KEY])
+    if time_head and config.MASK_PERIOD_BREAK_TIME and PERIOD_BREAK_KEY in split:
+        mask = mask * (1.0 - split[PERIOD_BREAK_KEY])
+    return mask.astype(np.float32)
 
 
 # =====================
@@ -447,14 +601,23 @@ def _percentile(values, q):
 
 
 def _scan_season(path):
-    """Per-game possession counts, durations, and the formula's estimate, for one season file."""
+    """Per-game possession counts, durations, the formula's estimate, and the mask shares.
+
+    The mask shares ride along because this pass already visits every row with the scan that
+    decides them, so the loss-mask number costs nothing extra. A *position* is a row that has a
+    next row in the same game -- what ``loss_mask`` marks, and what the event and time heads
+    actually train on. A position is masked when the row it predicts is one the controller emits
+    itself: a substitution (already masked at dataset time) or a continuation.
+    """
     import pandas as pd
 
     df = pd.read_csv(path)
     per_game_ends, lengths, clipped, rows = [], [], 0, 0
+    positions = sub_next = cont_next = either = 0
     for _, game in df.groupby("game_id", sort=False):
         scan = GameStateScan()
         before = 0
+        prev_seen = False
         for row in game.to_dict("records"):
             *_, clock = scan.step(row)
             rows += 1
@@ -463,22 +626,93 @@ def _scan_season(path):
             if scan.poss_ends != before:      # this row completed a possession
                 lengths.append(clock)
                 before = scan.poss_ends
+            if prev_seen:                     # the position BEFORE this row predicts this row
+                positions += 1
+                is_sub = _norm(row.get("event")) == "substitution"
+                sub_next += is_sub
+                cont_next += scan.is_continuation
+                either += is_sub or scan.is_continuation
+            prev_seen = True
         per_game_ends.append(scan.poss_ends)
-    return per_game_ends, lengths, clipped, rows, _formula_possessions(df)
+    return (per_game_ends, lengths, clipped, rows, _formula_possessions(df),
+            positions, sub_next, cont_next, either)
+
+
+def _non_ending_fta(df) -> int:
+    """Free-throw attempts that provably do NOT end a possession, off raw tokens alone.
+
+    Two categories, and they are the same two the possession rule excludes -- but identified here
+    by a completely separate route, so the reference stays independent of the rule it checks:
+
+      * **and-1s.** The made field goal already ended the possession; the bonus attempt cannot end
+        it again. Detected by the one unambiguous raw signal: the free-throw shooter IS the player
+        who made the immediately preceding field goal. (Testing only "a made FG came before the
+        foul" is not enough -- most defensive fouls follow somebody's made basket. That version
+        measured 9.3 and-1s per team per game against a true 2.0.)
+      * **retaining fouls.** A technical or the ``free throw op`` family (personal take,
+        transition take, flagrant-1): the shooting team keeps the ball.
+
+    Measured per team per game: and-1 2.0 (2002-03) / 2.0 (2012-13) / 2.7 (2022-23), retaining
+    1.1 / 1.3 / 1.4 -- rates that match real basketball, which the naive detector's did not.
+    """
+    ev = df["event"].to_numpy()
+    ty = df["type"].to_numpy()
+    rs = df["result"].to_numpy()
+    pl = df["player"].to_numpy()
+    gid = df["game_id"].to_numpy()
+
+    excluded = 0
+    kind = None            # what the open trip is: "and1", "retain", "trip", or pending
+    scorer = None          # player of the last made field goal, for the and-1 test
+    last_live = None
+    for k in range(len(df)):
+        if k and gid[k] != gid[k - 1]:
+            kind = last_live = None
+        event = ev[k]
+        if event == "shot" and ty[k] == "free throw":
+            if kind == "pending":     # first attempt of a trip that followed a made FG
+                kind = "and1" if (scorer is not None and pl[k] == scorer) else "trip"
+            if kind in ("and1", "retain"):
+                excluded += 1
+            continue
+        if event == "foul":
+            if rs[k] in _RETAINING_FOUL_RESULTS or ty[k] in _RETAINING_FOUL_TYPES:
+                kind = "retain"
+            elif (last_live is not None and last_live[0] == "shot"
+                  and last_live[2] == "made" and last_live[1] != "free throw"):
+                kind, scorer = "pending", last_live[3]
+            else:
+                kind = "trip"
+            continue
+        if event in _DEAD_BALL_EVENTS:
+            continue                  # injected mid-trip; the trip is still the same trip
+        kind = None
+        if event in _LIVE_EVENTS:
+            last_live = (event, ty[k], rs[k], pl[k])
+    return excluded
 
 
 def _formula_possessions(df) -> float:
-    """Possessions per team per game by the standard box-score estimate.
+    """Possessions per team per game by the standard box-score estimate, de-biased.
 
     ``FGA - OREB + TOV + 0.44 * FTA`` -- the accepted approximation, and the only reference the
     check needs that does not come from the rule being checked. Computed on the same file, so it
     tracks era, pace and this data's own quirks; published pace figures are normalized per 48
-    minutes and exclude playoff games, so they are an anchor rather than a target. On 2022-23 this
-    lands at 99.4 against a published 99.2.
+    minutes and exclude playoff games, so they are an anchor rather than a target.
+
+    **The 0.44 is corrected before use.** It charges a fraction of a possession to every free
+    throw, including the two families that cannot end one -- and-1s and retaining fouls (see
+    :func:`_non_ending_fta`). Left in, the reference measures a different quantity from the scan,
+    by about 1.5 possessions per team per game, and the check then reads as agreement or
+    disagreement for the wrong reason. Removing them costs nothing in independence: both are
+    found from raw tokens, with no possession rule involved.
+
+    Left uncorrected the 2022-23 figure is 99.4 against a published 99.2 -- which is exactly the
+    trap, because the published figure carries the same 0.44 and so shares the same bias.
     """
     shots = df[df["event"] == "shot"]
     fga = int((shots["type"] != "free throw").sum())
-    fta = int((shots["type"] == "free throw").sum())
+    fta = int((shots["type"] == "free throw").sum()) - _non_ending_fta(df)
     rebounds = df[df["event"] == "rebound"]
     oreb = int(rebounds["type"].isin(("offensive", "team offensive")).sum())
     tov = int((df["event"] == "turnover").sum()) + int(
@@ -502,6 +736,7 @@ def _main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     rows = []
+    masks = []
     failures = []
     for label in (x.strip() for x in args.seasons.split(",") if x.strip()):
         path = os.path.join(args.data_dir, f"season{label}.csv")
@@ -509,7 +744,8 @@ def _main(argv=None) -> int:
             print(f"WARNING: no cleaned file at {path}")
             continue
         print(f"scanning {label}: {path} ...", flush=True)
-        ends, lengths, clipped, n, formula = _scan_season(path)
+        (ends, lengths, clipped, n, formula,
+         positions, sub_next, cont_next, either) = _scan_season(path)
         if not ends:
             failures.append(f"{label}: no games found")
             continue
@@ -519,6 +755,7 @@ def _main(argv=None) -> int:
                      sum(lengths) / len(lengths) if lengths else float("nan"),
                      _percentile(lengths, 0.50), _percentile(lengths, 0.95),
                      100.0 * clipped / n if n else 0.0))
+        masks.append((label, positions, sub_next, cont_next, either))
         if abs(per_team - formula) > PACE_TOLERANCE:
             failures.append(
                 f"{label}: {per_team:.1f} possessions per team per game against {formula:.1f} "
@@ -535,6 +772,16 @@ def _main(argv=None) -> int:
     for label, games, per_team, formula, mean, p50, p95, pct in rows:
         print(f"{label:>8} {games:>7} {per_team:>10.1f} {formula:>8.1f} {per_team-formula:>+6.1f} "
               f"{mean:>8.1f} {p50:>7.1f} {p95:>7.1f} {pct:>6.1f}%")
+
+    # Workstream 12's number: how much of what the event and time heads train on is a question
+    # the controller never asks. "before" is what ships today (the substitution mask alone).
+    print()
+    print(f"{'season':>8} {'positions':>11} {'sub':>8} {'contin.':>9} {'before':>8} {'after':>8}")
+    for label, positions, sub_next, cont_next, either in masks:
+        if not positions:
+            continue
+        print(f"{label:>8} {positions:>11,} {sub_next:>8,} {cont_next:>9,} "
+              f"{100.0*sub_next/positions:>7.1f}% {100.0*either/positions:>7.1f}%")
 
     print()
     if failures:

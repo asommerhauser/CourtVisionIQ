@@ -463,6 +463,27 @@ RECENCY_WEIGHTING = True
 RECENCY_HALFLIFE_SEASONS = 3.0
 RECENCY_FLOOR = 0.05
 
+# --- Loss masking (event + time heads: train only where the sim actually asks) ---
+# The controller expands ONE sampled play into several emitted rows -- the shot after an
+# assist, the block after a blocked shot, every free throw of a trip -- and never asks the
+# event head 'what next' at the intermediate ones. Training there teaches a question that is
+# never asked at inference. Substitutions are masked already (they are injected by the
+# rotation scheduler, not sampled); this covers the rest. Measured over the cleaned corpus,
+# the masked share of event-head training positions goes 10.6% -> 31.5% on 2022-23, and
+# 9.0% -> 29.8% / 9.9% -> 30.2% on 2002-03 / 2012-13:
+#
+#     python -m models.game_state_features --seasons 2003,2013,2023
+#
+# A TRAINING knob, not a rollout dial and not architecture: it changes no weight shapes and
+# nothing at sim time reads it, so it is in neither _TUNING_KEYS nor ARCH_KEYS. The mask is
+# built at preprocess and stored in the npz either way -- this switches whether the dataset
+# APPLIES it, so the A/B is two trains against the same preprocess, no re-clean.
+MASK_CONTINUATION_ROWS = True
+# The time head additionally skips the last row of each period: that gap spans a buzzer, and
+# the controller clamps at the boundary rather than sampling across one. The event head is
+# still asked what opens the next period, so this is time-only.
+MASK_PERIOD_BREAK_TIME = True
+
 # --- Single full-train + batched holdout eval (full_train.py / training/full_run.py) ---
 # Stop training partway through the most recent season, hold out the next FINAL_HOLDOUT_GAMES real
 # games, and predict them EVAL_BATCH at a time (pausing between batches). Full-train weights go to
