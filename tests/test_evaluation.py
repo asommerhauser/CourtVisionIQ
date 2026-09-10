@@ -250,3 +250,128 @@ def test_progression_renders_section_and_parquet(tmp_path):
     assert len(prog) == 2
     assert {"segment", "n_games", "spread_mae", "DELTA_TIME_SCALE", "changed_dials"}.issubset(
         prog.columns)
+
+
+# ---------------------------------------------------------------------------
+# Per-quarter splits (workstream 13)
+# ---------------------------------------------------------------------------
+
+_Q = 720
+_REG = 4 * _Q
+
+
+def _qrow(time, event, player, type_, result, secondary="none"):
+    return {
+        "game_id": 7, "event": event, "player": player, "type": type_, "result": result,
+        "secondary_player": secondary, "time": time,
+        "roster_home": ["A", "B", "C", "D", "E"],
+        "roster_away": ["F", "G", "H", "I", "J"],
+    }
+
+
+def _quarter_game():
+    """One row per quarter, each a made shot, so every period is distinguishable by points."""
+    return pd.DataFrame([
+        _qrow(0, "start", "start", "start", "start"),
+        _qrow(10, "shot", "A", "paint", "made"),            # Q1: home 2
+        _qrow(_Q + 10, "shot", "B", "top3", "made"),        # Q2: home 3
+        _qrow(2 * _Q + 10, "shot", "F", "paint", "made"),   # Q3: away 2
+        _qrow(3 * _Q + 10, "shot", "A", "free throw", "made"),  # Q4: home 1
+        _qrow(_REG, "end", "end", "end", "end"),
+    ])
+
+
+def test_build_game_record_always_carries_the_actual_quarter_split():
+    """game_df is always to hand, so the real per-quarter box needs no histories."""
+    game = _quarter_game()
+    boxes = [ev.generate_box_score(game)]
+    rec = ev.build_game_record(game, boxes, n_sims=1)
+
+    assert rec["quarter_pred"] is None          # no period_boxes given
+    actual = rec["quarter_actual"]
+    assert sorted(int(k) for k in actual) == [0, 1, 2, 3]
+    assert actual["0"]["home"]["pts"] == 2
+    assert actual["1"]["home"]["pts"] == 3
+    assert actual["2"]["away"]["pts"] == 2
+    assert actual["3"]["home"]["pts"] == 1
+
+
+def test_build_game_record_averages_the_predicted_quarter_split_over_sims():
+    from simulation.box_score import period_box_scores
+    game = _quarter_game()
+    boxes = [ev.generate_box_score(game)]
+    rows = game.to_dict("records")
+    # two "sims": the game itself, and a copy with the Q1 basket removed.
+    thin = [r for r in rows if not (r["time"] == 10 and r["event"] == "shot")]
+    rec = ev.build_game_record(game, boxes, n_sims=2,
+                               period_boxes=[period_box_scores(rows),
+                                             period_box_scores(thin)])
+    assert rec["quarter_pred"]["0"]["home"]["pts"] == 1.0     # mean of 2 and 0
+    assert rec["quarter_pred"]["1"]["home"]["pts"] == 3.0     # untouched
+
+
+def test_predicting_the_game_itself_gives_a_zero_quarter_bias():
+    """The identity that makes the section readable: same input, no bias anywhere."""
+    from simulation.box_score import period_box_scores
+    game = _quarter_game()
+    rows = game.to_dict("records")
+    rec = ev.build_game_record(game, [ev.generate_box_score(game)], n_sims=1,
+                               period_boxes=[period_box_scores(rows)])
+    for period, sides in rec["quarter_actual"].items():
+        for side, stats in sides.items():
+            for stat, value in stats.items():
+                assert rec["quarter_pred"][period][side][stat] == value, (period, side, stat)
+
+
+def test_quarter_rows_are_long_format_and_labelled():
+    from simulation.box_score import period_box_scores
+    game = _quarter_game()
+    rows = game.to_dict("records")
+    rec = ev.build_game_record(game, [ev.generate_box_score(game)], n_sims=1,
+                               period_boxes=[period_box_scores(rows)])
+    out = eval_report.quarter_rows([rec])
+    assert {r["period_label"] for r in out} == {"Q1", "Q2", "Q3", "Q4"}
+    assert {r["side"] for r in out} == {"home", "away"}
+    pts_q1_home = [r for r in out
+                   if r["period"] == 0 and r["side"] == "home" and r["stat"] == "pts"]
+    assert len(pts_q1_home) == 1
+    assert pts_q1_home[0]["actual"] == 2 and pts_q1_home[0]["pred"] == 2
+
+
+def test_overtime_periods_are_labelled_ot1_onwards():
+    rows = [
+        _qrow(10, "shot", "A", "paint", "made"),
+        _qrow(_REG + 60, "shot", "B", "paint", "made"),
+        _qrow(_REG + 300 + 60, "shot", "A", "paint", "made"),
+    ]
+    rec = ev.build_game_record(pd.DataFrame(rows), [ev.generate_box_score(rows)], n_sims=1)
+    labels = {r["period_label"] for r in eval_report.quarter_rows([rec])}
+    assert "OT1" in labels and "OT2" in labels
+
+
+def test_the_quarter_section_survives_records_that_predate_it():
+    """An old run is partially readable, not silently wrong and not a crash."""
+    html = eval_report._quarter_section([{"game_id": 1}])
+    assert "predate" in html
+    assert eval_report._box_quarters_frame([{"game_id": 1}]).empty
+
+
+def test_the_quarter_section_says_so_when_only_the_actual_split_exists():
+    game = _quarter_game()
+    rec = ev.build_game_record(game, [ev.generate_box_score(game)], n_sims=1)
+    html = eval_report._quarter_section([rec])
+    assert "without the per-sim histories" in html
+
+
+def test_the_quarter_section_renders_a_row_per_period():
+    from simulation.box_score import period_box_scores
+    game = _quarter_game()
+    rows = game.to_dict("records")
+    rec = ev.build_game_record(game, [ev.generate_box_score(game)], n_sims=1,
+                               period_boxes=[period_box_scores(rows)])
+    html = eval_report._quarter_section([rec])
+    assert "Per-quarter team accuracy" in html
+    for q in ("Q1", "Q2", "Q3", "Q4"):
+        assert q in html
+    # _table escapes cells, so any markup built into one would show up as an entity.
+    assert "&lt;span" not in html

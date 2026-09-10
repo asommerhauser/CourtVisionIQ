@@ -40,6 +40,7 @@ from models.artifacts import DEFAULT_ARTIFACTS_ROOT
 from simulation.box_score import BoxScore, PlayerLine, generate_box_score
 from simulation.controller import GameController
 from simulation.game_input import extract_game_input
+from zones import ZONE_TOKENS
 from simulation.game_simulator import GameSimulator
 from simulation.predict_game import _real_starters
 
@@ -141,6 +142,59 @@ def _event_hist(events) -> dict[str, float]:
     return {e: float(counts.get(e, 0)) for e in _EVENT_TYPES}
 
 
+_ZONE_SET = frozenset(ZONE_TOKENS)
+
+
+def _zone_mix(events, types, results) -> dict[str, float]:
+    """Attempts and makes per court zone, for one game.
+
+    A distribution comparison, not a per-player accuracy stat, which is why it lives here rather
+    than in the eval's box-score tables. It is the shot-selection question the zone tokens were
+    introduced to make askable: the model can match total FGA and total eFG while taking a
+    completely different mix of shots -- more long twos, fewer corner threes -- and every
+    game-level number would look right. Free throws are excluded: they are not selected.
+    """
+    out: dict[str, float] = {}
+    for zone in ZONE_TOKENS:
+        out[f"{zone}.fga"] = 0.0
+        out[f"{zone}.fgm"] = 0.0
+    for event, etype, result in zip(events, types, results):
+        if event != "shot" or etype not in _ZONE_SET:
+            continue
+        out[f"{etype}.fga"] += 1.0
+        if result == "made":
+            out[f"{etype}.fgm"] += 1.0
+    return out
+
+
+def _summarize_zone_mix(pred: list[dict], act: list[dict]) -> dict:
+    """Share of attempts and make rate per zone, predicted against actual.
+
+    Shares rather than raw counts, so a pace difference does not read as a shot-selection
+    difference -- the two are separate failures and the report already has pace.
+    """
+    def totals(hists):
+        att = {z: _mean([h[f"{z}.fga"] for h in hists]) for z in ZONE_TOKENS}
+        made = {z: _mean([h[f"{z}.fgm"] for h in hists]) for z in ZONE_TOKENS}
+        return att, made
+
+    p_att, p_made = totals(pred) if pred else ({z: 0.0 for z in ZONE_TOKENS},) * 2
+    a_att, a_made = totals(act) if act else ({z: 0.0 for z in ZONE_TOKENS},) * 2
+    p_tot = sum(p_att.values()) or 1.0
+    a_tot = sum(a_att.values()) or 1.0
+    return {
+        z: {
+            "share_pred": p_att[z] / p_tot,
+            "share_actual": a_att[z] / a_tot,
+            "fg_pct_pred": (p_made[z] / p_att[z]) if p_att[z] else 0.0,
+            "fg_pct_actual": (a_made[z] / a_att[z]) if a_att[z] else 0.0,
+            "fga_pred": p_att[z],
+            "fga_actual": a_att[z],
+        }
+        for z in ZONE_TOKENS
+    }
+
+
 def compare_holdout(*, games: int | None = None, seeds: int = 3,
                     data_dir: str = "./data", processed_dir: str = "./data/processed",
                     artifacts_root: str = DEFAULT_ARTIFACTS_ROOT,
@@ -162,6 +216,7 @@ def compare_holdout(*, games: int | None = None, seeds: int = 3,
     pred_dt, act_dt = [], []              # pooled inter-event gaps
     pred_dt_lab, act_dt_lab = {}, {}      # inter-event gaps bucketed by preceding event
     pred_hist, act_hist = [], []          # per-game event histograms
+    pred_zone, act_zone = [], []          # per-game shot-zone mix
     pred_events_per_game, act_events_per_game = [], []
 
     for gid in holdout_ids:
@@ -175,6 +230,7 @@ def compare_holdout(*, games: int | None = None, seeds: int = 3,
         _merge_labeled(act_dt_lab, _labeled_gaps(game["event"], game["type"],
                                                  game["result"], game["time"]))
         act_hist.append(_event_hist(game["event"]))
+        act_zone.append(_zone_mix(game["event"], game["type"], game["result"]))
         act_events_per_game.append(int((~game["event"].isin(["start", "end"])).sum()))
         try:
             home_starters, away_starters = _real_starters(game)
@@ -194,6 +250,9 @@ def compare_holdout(*, games: int | None = None, seeds: int = 3,
                 [r["event"] for r in history], [r["type"] for r in history],
                 [r["result"] for r in history], [r["time"] for r in history]))
             pred_hist.append(_event_hist([r["event"] for r in history]))
+            pred_zone.append(_zone_mix([r["event"] for r in history],
+                                       [r["type"] for r in history],
+                                       [r["result"] for r in history]))
             pred_events_per_game.append(sum(1 for r in history
                                             if r["event"] not in ("start", "end")))
 
@@ -208,6 +267,7 @@ def compare_holdout(*, games: int | None = None, seeds: int = 3,
             "predicted": _mean(pred_events_per_game), "actual": _mean(act_events_per_game),
         },
         "event_histogram": _summarize_hist(pred_hist, act_hist),
+        "zone_mix": _summarize_zone_mix(pred_zone, act_zone),
     }
     _print_report(report)
     return report
@@ -283,6 +343,20 @@ def _print_report(r: dict) -> None:
     for e in _EVENT_TYPES:
         v = r["event_histogram"][e]
         row(e, v["predicted"], v["actual"])
+
+    # Shares, not counts: a pace difference must not read as a shot-selection difference.
+    # The model can match total FGA and total eFG on a completely different shot mix, and
+    # every game-level number in the block above would look right.
+    print("\n-- shot mix by zone (share of FGA, and FG% within the zone) --")
+    print(f"  {'zone':<14} {'share pred':>10} {'share real':>10} {'delta':>8}   "
+          f"{'FG% pred':>9} {'FG% real':>9}")
+    for zone in ZONE_TOKENS:
+        v = r["zone_mix"][zone]
+        if v["fga_pred"] == 0 and v["fga_actual"] == 0:
+            continue
+        print(f"  {zone:<14} {v['share_pred'] * 100:>9.1f}% {v['share_actual'] * 100:>9.1f}% "
+              f"{(v['share_pred'] - v['share_actual']) * 100:>+7.1f}pp   "
+              f"{v['fg_pct_pred'] * 100:>8.1f}% {v['fg_pct_actual'] * 100:>8.1f}%")
     print()
 
 
