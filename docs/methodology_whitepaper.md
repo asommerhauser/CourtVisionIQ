@@ -1,8 +1,9 @@
 # CourtVisionIQ: Generative Simulation of NBA Games as a Test of the Momentum Hypothesis
 
-> **Working draft** — current as of 2026-08-29, describing model `v1.0` (21 seasons, eleven heads)
-> and the `full4-s100` holdout evaluation. Numbers move with each retrain and dial pass; the
-> results in §5 name the run they come from.
+> **Working draft** — describes model `v1.0` (21 seasons, eleven heads) and the `full4-s100`
+> holdout evaluation of 2026-08-29. Model 2.0 is built and awaiting its train as of 2026-09-09;
+> §10 summarises what it changes, and `docs/v2_review_2026-09-09.md` sets out what to expect.
+> Numbers move with each retrain and dial pass; the results in §5 name the run they come from.
 
 ---
 
@@ -57,7 +58,8 @@ Conditional-time head   →  re-times the step once event + actor are decided
         ↓
 Six detail heads        →  shot type / shot result / assist / turnover / foul / rebound type
         ↓
-Rotation heads          →  substitution (who checks in) + stint length (for how long)
+Rotation heads          →  substitution (who checks in) + stint length (for how long; 2.0: a
+                           sub-decision head asks "how many come off at this stoppage" instead)
         ↓
 Controller              →  hard rules: clock, score, possession, fouls, bonus, foul-outs
         ↓
@@ -359,23 +361,30 @@ few dollars of rented GPU time.
 
 ## 10. Future Work
 
-**Version 2** (decided change set in `docs/v2_planned_changes.md`; nothing built yet): activate the
-game-state features; weight the loss toward close-and-late rows; expand `shot_type` from
-`{2pt, 3pt}` to seven court zones derived from the raw shot coordinates already on disk, so
-per-player-per-zone make rates are learned instead of dialed; add player age and coach (rolling
-team style priors plus a coach embedding) for year-to-year generalization.
+**Version 2** (spec `docs/v2_planned_changes.md`, build state `docs/v2_progress.md`; **built,
+awaiting its train** as of 2026-09-09). Two halves. The simulator gains rules it did not enforce:
+fouls resolve to the fouler's side and free throws to the opponent in every branch, a real
+dead-ball state, no play across a buzzer, a timeout budget, and substitutions only where NBA Rule 3
+allows them. The model gains information it could not see: fifteen court zones in place of
+`{2pt, 3pt}` so per-zone make rates are learned instead of dialed; the free-throw count as a learned
+foul token; the fouled player on the foul row; timeouts and team rebounds as real events; a
+possession clock; per-player stint, minutes and fouls in the roster encoder; a bench bundle; and
+the game-state features consumed for the first time. Rotation becomes a decision (a `sub_decision`
+head asked at each legal stoppage) rather than a sampled duration, two of eight attention heads per
+block are restricted to the last eight rows, and the event and time heads stop training on the
+~31% of positions the rollout never queries. Clutch loss weighting was planned and deliberately
+dropped; player age and coach are parked in `docs/v3_planned_changes.md`.
 
-A second cluster of theories moves rules the simulator currently hard-codes into the data itself:
-free-throw counts (the rollout awards three free throws roughly twelve times too often, because the
-count is decided by a branch reading a head trained not to answer that question), the fouled player
-(present in the raw data, dropped by the cleaner), and a loss mask that would stop the event head
-from training on the ~22% of positions the rollout never visits.
+The build also repaired defects in the data `v1.0` was trained on: the on-court five disagreed
+with the substitution rows about twenty times a game, and a jump-ball binding bug collapsed both
+teams onto one abbreviation in roughly half of all games, which mislabelled every timeout and
+corrupted the team rest and games-played features in those games.
 
 **Beyond that:**
 
-1. **A rotation/minutes model** — predict stints and on-court minutes directly, with seeded
-   starters, instead of deriving them from sampled substitution events. Player minutes are the
-   multiplier on every per-player stat and currently miss by 5.7 minutes.
+1. **Team identity** — the model has none today; a team is the five embeddings on the floor.
+   Rolling team style priors (pace, 3PA rate, FTA rate over a trailing window) need no external
+   data and are the cheapest way to give the team-strength metrics something to move on.
 2. **The momentum probes** — event-head calibration curves and the context-sensitivity test, which
    are the direct measurements the whole thesis is built to make (§6).
 3. **A relative offense/defense encoding** instead of home/away, evaluable only with a full retrain.

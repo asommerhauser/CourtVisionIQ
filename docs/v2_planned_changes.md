@@ -6,6 +6,12 @@
 
 ## Status
 
+> **Updated 2026-09-09: everything in this document is built** and merged on `feature/version2`;
+> only the 2.0 train remains. This document is the *spec* and was not edited during the build
+> beyond dated banners like this one — where it and the code disagree, `v2_progress.md` wins
+> (its corrections A–U record every departure). What to expect from the train is in
+> `v2_review_2026-09-09.md`. The paragraph below is the original status, kept as the record.
+
 Branch `feature/version2`, level with `main`. Nothing in this document is implemented.
 
 Version 1 closed most of the gap to the season-average baseline (+44% MAE / 35% win-pick in June →

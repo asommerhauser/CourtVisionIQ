@@ -2,9 +2,12 @@
 
 > *"Learn the rhythm and structure of basketball games first, then layer detail on top."*
 
-**Status: current as of 2026-08-29 (model `v1.0`, eval run `full4-s100`).** Everything described
-here is built and running unless a line says otherwise; forward-looking work is confined to
-[Open work](#open-work) and `docs/v2_planned_changes.md`.
+**Status: describes model `v1.0` and eval run `full4-s100` (2026-08-29); 2.0 notes added
+2026-09-09.** The 2.0 code is complete on `feature/version2` and awaiting its train; where 2.0
+changed something described here, a **2.0:** note says so inline. The 2.0 spec is
+`docs/v2_planned_changes.md`, its build state `docs/v2_progress.md`, and the pre-train review
+`docs/v2_review_2026-09-09.md`. Measured numbers in this document are still v1.0's until the 2.0
+eval runs.
 
 ---
 
@@ -39,7 +42,10 @@ The system is an **ensemble of eleven transformer heads** over one shared token 
   once the event and actor are decided.
 - Six **conditional type/result heads** fill in the detail (shot type, shot result, assist type,
   turnover type, foul type, rebound type).
-- A **substitution head** and a **stint-length head** drive the rotation.
+- A **substitution head** and a **stint-length head** drive the rotation. **2.0:** the stint-length
+  head is retired; a `sub_decision` head predicts, at every position where NBA Rule 3 permits a
+  substitution, how many each side makes (`0/1/2/3+`), and the substitution head picks the
+  incoming player from a bench bundle carrying seconds-since-sat, minutes and fouls.
 - A hard-coded **Controller** enforces basketball rules so every generated step is a legal game
   state, and owns everything the models do not see (clock, score, possession, team fouls, bonus,
   foul-outs, ejections).
@@ -308,6 +314,15 @@ same order per event.
 
 Total ≈ **140M** parameters across the stack; a loaded eval process costs ~3–4 GB of VRAM.
 
+**2.0 changes to this table.** Row 4's `shot_type` predicts one of **fifteen court zones** (plus
+`heave`) instead of `2pt`/`3pt`; row 8's `foul_type` carries `shooting 2pt`/`shooting 3pt` so the
+free-throw count is learned; row 9's `rebound_type` gains `team offensive`/`team defensive`; a
+seventh conditional type head, `timeout_team`, names the calling team; row 11 is replaced by
+`sub_decision` (two softmaxes over `0/1/2/3+`, one per side, on one backbone). All heads share one
+extracted backbone (`models/backbone.py`) in which two of the eight attention heads per block are
+restricted to a trailing window of eight rows; every head also consumes a possession clock, the
+six game-state scalars, and per-player stint seconds / minutes / fouls through the roster encoder.
+
 **Availability masking** (from train 2): the player-vocab heads are masked to each game's actually
 available player set, so a head can never spend probability mass on someone not dressed.
 
@@ -407,6 +422,13 @@ number of free throws). It owns what the models never see:
   scheduled off at the next dead ball past their exit, with `SUB_MAX_GAP_SECONDS` as a backstop so
   a team cannot play five men for 48 minutes
 - dead-ball rebounds (`DEADBALL_REBOUND_PROB`) — the rare no-individual-rebounder case
+
+**2.0:** the controller also owns a real dead-ball flag, a single possession tracker (the
+simulator's copy is gone), a period-boundary clamp so no play straddles a buzzer, a full-roster
+team map resolved *before* a foul is typed (foul types masked to the fouler's side; free throws to
+the fouler's opponent in every branch), a per-team timeout budget, and Rule 3 substitution gating.
+The stint scheduler and the dead-ball rebound coin flip are gone: rotation is asked of the
+`sub_decision` head at each legal opportunity, and team rebounds are learned tokens.
 
 ### Throughput
 
@@ -529,7 +551,7 @@ records the dials that produced it, and the progression table segments a run by 
 | `SHOT_RESULT_BIAS` | Made/missed/blocked offsets → eFG / FG% (currently `made +0.40`, `blocked −0.15`). |
 | `PLAYER_TEMPERATURE` (2.0) | Flattens the actor head. Above 1 on purpose: the full-corpus head is confident enough that at 0.8 one star vacuumed points, rebounds **and** assists at once. |
 | `SUB_INCOMING_TEMPERATURE` (0.45) | Sharpens the incoming-sub pick onto the real 8–9 man rotation. |
-| `STINT_LENGTH_SCALE` (1.30) | Multiplies predicted stint lengths → substitution rate / minutes concentration. The log-stint head's point estimate is a geometric mean and under-shoots the arithmetic mean; tune to real ~46 subs/game. Re-fit **after every retrain**. |
+| `STINT_LENGTH_SCALE` (1.30) | Multiplies predicted stint lengths → substitution rate / minutes concentration. The log-stint head's point estimate is a geometric mean and under-shoots the arithmetic mean; tune to real ~46 subs/game. Re-fit **after every retrain**. **2.0: retired** with the stint head, along with `STINT_SAMPLE_SIGMA`, `STINT_MAX_SECONDS`, `SUB_FATIGUE_WEIGHT` and `DEADBALL_REBOUND_PROB`; `SHOT_RESULT_BIAS_BY_ZONE` is new. The whole package is refit from zero after the 2.0 train. |
 | `HOME_COURT_SHOT_BIAS` (0.055) | Symmetric made-shot logit nudge for the home offense; the rollout is otherwise home/away symmetric, so this is what separates winners. Tune against spread bias. |
 | `DEADBALL_REBOUND_PROB` (0.10) | Share of misses yielding no individual rebound — the total-rebound-volume lever (the off/def split is `TYPE_BIAS.rebound_type`'s job). |
 | `MARGIN_CALIBRATION_SLOPE/INTERCEPT` | Post-hoc linear calibration on predicted margin, applied **only** when aggregating spread metrics — never to the raw per-game record, so it can be refit without touching sim data. Not a rollout dial. |
@@ -618,9 +640,12 @@ either existed, with no retrain.
 
 ### Decided for v2 (see `docs/v2_planned_changes.md`)
 
-**Nothing below is built.** The planned-changes doc is the authority; it promotes the theories
-listed here into numbered changes (`R` rules, `D` schema, `F` features) or parks them with a
-reason. Ids below are the original theory ids; the doc is organized by feature.
+**Built on `feature/version2` as of 2026-09-09; awaiting the 2.0 train.** The planned-changes doc
+is the spec, `docs/v2_progress.md` the build state, and `docs/v2_review_2026-09-09.md` the
+pre-train review. Ids below are the original theory ids; S1 landed as fifteen zones rather than
+seven, S5 landed as a cleaner labelling step only (the row feature is parked in
+`docs/v3_planned_changes.md`), S6/S7 are parked there too, and M4's masked share measured
+10.6% → 31.5% against the 2.0 clean rather than the 21.9% recorded here.
 
 | # | Theory | Note |
 |---|---|---|
@@ -640,8 +665,9 @@ reason. Ids below are the original theory ids; the doc is organized by feature.
 
 | Area | Question |
 |---|---|
-| **Rotation / minutes model** | A dedicated head that predicts stints and on-court minutes directly, with seeded starters, replacing the current event-head-driven substitutions. Player-minutes MAE of 5.7 min is the biggest single lever on per-player box accuracy. |
-| **Baseline** | Beating season-to-date player averages on per-player box MAE — still ~8% behind at `full1`, and the check has not been re-run since. |
+| **Rotation / minutes model** | **Built in 2.0** as the `sub_decision` head plus per-player live state and a bench bundle. Whether it moves the 5.7-minute MAE is the first thing the 2.0 eval answers. |
+| **Baseline** | Beating season-to-date player averages on per-player box MAE — still ~8% behind at `full1`, and the check has not been re-run since. **Run it first after the 2.0 train**, before any dial is touched. |
+| **Team identity** | The model has none: a team is the five embeddings on the floor. Rolling team style priors (`v3_planned_changes.md` §3, the no-external-data half) are the cheapest fix and the only listed idea aimed at the team-strength metrics. |
 | **Relative encoding** | Offense/defense frame instead of home/away; evaluable only with a full retrain. |
 | **Calibration auxiliary losses** | Aggregate-consistency terms per head; design exists in notes only. |
 | **Tracking data** | Shot location as something the model *generates* against the specific defense on the floor, rather than a token it looks up. Needs a license. |

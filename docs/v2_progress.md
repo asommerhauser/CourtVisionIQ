@@ -66,6 +66,11 @@ is pytest plus TF-free measurement until the 2.0 train.
 
 ## START HERE (as of 2026-09-09)
 
+> **2026-09-09, pre-train review:** `v2_review_2026-09-09.md` is the theory review of the whole
+> programme — what changed by mechanism, what the build found in the data, a metric-by-metric
+> forecast, and the recommended order of post-train measurement (baseline comparison first).
+> Read it before Gate C's train.
+
 **Workstream 11 is complete. Phases 1 and 2, Gate B, all of §9 and all of §8 are merged into
 `feature/version2`.** The full suite is green.
 

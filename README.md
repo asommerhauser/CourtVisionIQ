@@ -2,16 +2,25 @@
 
 An NBA play-by-play sequence model. The core **Event/Time Transformer** reads a game as a
 sequence of events (with on-court rosters encoded by a Set Transformer) and predicts the next
-event and the time until it; a stack of conditional heads (shot type/result, assist, turnover,
-foul, rebound, substitution, stint length) fills in the details. A rollout engine then simulates
-whole games event-by-event, and an evaluation harness scores the simulated games against real
-holdout games. Built on **TensorFlow 2.20 / Keras 3**.
+event and the time until it; a stack of conditional heads (shot zone/result, assist, turnover,
+foul, rebound, substitution, substitution count) fills in the details. A rollout engine then
+simulates whole games event-by-event, and an evaluation harness scores the simulated games against
+real holdout games. Built on **TensorFlow 2.20 / Keras 3**.
 
 - `docs/methodology_whitepaper.md` — the modeling approach.
 - `docs/technical_specs.md` — architecture / data details.
-- `docs/v2_planned_changes.md` — Model 2: the decided change set (rules, schema, features, rotation); nothing built yet.
+- `docs/v2_planned_changes.md` — Model 2: the spec (rules, schema, features, rotation).
+- `docs/v2_progress.md` — Model 2: the build tracker (state, gates, corrections). **Read its START HERE first.**
+- `docs/v2_review_2026-09-09.md` — Model 2: pre-train review — what changed, what was found, what to expect.
 
 ## Where it stands
+
+**Model 2.0 is built and awaiting its train** (branch `feature/version2`, 2026-09-09). All
+thirteen workstreams are merged: controller rules, the re-clean with fifteen shot zones and the
+new tokens, a shared backbone with two local attention heads, a possession clock, a rotation model
+(`sub_decision` replaces `stint_length`), loss masking, and per-quarter eval splits. The re-clean
+changed the token vocabulary, so **no v1.0 weights load against the 2.0 code**; the numbers below
+are the last measured state and stay the reference until the 2.0 train is evaluated.
 
 **Model `v1.0`** — eleven heads (~140M params total) trained on 21 seasons (2002-03 … 2022-23,
 ≈26,400 games; 21,014 train / 5,253 validation), holding out the 100 real games that follow a cut
@@ -489,7 +498,7 @@ A full train re-preprocesses each head from `data/`, writes weights to `artifact
 a per-head training report under `reports/<head>/`. If it dies mid-run, `--continue` picks up at
 the next unfinished head. `--model <name>` retrains a single head (`event_time`, `player`,
 `event_time_cond`, `shot_type`, `shot_result`, `assist_type`, `turnover_type`, `foul_type`,
-`rebound_type`, `substitution`, `stint_length`).
+`rebound_type`, `substitution`, `sub_decision`; `stint_length` was retired in 2.0).
 
 **Train batch capacity.** `--batch-size` sets the train batch for every head; the three
 player-vocab heads are additionally capped by `LARGE_OUTPUT_BATCH` (`models/pipeline.py`) — keep it
@@ -698,10 +707,16 @@ ones:
 | `SHOT_RESULT_BIAS` | `made +0.40`, `blocked −0.15` | Made/missed/blocked logit offsets → eFG / FG%. |
 | `PLAYER_TEMPERATURE` | 2.0 | Flattens the actor head → shot/rebound/assist concentration across players. Above 1 on purpose: at 0.8 one star vacuumed points, rebounds and assists at once. |
 | `SUB_INCOMING_TEMPERATURE` | 0.45 | Sharpens the incoming-sub pick onto the real 8–9 man rotation. |
-| `STINT_LENGTH_SCALE` | 1.30 | Multiplies predicted stint lengths → substitution rate / minutes concentration (the log-stint head's point estimate is a geometric mean and under-shoots; tune to real ~46 subs/game). Re-fit **after every retrain**, like `DELTA_TIME_SCALE`. |
+| `SUB_MAX_GAP_SECONDS` | 600 | Cadence backstop: a team starved of substitutions past this gap gets one forced at the next dead ball. |
+| `SHOT_RESULT_BIAS_BY_ZONE` | `{}` | 2.0: per-zone override of `SHOT_RESULT_BIAS`, so rim make rate and long-mid frequency no longer compete for one number. Fit from zero after the 2.0 train. |
 | `HOME_COURT_SHOT_BIAS` | 0.055 | Symmetric made-shot nudge for the home offense. The rollout is otherwise home/away symmetric, so this is what separates winners; tune against spread bias. |
-| `DEADBALL_REBOUND_PROB` | 0.10 | Share of misses with no individual rebounder — the total rebound-volume lever (the off/def split is `TYPE_BIAS.rebound_type`'s job). |
 | `MARGIN_CALIBRATION_SLOPE`/`_INTERCEPT` | 0.745 / −0.31 | Post-hoc linear calibration on predicted margin, applied **only** when aggregating spread metrics — never to the raw per-game record. Not a rollout dial. |
+
+**Retired in 2.0:** `STINT_LENGTH_SCALE`, `STINT_SAMPLE_SIGMA`, `STINT_MAX_SECONDS` and
+`SUB_FATIGUE_WEIGHT` went with the stint scheduler (rotation is now the `sub_decision` head's
+call, and every head sees stint seconds, minutes and fouls per player); `DEADBALL_REBOUND_PROB`
+went with learned team rebounds. Every value above was fitted against v1.0 weights and a
+vocabulary that no longer exists — **the whole package is refit from zero after the 2.0 train.**
 
 A dial marked "re-fit after every retrain" is a calibration against *those* weights, not a fact
 about basketball. Carrying one across a retrain unexamined is how `trial1`'s +6% pace correction
