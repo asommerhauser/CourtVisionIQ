@@ -173,7 +173,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | 11b | `feature/lineup-state` | 3 | §8 | [x] | 4fa3713 |
 | 11c | `feature/bench-bundle` | 3 | §8 | [x] | 402c182 |
 | 11d | `feature/sub-decision-head` | 3 | §8 | [x] | 1b48794 |
-| 12 | `feature/training-changes` | 3 | §10† | [~] | |
+| 12 | `feature/training-changes` | 3 | §10† | [x] | PENDING |
 | 13 | `feature/quarter-eval-splits` | 4 | §11 | [ ] | |
 | — | **Gate C — pre-train checklist, then the 2.0 train** | 4 | | [ ] | |
 
@@ -1231,9 +1231,53 @@ appends rather than rebuilds, so it is the only way to drop the dead `Nene ` tok
 P). It renumbers every player id above 232, which is free now and stops being free the moment
 train 3 finishes. Gate C's "byte-identical" check re-baselines against this clean.
 
-**Result:**
+**Result:** Suite green and the clean done (2026-09-09). Reported green by Alec rather than
+pasted, so the one thing not independently confirmed is that the ~21 new tests **collected** — a
+green run where they silently did not collect looks identical to one where they did. Everything
+else below was verified here, TF-free, against the artifacts the clean produced.
 
 **Notes:**
+
+**The vocabulary purge landed exactly as intended.** `Nene ` is gone; the real `Nene` now sits at
+id 232 (it took the freed slot on the rebuild); `next_token` went 2153 -> 2152, exactly one token
+removed. `event`, `type`, `result` and `season` vocabularies are byte-identical to the freeze —
+they do not even appear in `git status` — so nothing else moved. This is the new baseline for
+Gate C's byte-identical check.
+
+**`norm_stats.json` is a legitimate refit, not test residue.** It is timestamped twenty minutes
+after the vocabularies, which is exactly the signature the Gate C checklist warns about. It is not
+pollution: `train.npz` / `test.npz` / `holdout.npz` / `event_time_norm_stats.json` all carry the
+same 16:59 stamp, i.e. the event_time preprocess finishing its pass over 21 seasons, and the four
+scalars moved only in the seventh significant figure (`delta_mean` 5.8389745 -> 5.8389098),
+consistent with correction Q's few hundred repaired rows. Test residue from the two-game synthetic
+fixture would not be corpus-scale. **The timestamp alone does not settle this — check that the
+npz share the stamp and that the values are corpus-scale.**
+
+**The mask arrays verified end-to-end at corpus scale**, straight out of the real npz:
+
+| | train.npz | test.npz |
+|---|---|---|
+| games | 18,878 | 5,394 |
+| positions | 9,355,829 | 2,676,448 |
+| continuation | 1,919,475 (20.52%) | 549,212 (20.52%) |
+| period break | 76,662 (0.82%) | 21,923 (0.82%) |
+| event head trains on | 79.48% | 79.48% |
+| time head trains on | 78.66% | 78.66% |
+
+Both arrays are 0/1 only and a strict subset of `loss_mask`. Train and test agreeing to two
+decimals is the sign the rule is reading the data and not an artifact of one split. The 20.52%
+here against ~20.6% averaged over the three sampled eras is the season mix, not a discrepancy —
+the npz covers all 21 seasons.
+
+**The other five heads' npz are two months stale (2026-07-05) and that is harmless.**
+`--model event_time` preprocesses only its own head, so `cond_*`, `condtime_*`, `player_*`,
+`sub_*` and `stint_*` still predate Gate B. `models/pipeline.run_stage` calls `preprocess()`
+unconditionally per head (gated only on the resume list, empty on a fresh train), so Gate C's
+`train.py --full` rebuilds all of them from the cleaned data — including
+`ConditionalTimeModel`'s, which is where the second copy of the mask lands. **Worth knowing:
+`condtime_train.npz` does not carry the mask today**, and cannot until that train, so the only
+evidence for that head is the wiring test on synthetic rows. `stint_*` is a leftover from the head
+retired in 11d.
 
 ---
 
@@ -1605,3 +1649,4 @@ Append one line per merge. Newest last.
 | 2026-09-09 | `feature/bench-bundle` | 402c182 | ten bench slots per side, second set encoder; BENCH_SIZE into ARCH_KEYS |
 | 2026-09-09 | `feature/sub-decision-head` | 1b48794 | rotation is a decision, not a timer; stint head + 4 dials retired (correction R) |
 | 2026-09-09 | — | — | clutch weighting rejected before building (correction S); workstream 11 complete |
+| 2026-09-09 | `feature/training-changes` | PENDING | mask 10.6% -> 31.5% of event-head positions; free-throw trip unified and the pace reference de-biased (correction T) |
