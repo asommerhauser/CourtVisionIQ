@@ -174,7 +174,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | 11c | `feature/bench-bundle` | 3 | §8 | [x] | 402c182 |
 | 11d | `feature/sub-decision-head` | 3 | §8 | [x] | 1b48794 |
 | 12 | `feature/training-changes` | 3 | §10† | [x] | be87b39 |
-| 13 | `feature/quarter-eval-splits` | 4 | §11 | [~] | |
+| 13 | `feature/quarter-eval-splits` | 4 | §11 | [x] | PENDING |
 | — | **Gate C — pre-train checklist, then the 2.0 train** | 4 | | [ ] | |
 
 † Workstream 12 builds only half of §10: the clutch loss weighting was started and dropped
@@ -1370,9 +1370,16 @@ the number that says they collected**. The slicing half was additionally run her
 real games; the report and diagnostics halves are pytest-only, because `reporting/eval_report.py`
 imports `report_artifacts`, which imports Keras.
 
-**Result:**
+**Result:** Suite green (2026-09-09), reported by Alec. The slicing half was additionally run
+here against 1,500 real cleaned games across three eras with zero mismatches; the report and
+diagnostics halves are pytest-only, because `reporting/eval_report.py` imports `report_artifacts`,
+which imports Keras.
 
-**Notes:**
+**Notes:** `reporting/eval_report.py` is the one CRLF file this branch touched, and the patch
+flipped it to LF -- reading in text mode normalizes CRLF, and writing back with `newline=""` then
+persists it. Caught from the diff stat (789 deletions for ~100 added lines), not from a test,
+because nothing in the suite looks at line endings. Restored. Worth watching on any future patch
+to that file.
 
 ### Gate C — pre-train
 
