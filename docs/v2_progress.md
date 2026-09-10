@@ -174,7 +174,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | 11c | `feature/bench-bundle` | 3 | §8 | [x] | 402c182 |
 | 11d | `feature/sub-decision-head` | 3 | §8 | [x] | 1b48794 |
 | 12 | `feature/training-changes` | 3 | §10† | [x] | be87b39 |
-| 13 | `feature/quarter-eval-splits` | 4 | §11 | [ ] | |
+| 13 | `feature/quarter-eval-splits` | 4 | §11 | [~] | |
 | — | **Gate C — pre-train checklist, then the 2.0 train** | 4 | | [ ] | |
 
 † Workstream 12 builds only half of §10: the clutch loss weighting was started and dropped
@@ -1311,12 +1311,64 @@ shot-mix half was never about clutch either.
 
 **Independent of everything else** — it can be pulled forward at any time at no cost.
 
+**The verify below does not work, and the reason is worth keeping.** `full4-s100` is a v1.0-era
+run: its archived play-by-play carries `2pt` / `3pt`, and `zones.points_for_shot` refuses any type
+that is not a zone or `free throw` (standing guard 1). Any 2.0 code that rebuilds a box score from
+those rows aborts. So the archived run cannot be the reference, and the cleaned corpus is used
+instead — which is the better target anyway: ~26,000 real games in current tokens, no weights, no
+TensorFlow.
+
+**The independent number: per-period boxes must sum to the whole-game box.** Stat for stat, player
+for player, over every counting field and minutes. Two routes to one quantity — one scan over all
+rows, and a scan per period recombined. **1,500 games across three eras, zero mismatches**, with
+period counts that are real basketball (463 / 34 / 3 regulation / 1OT / 2OT in 2002-03).
+
+It found three defects, none of which a unit test would have proposed:
+
+- **A phantom fifth period in every regulation game.** `period_index` is half-open, so a clock
+  exactly on a boundary opens the next period. That is right for the game STATE (at 2880 there
+  really are 300 seconds of a new period) and wrong for an EVENT: a shot at 0.0 is a buzzer-beater
+  belonging to the quarter it ended, and the final shot, its block and the `end` sentinel all sit
+  at exactly 2880. A zero-duration tail sitting exactly on its own period start folds back.
+- **Minutes leaking at every break.** A slice beginning mid-game has real elapsed time before its
+  first event, credited to nobody without a seed. Worse: a player substituted off AT the break was
+  credited those seconds by `line()` and then dropped from the box, because the players sets are
+  built only from rows in the slice — so his minutes left the total altogether.
+- **Side membership derived per period.** A player who records a stat in a period he was not on the
+  floor for resolves to no side, his line is never emitted, and his stats vanish from that period's
+  team total. One game in 1500 — Brent Barry fouling and turning it over at the 2002-03 buzzer while
+  off the floor. Which side a player is on is a fact about the game, so it is computed once.
+
+**Where the code went.** `split_by_period` / `period_box_scores` / `side_membership` in
+`simulation/box_score.py`, next to the thing they slice, importing the period rule from
+`models.game_state_features` rather than restating it. **Known duplicate, deliberately left:**
+`GameController._period_index` is a third copy of that arithmetic. It reads `self.clock` rather
+than a parameter and sits on the rollout's hot path (a call per event against inline arithmetic,
+with millions of events per run), so unifying it is a perf question, not a tidiness one. Recorded
+here so it is not rediscovered.
+
+`build_game_record` gained `period_boxes`, and `_PbpSink` computes the split as each sim lands
+rather than keeping histories alive — the 8.6 GB record spike the lineup-state branch removed is
+not worth reintroducing for a table of team totals. **The actual game's split is always derived**,
+because `game_df` is always to hand, so a record carries the real per-quarter box even when the
+predicted one is unavailable.
+
+**The per-zone shot mix** is in `simulation/diagnostics.compare_holdout`, reporting SHARE of
+attempts per zone rather than counts: a pace difference must not read as a shot-selection
+difference, and the report already measures pace. Cross-checked against a route sharing no code
+with it — `python -m zones` derives the era table from raw coordinates, this derives it from
+cleaned tokens, and on 2022-23 they agree (corner3_l 5.2% vs 5.1% at 38.5% both ways, wing3_l 9.6%
+vs 9.8% at 35.8% both ways, 3PA share 38.6% vs 38.8%; the residual is 200 games against a season).
+
 **Verify**
 ```bash
-pytest tests/test_evaluation.py tests/test_reporting.py -q
-python evaluate.py --model v1.0 --run full4-s100 --report-only
+python -m pytest tests/test_box_score.py tests/test_evaluation.py tests/test_diagnostics.py -q
+python -m pytest tests/ -q
 ```
-The `--report-only` rebuild runs over an existing finished run and starts no new sims.
+The suite was 739 before this branch and gains 25 (17 box-score slicing, 8 shot-mix), so **764 is
+the number that says they collected**. The slicing half was additionally run here against 1,500
+real games; the report and diagnostics halves are pytest-only, because `reporting/eval_report.py`
+imports `report_artifacts`, which imports Keras.
 
 **Result:**
 
