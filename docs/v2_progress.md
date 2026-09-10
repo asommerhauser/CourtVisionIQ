@@ -1383,21 +1383,49 @@ to that file.
 
 ### Gate C — pre-train
 
-- `pytest tests/` green.
-- **Check `encoder/vocabs/norm_stats.json` and the vocab files before training.** pytest overwrites
-  the committed encoder artifacts; confirm the freeze came from a real clean, not test residue.
-- Zone table matches §3 in all three sampled eras.
-- Derived-vs-raw 3pt disagreement under 1% per season.
-- **Pace gate green and the mask table populated**, from the one command that prints both:
-  `python -m models.game_state_features --seasons 2003,2013,2023`. The reference changed at
-  workstream 12 (correction T), so a pre-12 number is not comparable. Expect a gap near -1.8 and
-  a masked share near 30%; a masked share back near 10% means the arrays did not reach the npz.
+**Pre-train checklist run 2026-09-09. Every item that does not need TensorFlow is green.**
+
+| check | result |
+|---|---|
+| `pytest tests/` | green (reported; 739 before workstream 13, +25 from it) |
+| committed encoder artifacts | clean, and `norm_stats.json` equals `data/processed/event_time_norm_stats.json` bit for bit |
+| vocabulary purge | `next_token` 2152, `Nene` at 232, `Nene ` absent |
+| zone table vs §3, three eras | all gates passed |
+| derived-vs-raw 3pt disagreement | 0.39% / 0.23% / 0.11% — under 1% in every era |
+| coordinate coverage | 100% / 100% / 99.4% |
+| pace gate | -1.7 / -1.6 / -1.9 against the de-biased reference (correction T), tolerance 3.0 |
+| loss-mask share | 9.0% -> 29.8% / 9.9% -> 30.1% / 10.6% -> 31.5% |
+
+Reproduced by two commands, both TF-free and both cheap:
 
 ```bash
-python train.py --full --name full_train_3 --batch-size 64 --clean --rebuild-vocabs
+python -m zones --seasons 2003,2013,2023
+python -m models.game_state_features --seasons 2003,2013,2023
 ```
 
-Train 2's availability masking and capacity settings carry forward unchanged.
+**The norm-stats check is stronger than "the file is unmodified."** The committed value equals what
+the preprocess wrote, which is what distinguishes a real freeze from pytest residue — an unmodified
+file only says nothing has touched it since the last commit, not that the last commit held a real
+clean. Compare the two files, not the git status.
+
+**The train command drops `--clean --rebuild-vocabs`.** Workstream 12's clean already ran, with the
+purge, and `main.py --clean` enriches as `train.py --full --clean` does — the cleaned data carries
+the season-context columns. Re-cleaning would reproduce the same bytes and re-appending to the
+vocabulary would reproduce the same ids, so both are ~40 minutes of failure surface for no gain
+before a long train. Without `--rebuild-vocabs`, `run_stage` loads and freezes the committed
+vocabulary, which is the path the other five heads already take.
+
+```bash
+python train.py --full --name full_train_3 --batch-size 64
+```
+
+Use `--clean --rebuild-vocabs` only if `data/` or `encoder/vocabs/` has been touched since
+2026-09-09; then the vocabularies must come back byte-identical to the purged freeze.
+
+Train 2's availability masking and capacity settings carry forward unchanged. `run_stage`
+preprocesses every head unconditionally on a fresh train, so the five heads whose npz still predate
+Gate B are rebuilt — that is where `ConditionalTimeModel` gets its copy of the loss mask, which has
+no corpus-scale evidence before this train.
 
 **Post-train:** per-zone make rates against the era table; the per-quarter section read for what
 end-game behaviour the model actually produces (does a trailing team foul, does it hunt threes);
