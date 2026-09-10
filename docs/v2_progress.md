@@ -174,7 +174,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` verified and merged · `[x]*` m
 | 11c | `feature/bench-bundle` | 3 | §8 | [x] | 402c182 |
 | 11d | `feature/sub-decision-head` | 3 | §8 | [x] | 1b48794 |
 | 12 | `feature/training-changes` | 3 | §10† | [x] | be87b39 |
-| 13 | `feature/quarter-eval-splits` | 4 | §11 | [x] | PENDING |
+| 13 | `feature/quarter-eval-splits` | 4 | §11 | [x] | a9848c9 |
 | — | **Gate C — pre-train checklist, then the 2.0 train** | 4 | | [ ] | |
 
 † Workstream 12 builds only half of §10: the clutch loss weighting was started and dropped
@@ -1710,3 +1710,4 @@ Append one line per merge. Newest last.
 | 2026-09-09 | `feature/sub-decision-head` | 1b48794 | rotation is a decision, not a timer; stint head + 4 dials retired (correction R) |
 | 2026-09-09 | — | — | clutch weighting rejected before building (correction S); workstream 11 complete |
 | 2026-09-09 | `feature/training-changes` | be87b39 | mask 10.6% -> 31.5% of event-head positions; free-throw trip unified and the pace reference de-biased (correction T) |
+| 2026-09-09 | `feature/quarter-eval-splits` | a9848c9 | per-quarter boxes + per-zone shot mix; sum identity over 1,500 games found 3 defects |
