@@ -81,7 +81,7 @@ executed under pytest yet.
 | branch | `feature/version2`, clean tree, everything merged |
 | cleaned data | 2.0, all 21 seasons, **current** — re-cleaned at workstream 12 (correction Q) |
 | vocabularies | frozen and committed, **`be87b39`** — re-frozen at workstream 12's clean, which purged `Nene ` (one token, 2153 -> 2152); the other four are byte-identical to `0ab3956` |
-| suite | green (~719) |
+| suite | green, **739** — 719 before workstream 12, +20 from it |
 | weights | **none usable** — see standing rule 5 |
 
 **One clean is owed, and workstream 12 is where it rides.** `data/` predates correction Q (a
@@ -1231,10 +1231,11 @@ appends rather than rebuilds, so it is the only way to drop the dead `Nene ` tok
 P). It renumbers every player id above 232, which is free now and stops being free the moment
 train 3 finishes. Gate C's "byte-identical" check re-baselines against this clean.
 
-**Result:** Suite green and the clean done (2026-09-09). Reported green by Alec rather than
-pasted, so the one thing not independently confirmed is that the ~21 new tests **collected** — a
-green run where they silently did not collect looks identical to one where they did. Everything
-else below was verified here, TF-free, against the artifacts the clean produced.
+**Result:** **739 passed** (2026-09-09), against 719 before this branch. That delta is the check
+that matters: 20 tests were added and 20 appeared, so the new files collected — a green run where
+they had silently not collected would have looked identical. The clean and the vocabulary purge
+ran in the same session; everything below was verified here, TF-free, against the artifacts they
+produced rather than taken on trust.
 
 **Notes:**
 
