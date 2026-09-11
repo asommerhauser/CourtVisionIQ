@@ -1715,6 +1715,35 @@ Changing it costs a re-clean and a fresh vocabulary freeze for no behavioural ga
 **deliberately not fixed** — unlike correction P's `Nene `, which is a genuine duplicate player
 embedding and is purged at workstream 12's clean.
 
+**V. Train 3's OOM was a Keras 3 Dense, not a batch size.** The run died 298 steps into epoch 1
+on a 2.34 GiB allocation for
+`gradient_tape/.../roster_vec/roster_encoder/pma/mab/rff/fc2/MatMul/MatMul_1`, with 22.4 GiB of a
+23.2 GiB card in use.
+
+The op is TF's gradient for a *broadcasting* `BatchMatMul`, which materialises one kernel gradient
+per batch element — `(B, d_model, d_ff)` — before reducing it to the `(d_model, d_ff)` the kernel
+actually is. Keras 3's `Dense` is `ops.matmul(inputs, kernel)` and lowers to that op for any input
+of rank > 2; Keras 2's `Dense` reshaped internally first, so the cost is new in 2.0 even though the
+set transformer is not. `SequenceRosterEncoder` collapses time into the batch axis, so B there is
+`batch x SEQ` = 38400 at batch 64, and `38400 x 128 x 256 x 2` bytes is 2.34 GiB — per Dense, with
+eight of them per roster application (2 SABs + PMA's pre-rFF and MAB rFF, two Dense each), applied
+twice a step for home and away.
+
+**The allocator dump is the proof, and it is worth reading before touching batch size.** At the
+failure there was ~10 GiB free, in blocks of 2.33 / 1.86 / 1.62 / 1.47 / 1.39 / 1.33 GiB — the
+holes left by these same transients — and the largest missed the request by 9.8 MB. That is
+fragmentation on top of a genuine 96%-of-VRAM peak, which is why it survived 297 steps: nothing
+changed at 298 except that the heap finally had no contiguous slab left.
+
+Fix: `RowFF.call` flattens to rank 2 before the two Dense layers and restores the shape after.
+rFF is row-wise, so the function is identical; the kernel gradient goes from 2.34 GiB to 128 KiB.
+`tests/test_row_ff.py` asserts it by inspecting the emitted graph for `BatchMatMul` — an output
+test cannot tell the two graphs apart, which is exactly why this shipped.
+
+Not changed, and noted for whoever needs the next slice: `RosterSetEncoder.scalar_proj` has the
+same shape (39 MB an application, not worth the diff), and the deeper waste is that the encoder
+re-encodes all 600 timesteps when rosters only move on substitutions.
+
 ---
 
 ## Log
