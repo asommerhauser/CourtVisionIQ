@@ -529,10 +529,14 @@ SUBSET_RECENT_SEASON_RATES = (1.0, 0.70, 0.50)
 SUBSET_RECENCY_HALFLIFE_SEASONS = 5.0
 SUBSET_SEED = 42                     # deterministic subset selection
 SUBSET_GAMES_PATH = "./training/subset_games.json"  # persisted subset manifest (one extract step)
-# Heads trained on the representative subset rather than the full corpus. All six conditional
-# type/result heads share one preprocess file, so they move as a group. Everything NOT listed here
-# (event_time, player, substitution, sub_decision) trains on the full corpus.
+# Heads trained on the representative subset rather than the full corpus. All SEVEN conditional
+# type/result heads share one cond_*.npz, so they move as a group — listing six of them was true
+# of nothing: timeout_team already trained on subset rows, because run_stage builds that shared file
+# once from cond_keys[0] (shot_type, which is listed). The list was wrong, not the behaviour, and
+# models.pipeline.run_stage now raises rather than let the two drift again. Everything NOT listed
+# here (event_time, player, substitution, sub_decision) trains on the full corpus.
 SUBSET_MODEL_KEYS = (
     "event_time_cond",
     "shot_type", "shot_result", "assist_type", "turnover_type", "foul_type", "rebound_type",
+    "timeout_team",
 )

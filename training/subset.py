@@ -1,7 +1,7 @@
 """
 subset.py — extract a compact, representative training subset for the small heads.
 
-The big player-vocab heads (player / substitution / stint_length) want every game; the small
+The big player-vocab heads (player / substitution / sub_decision) want every game; the small
 categorical/regression heads (event/type/result/conditional-time) saturate well before they've seen
 the whole corpus and then overfit. This module carves a slice of the train pool for those small
 heads with two properties:

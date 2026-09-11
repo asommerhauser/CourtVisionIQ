@@ -41,3 +41,8 @@ htmlcov/
 
 # Eval-only run state (holdout ids + data paths); written by a full train, machine-local
 /training/full_run_state.json
+
+# Small-head training subset, derived from the state file above and equally machine-local.
+# Deliberately NOT tracked: a fresh clone then carries no manifest, so full_run extracts one from
+# that machine's own state and it cannot arrive stale.
+/training/subset_games.json

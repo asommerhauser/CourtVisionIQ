@@ -26,7 +26,8 @@ from pathlib import Path
 
 from config import (
     DEFAULT_MODEL, EVAL_BATCH, EVAL_GAMES_PER_BATCH, FINAL_HOLDOUT_GAMES, FINAL_SEASON_FRACTION,
-    FULL_RUN_STATE_PATH, ROLLOUT_BATCH_SIZE, SEED, STAGE_SIMS, SUBSET_MODEL_KEYS, TEST_FRAC,
+    FULL_RUN_STATE_PATH, ROLLOUT_BATCH_SIZE, SEED, STAGE_SIMS, SUBSET_GAMES_PATH,
+    SUBSET_MODEL_KEYS, TEST_FRAC,
 )
 # model_name is re-exported: it lives in models.artifacts (TF-free, so eval_pool can reach
 # it), but train.py and the tests have always imported it from here.
@@ -36,7 +37,7 @@ from models.manifest import (new_manifest, record_head, snapshot_vocabs, vocab_f
 from models.registry import STAGE_MODEL_KEYS
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
 from training.chronology import game_index, sequential_partition
-from training.subset import load_subset_games
+from training.subset import extract as extract_subset, load_subset_games
 
 DEFAULT_STATE_PATH = FULL_RUN_STATE_PATH   # re-exported: train.py imports it from here
 
@@ -115,6 +116,37 @@ class FullRun:
         print(f"State -> {self.state_path}\nNext:  python train.py --full --name {name} "
               f"--batch-size {batch_size}")
 
+    # -------------------------------------------------------------- subset
+    def _subset_games(self, *, tag: str) -> set[int]:
+        """The small-head training subset, extracted on demand. Never returns None.
+
+        A missing manifest used to mean "train every head on the full corpus", announced by a
+        single line of stdout. Measured against full_train_2's reports that is 391-428 sec/epoch
+        on 21,014 games where the subset heads ran 72-74 on 3,239 — 5.4x, silently, for about
+        sixteen hours of a rented card. Absence cannot select a training regime any more.
+
+        Extracting here is not a convenience, it is the only point in the flow where it fits:
+        ``extract`` reads ``full_run_state.json``, which ``setup()`` writes and which
+        ``train.py --full`` consumes in the same breath, so there has never been a window in
+        which a separate ``python -m training.subset extract`` could have run.
+        """
+        games = load_subset_games()
+        if games is None:
+            print(f"[{tag}] no subset manifest at {SUBSET_GAMES_PATH} — extracting one now. "
+                  f"It reads every cleaned season to map players to games; a few minutes.")
+            extract_subset(state_path=str(self.state_path))
+            games = load_subset_games()
+            if games is None:
+                raise SystemExit(
+                    f"subset extract wrote no games to {SUBSET_GAMES_PATH}; the small heads "
+                    f"would have no train pool."
+                )
+        bar = "=" * 70
+        print(f"\n{bar}\n[{tag}] subset heads {list(SUBSET_MODEL_KEYS)}\n"
+              f"[{tag}]   -> {len(games)} games\n"
+              f"[{tag}] full corpus -> event_time, player, substitution, sub_decision\n{bar}")
+        return games
+
     # --------------------------------------------------------------- train
     def train(self, *, rebuild_vocabs: bool = False) -> None:
         from models.pipeline import run_stage
@@ -131,15 +163,9 @@ class FullRun:
               f"(recency-weighted) -> {self.state['artifacts_root']}")
 
         # Small heads (config.SUBSET_MODEL_KEYS) train on the compact, modern-heavy per-season
-        # subset if it has been extracted (python -m training.subset extract); the big player-vocab
-        # heads keep the full corpus. No subset file => everything trains full, as before.
-        subset_train = load_subset_games()
-        if subset_train is not None:
-            print(f"[train] small heads {list(SUBSET_MODEL_KEYS)} -> {len(subset_train)}-game subset; "
-                  f"player/substitution/stint_length -> full corpus.")
-        else:
-            print("[train] no subset extracted — all heads train on the full corpus. "
-                  "(Run `python -m training.subset extract` to enable the small-head subset.)")
+        # subset; the big player-vocab heads keep the full corpus. Extracted here when absent, so
+        # there is no "no subset file" branch left to fall into.
+        subset_train = self._subset_games(tag="train")
 
         self.state["status"] = "training"
         self._save()
@@ -289,7 +315,7 @@ class FullRun:
         idx = game_index(self.state["data_dir"])
         partition = sequential_partition(idx, self.state["boundary_idx"],
                                          n_holdout=FINAL_HOLDOUT_GAMES, val_frac=TEST_FRAC, seed=SEED)
-        subset_train = load_subset_games()
+        subset_train = self._subset_games(tag="retrain")
         print(f"[retrain] '{name}' only -> {self.state['artifacts_root']}/{name} "
               f"(other heads left in place)")
 

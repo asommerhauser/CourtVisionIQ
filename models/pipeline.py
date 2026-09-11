@@ -234,7 +234,20 @@ def run_stage(data_dir: str, game_partition, *, artifacts_root: str = DEFAULT_AR
     # 3) Conditional heads — one shared preprocess (only if a head still needs training), then each.
     # They share one cond_*.npz file, so they share one partition: all conditional heads are in
     # subset_keys together (see config.SUBSET_MODEL_KEYS) or none are.
+    #
+    # Checked, not assumed. The shared file is built from cond_keys[0] alone, so a head left out of
+    # subset_keys still trains on whatever partition the FIRST spec in TYPE_GEN_SPECS selects —
+    # which made the invariant a property of dict ordering. It held only because shot_type happens
+    # to come first and happens to be listed; reorder the specs and every conditional head flips to
+    # the full corpus, with no diff anywhere to show for it.
     cond_keys = [cls.KEY for cls in CONDITIONAL_MODEL_CLASSES]
+    listed = [k for k in cond_keys if k in subset_keys]
+    if listed and len(listed) != len(cond_keys):
+        raise ValueError(
+            "conditional heads share one cond_*.npz and so must share one partition: "
+            f"in subset_keys={listed}, missing={[k for k in cond_keys if k not in subset_keys]}. "
+            "Add the missing keys to config.SUBSET_MODEL_KEYS, or remove all of them."
+        )
     if any(k not in done for k in cond_keys):
         CONDITIONAL_MODEL_CLASSES[0](Encoder(), path=data_dir).preprocess(**_pp(cond_keys[0]))
     for cls in CONDITIONAL_MODEL_CLASSES:
