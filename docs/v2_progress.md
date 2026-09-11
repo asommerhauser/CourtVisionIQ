@@ -71,6 +71,15 @@ is pytest plus TF-free measurement until the 2.0 train.
 > forecast, and the recommended order of post-train measurement (baseline comparison first).
 > Read it before Gate C's train.
 
+> **2026-09-11, train 3 cancelled and the tree made train-ready.** Attempts 1 and 2 are dead: a
+> Keras 3 `Dense` OOM (correction V, fixed on `fix/rowff-rank2`), a pod running v1.0 code because
+> the branch had never been pushed, and a missing subset manifest that would have trained every
+> head on the full corpus at 5.4x the epoch cost. All three are written up as corrections V and W.
+> The last two are now impossible rather than documented: `full_run` extracts the manifest itself,
+> `run_stage` raises on a split conditional group, and the README's pod procedure names a branch,
+> checks provenance, and runs the train under `nohup` into a log file. **Push the branch before
+> cloning it on a pod** — that is the step that was missing.
+
 **Workstream 11 is complete. Phases 1 and 2, Gate B, all of §9 and all of §8 are merged into
 `feature/version2`.** The full suite is green.
 
@@ -117,6 +126,10 @@ around:
    `free throw`. A stray token aborts the preprocess instead of silently scoring it as two.
 2. **`DataCleaner._check_schema` raises** if any emitted event's keys differ from
    `OUTPUT_COLUMNS`. A missing key would otherwise become a silent all-NaN column.
+3. **`models.pipeline.run_stage` raises** if some but not all conditional heads are in
+   `SUBSET_MODEL_KEYS`. They share one `cond_*.npz`, so they share one partition; the invariant
+   used to be a comment that held only because `shot_type` comes first in `TYPE_GEN_SPECS`
+   (correction W). Added 2026-09-11.
 
 ### What this programme has actually taught, twice each
 
@@ -1400,6 +1413,8 @@ to that file.
 | coordinate coverage | 100% / 100% / 99.4% |
 | pace gate | -1.7 / -1.6 / -1.9 against the de-biased reference (correction T), tolerance 3.0 |
 | loss-mask share | 9.0% -> 29.8% / 9.9% -> 30.1% / 10.6% -> 31.5% |
+| branch provenance on the pod | **added after train 3** — `git log --oneline -1` is the tip, and grep finds `timeout_team` |
+| subset regime | **added after train 3** — auto-extracted by `full_run`; the banner reads a few thousand games, not 21,014 |
 
 Reproduced by two commands, both TF-free and both cheap:
 
@@ -1421,11 +1436,28 @@ before a long train. Without `--rebuild-vocabs`, `run_stage` loads and freezes t
 vocabulary, which is the path the other five heads already take.
 
 ```bash
-python train.py --full --name full_train_3 --batch-size 64
+nohup python train.py --full --name <name> --batch-size 64 > /workspace/train.log 2>&1 &
+tail -n 200 /workspace/train.log | tr '\r' '\n' | tail -30
 ```
 
 Use `--clean --rebuild-vocabs` only if `data/` or `encoder/vocabs/` has been touched since
 2026-09-09; then the vocabularies must come back byte-identical to the purged freeze.
+
+**Two things to read before the first head, both consequences of correction W.** Neither is
+optional and both are cheap:
+
+- **Provenance, before the card is spent.** `git log --oneline -1` must show the branch tip you
+  expect, and `grep -rl timeout_team models/` must return files. Train 3 ran pre-2.0 code for
+  twelve hours because the branch had never been pushed and nothing checked.
+- **The subset banner, in the log's first screen.** `full_run` extracts the manifest itself now,
+  so the banner is always printed: the small heads on a few thousand games, `event_time` /
+  `player` / `substitution` / `sub_decision` on the full corpus. If those counts look like the
+  whole corpus, stop the train rather than pay 5.4x for it. `python -m training.subset show`
+  prints the same summary afterwards.
+
+The train runs under `nohup` into a log file on the volume. It is not that the process needs
+protecting — it survives a dropped SSH session perfectly well — but that its *output* does
+not, and with no `SYS_PTRACE` in the container there is no recovering it from the orphan.
 
 Train 2's availability masking and capacity settings carry forward unchanged. `run_stage`
 preprocesses every head unconditionally on a fresh train, so the five heads whose npz still predate
@@ -1661,6 +1693,7 @@ harm it causes should not ship on.** §10 says to watch the per-quarter splits f
 drift and that a Q1 regression means the weight is too high. Build the measurement first, then
 decide. Nothing is lost by waiting — the mechanism is ~30 lines and the A/B is two trains
 against the same preprocess.
+
 **T. A dead-ball row inside a free-throw trip closed it early, and the pace gate hid it by
 cancelling against a biased reference.** Found while unifying the trip state for workstream 12's
 continuation rule, which needs the same "is a trip open" question correction M's possession clock
@@ -1743,6 +1776,58 @@ test cannot tell the two graphs apart, which is exactly why this shipped.
 Not changed, and noted for whoever needs the next slice: `RosterSetEncoder.scalar_proj` has the
 same shape (39 MB an application, not worth the diff), and the deeper waste is that the encoder
 re-encodes all 600 timesteps when rosters only move on substitutions.
+
+**W. Train 3 also ran v1.0 code on the pod, and would have trained every head on the full corpus
+anyway. Both failures were silent, and neither was in the model.** The RowFF fix (correction V) was
+the only one of the three that announced itself.
+
+*The branch was never pushed.* `origin/feature/version2` sat at `f2f0db8` — pre-2.0 — so the
+pod's clone produced a v1.0 tree. Verified there after the fact: `git log --oneline -1` returned
+`f2f0db8`, and grep found zero occurrences of both `timeout_team` and `lead = tf.shape`. Twelve
+hours of training (event_time 5h20m, player 3h43m, event_time_cond 3h20m) were worthless before
+the OOM ever mattered. Nothing about the run looked wrong from the outside: same files, same
+commands, same banner. The README's clone step named no branch and the procedure had no provenance
+check; both are fixed, and Gate C's checklist now carries the check as an item.
+
+*The subset manifest was absent, so every head trained on the full corpus.* `full_run.train()`
+called `load_subset_games()`, which returns `None` when `./training/subset_games.json` is missing,
+and then trained the seven small heads on all 21,014 games while printing one line of stdout
+saying so. Measured from full_train_2's reports, which had the manifest: full-corpus heads ran
+391-428 sec/epoch on 21,014 games, subset heads 72-74 on 3,239. 6.5x the games for 5.4x the time,
+about sixteen hours of rented card.
+
+The manifest's absence was not carelessness — **there was no point in the documented flow at
+which it could have been created.** `extract` reads `full_run_state.json`, which only `setup()`
+writes, and `train.py --full` calls `setup()` then `train()` in the same breath. A separate
+`python -m training.subset extract` has never had a window to run in. So the fix is auto-extract
+inside `train()`, at the one moment the state file exists and no head has started;
+`_subset_games()` returns a set and never `None`, and the full-corpus branch is gone rather than
+guarded. `retrain_model()` had the same fallback with no message at all and now shares the helper.
+The manifest stays untracked, in `.gitignore` beside the state file it derives from: a fresh clone
+then carries none, so one is always built from that machine's own state and cannot arrive stale.
+Residual, deliberately not coded against: a re-clean on a machine that already holds a manifest
+leaves the old one in place, and deleting the file is what re-derives it.
+
+*`timeout_team` was not the third victim, and the epoch times would have said otherwise.* It is a
+seventh `ConditionalTypeModel` and it is not in `SUBSET_MODEL_KEYS`, which reads as ~2.7h on the
+full corpus against ~25 min for its six siblings. It is not. All seven conditional heads share one
+`cond_*.npz`, built once in `run_stage` from `_pp(cond_keys[0])`, and `cond_keys[0]` is `shot_type`
+— which is listed. `timeout_team` has been training on subset rows since workstream 13. The
+config list was wrong, not the behaviour, and adding the seventh key changes no bytes of any npz.
+
+What was genuinely dangerous is that `run_stage` stated the all-or-none invariant in a comment. It
+held only because `shot_type` happens to come first in `TYPE_GEN_SPECS`; reorder those specs and
+every conditional head flips to the full corpus with no diff anywhere to show for it. `run_stage`
+now raises instead, in the `DataCleaner._check_schema` style.
+
+*`sub_decision` stays on the full corpus, deliberately.* It replaced full-corpus `stint_length`
+(correction R) and has no history of its own, so the question was open. It is
+`class SubDecisionModel(SubstitutionModel)`: it inherits the roster encoder and trains `emb_player`
+against `player_vocab.next_token`, which makes it a player-vocab head by `training/subset.py`'s own
+criterion, sitting with `substitution` rather than with the conditionals. Subsetting it on its
+first ever train would also confound "new head" with "new regime" in the report. Revisit once
+train 3 shows whether it saturates. Two stale `stint_length` strings — the train banner and
+`subset.py`'s docstring — are corrected while here.
 
 ---
 
