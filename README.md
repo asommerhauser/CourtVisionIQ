@@ -200,6 +200,11 @@ runpodctl ssh info <pod-id>                           # the ssh command, without
   proxy, which is terminal-only.
 - `--stop-after` / `--terminate-after` take an ISO datetime and are cheap insurance against leaving
   a card running overnight.
+- **Ask for `SYS_PTRACE` if the console or CLI will give it to you.** The stock container does not
+  have it, and without it `py-spy`, `strace`, `gdb` and `reptyr` all fail — `/proc/sys` is
+  read-only too, so yama cannot be relaxed from inside. That is the difference between diagnosing a
+  wedged train and terminating the pod blind, and it costs nothing to set at create time. Verify
+  with `capsh --print | grep ptrace` once you are in, rather than finding out mid-incident.
 
 ### 2. SSH in (PowerShell)
 
@@ -214,21 +219,33 @@ Fallback when the pod exposes no TCP port — the RunPod proxy. It gives a termi
 ssh <pod-id>-<hash>@ssh.runpod.io -i $env:USERPROFILE\.ssh\id_ed25519
 ```
 
-**Then, first thing, start a multiplexer:**
+**There is no multiplexer on the RunPod images.** `tmux` is not installed, and this README used
+to open with `tmux new -s cviq` — which fails on a fresh pod at the exact moment you are trying to
+start a job. Do not reach for it.
+
+You do not need one. A train launched with `nohup` **survives a dropped SSH session**: it detaches
+from the terminal and keeps running, as a full night of training proved. What does not survive is
+its *output*. Launch interactively and stdout is a pty whose master dies with `sshd`, taking every
+line with it — and with no `SYS_PTRACE` in the container there is no attaching to the orphan to
+get it back. The log file is the whole point:
 
 ```bash
-tmux new -s cviq          # tmux attach -t cviq to get back after a drop
+nohup python train.py --full --name <name> --batch-size 64 > /workspace/train.log 2>&1 &
+tail -f /workspace/train.log            # Ctrl-C this freely; it does not touch the train
 ```
 
-A dropped SSH session takes its child processes with it. `cviq> train --go` detaches the train from
-the *shell*, but it stays in the SSH session's process group — it is not SIGHUP-proof on its own.
-Anything longer than a few minutes belongs inside `tmux`.
+Put the log on `/workspace` (the volume), not the container disk. Keras progress bars are written
+with `\r`, so a raw `tail` shows one enormous line — translate them to get a readable view:
+
+```bash
+tail -n 200 /workspace/train.log | tr '\r' '\n' | tail -30
+```
 
 ### 3. Clone + environment (on the pod)
 
 ```bash
 cd /workspace                                  # the volume; the container disk is wiped on stop
-git clone https://github.com/asommerhauser/CourtVisionIQ.git && cd CourtVisionIQ
+git clone -b <branch> https://github.com/asommerhauser/CourtVisionIQ.git && cd CourtVisionIQ
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-gpu.txt
 python -c "import tensorflow as tf; print('GPUs:', tf.config.list_physical_devices('GPU'))"
@@ -237,6 +254,22 @@ nvidia-smi; nproc                              # card + cores (cores size --proc
 ```
 
 Keep the venv under `/workspace` as well, or a stop/start throws it away with the container disk.
+
+**Name the branch, then prove you got it.** A bare `git clone` takes whatever `main` points at. If
+the work you mean to train lives on a feature branch that has never been pushed, the clone resolves
+to something older and looks completely normal — same files, same commands, same banner — until
+the first report comes back wrong. That cost a twelve-hour train once: the pod ran pre-2.0 code all
+night because `origin/feature/version2` did not exist yet.
+
+Thirty seconds, before you spend a card:
+
+```bash
+git log --oneline -1                       # the tip you expect, not something months old
+grep -rl "<symbol only the new code has>" .   # zero hits = wrong tree, stop here
+```
+
+Pick the symbol from the newest work in the branch, not from something old enough to exist on both
+sides. And if the branch is local-only, the fix is upstream of the pod: push it first.
 
 ### 4. Ship the data / weights up
 
@@ -301,8 +334,9 @@ Ctrl-C both ends and re-issue (the spent code is dead, you get a new one).
 
 ### 5. Run the job
 
-Everything below runs on the pod, inside `tmux`, with the venv active. The flags are documented in
-full under [Training](#training--trainpy), [Evaluation](#evaluation--evaluatepy) and
+Everything below runs on the pod with the venv active, long jobs under `nohup` (step 2). The flags
+are documented in full under [Training](#training--trainpy),
+[Evaluation](#evaluation--evaluatepy) and
 [Inference dials](#inference-dials-tuning-without-retraining); this is the order of operations.
 
 **Clean** — only if you shipped `RawData/`. CPU-only, normally done locally:
@@ -310,12 +344,20 @@ full under [Training](#training--trainpy), [Evaluation](#evaluation--evaluatepy)
 python main.py --clean --rebuild-vocabs --model event_time
 ```
 
-**Train** a new named model:
+**Train** a new named model. Never in the foreground: a train is hours, and an interactive launch
+loses all of its output to the first dropped connection.
 ```bash
-python train.py --full --name v1.1 --batch-size 64      # add --clean --rebuild-vocabs after a re-clean
-python train.py --status                                # progress, from a second tmux pane
+nohup python train.py --full --name v1.1 --batch-size 64 > /workspace/train.log 2>&1 &
+# add --clean --rebuild-vocabs ONLY after a re-clean; both are destructive to a frozen vocabulary
+tail -n 200 /workspace/train.log | tr '\r' '\n' | tail -30   # readable progress, any time
+python train.py --status                                # summary, from a second SSH session
 python train.py --continue                              # resume at the next unfinished head
 ```
+The first thing the log should show is the subset banner: the small heads on a few thousand games,
+`event_time / player / substitution / sub_decision` on the full corpus. `full_run` extracts the
+manifest itself if it is missing, so that banner is always there — if the counts look like the
+whole corpus, stop the train rather than pay 5.4x for it.
+
 Weights land in `artifacts/v1.1/`, per-head training reports under `reports/`, and the run state in
 `training/full_run_state.json` — which is what makes `evaluate.py` usable on this pod afterwards.
 
@@ -341,7 +383,8 @@ Lower `--concurrency` (48 default → ~24 per child) if you crowd VRAM; each chi
 `CVIQ_TF_INFER=1` is the opt-in compiled-inference path — measure it on the rented card before
 trusting it.
 
-**Anything over ~30 games needs a harvester in a third pane**, or the volume fills mid-run:
+**Anything over ~30 games needs a harvester running beside it** (its own `nohup`, or a second
+SSH session), or the volume fills mid-run:
 
 ```bash
 python harvest.py --run results/v1.0/full1 --out /workspace/archive --loop 60 --keep 2
@@ -382,7 +425,7 @@ the next start anyway.
 A fresh pod per session means re-shipping the CSVs and rebuilding the venv every time. A **network
 volume** removes both: create it in the console, pass `--network-volume-id <id>` to
 `runpodctl pod create`, and it mounts at `/workspace`. Put the clone, the venv, `data/` and
-`artifacts/` on it once, and every later session is just steps **2** (SSH + tmux) and **5** (run the
+`artifacts/` on it once, and every later session is just steps **2** (SSH) and **5** (run the
 job), with nothing to transfer and results pulled down as above. The volume bills by the GB-month
 whether or not a pod is attached, and it pins you to its datacenter when picking a GPU.
 
