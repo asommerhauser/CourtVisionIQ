@@ -298,13 +298,18 @@ class FullRun:
         print("=" * 70)
 
     # --------------------------------------------------------------- retrain one head
-    def retrain_model(self, name: str) -> None:
+    def retrain_model(self, name: str, batch_size: int | None = None) -> None:
         """Retrain exactly ONE head in place, keeping the other heads' weights untouched.
 
         Backs ``train.py --model <name>``. Reuses the full pipeline (``run_stage``) with every OTHER
         head marked ``done`` so only ``name`` preprocesses + trains, overwriting
         ``artifacts/v<version>/<name>/``. Fresh init, same recency-weighted train slice as a full
         train. ``ModelBundle.load`` tolerates the untouched heads.
+
+        ``batch_size`` overrides the state's for this head only, and is NOT written back: a
+        one-head rescue on a smaller card must not silently re-scope the next ``--continue``.
+        It used to be accepted on the command line and dropped on the floor here, so a
+        ``--batch-size 24`` aimed at an OOM re-ran at the state's 64 and died the same way.
         """
         from models.pipeline import run_stage
 
@@ -316,8 +321,11 @@ class FullRun:
         partition = sequential_partition(idx, self.state["boundary_idx"],
                                          n_holdout=FINAL_HOLDOUT_GAMES, val_frac=TEST_FRAC, seed=SEED)
         subset_train = self._subset_games(tag="retrain")
+        bs = batch_size or self.state["batch_size"]
         print(f"[retrain] '{name}' only -> {self.state['artifacts_root']}/{name} "
               f"(other heads left in place)")
+        print(f"[retrain] batch {bs}"
+              + (f" (override; state says {self.state['batch_size']})" if batch_size else ""))
 
         sdict = self.state
         def on_trained(key: str) -> None:
@@ -328,7 +336,7 @@ class FullRun:
         run_stage(
             self.state["data_dir"], partition, artifacts_root=self.state["artifacts_root"],
             warm_start=False, refit_norm_stats=True, epochs=self.state["epochs"],
-            batch_size=self.state["batch_size"], report=True, run_name=self.state["run_name"],
+            batch_size=bs, report=True, run_name=self.state["run_name"],
             done=[k for k in STAGE_MODEL_KEYS if k != name], on_trained=on_trained,
             subset_keys=SUBSET_MODEL_KEYS, subset_train_games=subset_train,
         )

@@ -34,16 +34,21 @@ from models.substitution_model import SubstitutionModel
 
 # Heavier heads that get a capped batch so the chain fits a tight (~10 GB) GPU alongside the shared
 # roster encoder (~8 GB at batch 32). PlayerModel + SubstitutionModel emit logits over the large
-# *player* vocab (+~0.5–1 GB of logits/gradients — the actual OOM cause); SubDecisionModel has a
-# scalar output but is the substitution model's sibling (two player-embedding conditioning inputs),
-# capped here too as a precaution since it's the last head to train. Every other head (event / type /
-# result / conditional-time — tiny outputs) trains at the full batch_size.
-LARGE_OUTPUT_MODELS = {PlayerModel.KEY, SubstitutionModel.KEY}
-# Per-head cap for the player-vocab heads (their logits/gradients over the player vocab are the
-# real OOM risk). Set to 64 for the paid-GPU train 2 (provisioning a high-VRAM card), matching the
-# global batch_size so these heads also train at 64 — i.e. effectively uncapped. Lower this (e.g.
-# 24/16) if you ever run the chain on a tight (~10 GB) GPU and a player-vocab head OOMs.
-LARGE_OUTPUT_BATCH = 64
+# *player* vocab (+~0.5–1 GB of logits/gradients); SubDecisionModel has a scalar output but is the
+# substitution model's sibling (two player-embedding conditioning inputs) and builds the same
+# ten-slot bench_vec encoder, so it is capped too. It was named in this comment but MISSING from
+# the set until train 4 — the same shape of bug as correction W, and it would have OOM'd on the
+# very next head after substitution was fixed. Every other head (event / type / result /
+# conditional-time — tiny outputs) trains at the full batch_size.
+LARGE_OUTPUT_MODELS = {PlayerModel.KEY, SubstitutionModel.KEY, SubDecisionModel.KEY}
+# Per-head cap for the roster/bench heads. Train 4 OOM'd 'substitution' at 64 on a pod whose card
+# was NOT the L40S the run started on: the allocator reported a 10.0 GiB limit (the run's own first
+# stage had logged 43500 MB), and the failing node was
+# bench_vec -> roster_encoder -> sab_0 -> mab -> ln1 — the roster encoder, not the output logits.
+# That makes the batch the lever. 24 is set from evidence rather than taste: v1.0's substitution
+# (13.4M params) trained at 32 on a 12 GB card, and this head is 14.4M on a 10 GB one. Raise it
+# again only alongside a card confirmed in the log, not assumed from the pod's advertised type.
+LARGE_OUTPUT_BATCH = 24
 
 
 def _batch_for(key: str, batch_size: int) -> int:

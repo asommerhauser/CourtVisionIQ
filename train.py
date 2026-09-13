@@ -80,7 +80,7 @@ def main() -> None:
         if name and run.state.get("version") not in (None, name):
             ap.error(f"--model targets the currently trained model '{run.state.get('version')}', "
                      f"not '{name}'. Run a --full train for that name first.")
-        run.retrain_model(args.model)
+        run.retrain_model(args.model, batch_size=args.batch_size)
     elif args.cont:
         run.train()
     elif args.status:
