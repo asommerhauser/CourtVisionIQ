@@ -34,16 +34,29 @@ from models.substitution_model import SubstitutionModel
 
 # Heavier heads that get a capped batch so the chain fits a tight (~10 GB) GPU alongside the shared
 # roster encoder (~8 GB at batch 32). PlayerModel + SubstitutionModel emit logits over the large
-# *player* vocab (+~0.5–1 GB of logits/gradients — the actual OOM cause); SubDecisionModel has a
-# scalar output but is the substitution model's sibling (two player-embedding conditioning inputs),
-# capped here too as a precaution since it's the last head to train. Every other head (event / type /
-# result / conditional-time — tiny outputs) trains at the full batch_size.
-LARGE_OUTPUT_MODELS = {PlayerModel.KEY, SubstitutionModel.KEY}
-# Per-head cap for the player-vocab heads (their logits/gradients over the player vocab are the
-# real OOM risk). Set to 64 for the paid-GPU train 2 (provisioning a high-VRAM card), matching the
-# global batch_size so these heads also train at 64 — i.e. effectively uncapped. Lower this (e.g.
-# 24/16) if you ever run the chain on a tight (~10 GB) GPU and a player-vocab head OOMs.
-LARGE_OUTPUT_BATCH = 64
+# *player* vocab (+~0.5–1 GB of logits/gradients); SubDecisionModel has a scalar output but is the
+# substitution model's sibling (two player-embedding conditioning inputs) and builds the same
+# ten-slot bench_vec encoder, so it is capped too. It was named in this comment but MISSING from
+# the set until train 4 — the same shape of bug as correction W. It then did exactly that: OOM on
+# the very next head after substitution was fixed. Every other head (event / type / result /
+# conditional-time — tiny outputs) trains at the full batch_size.
+LARGE_OUTPUT_MODELS = {PlayerModel.KEY, SubstitutionModel.KEY, SubDecisionModel.KEY}
+# Per-head cap for the roster/bench heads. The card was an L40S (46 GB) throughout train 4 — an
+# allocator "Limit: 10768941056" is NOT evidence of a small card, it is what TF records when it
+# initialises alongside something else holding the rest. Two distinct OOMs hide behind that line
+# and only the second needs this knob:
+#
+#   1. 'substitution' failed twice on a card a crashed run still held (nvidia-smi: one python at
+#      33,212 MiB of 46,068). Freeing it was the whole fix; the head then trained at 64 in ~10 GiB.
+#      Before touching the batch, run nvidia-smi and confirm memory.used is 0.
+#   2. 'sub_decision' then OOM'd at 64 on a *verified empty* card, in a fresh process, at
+#      gradient_tape/final_ln — the backward pass, which is what the batch actually governs.
+#
+# 24 is therefore for (2). Note also that neither head OOMs in isolation but the CHAIN does: TF
+# never returns VRAM to the driver, so stage 11 inherits stage 10's pool (see _free_gpu, which is
+# best-effort and cannot fix this). Running a tail of the chain as its own process is the other
+# half of the remedy, and is why 'substitution' succeeded on the retry.
+LARGE_OUTPUT_BATCH = 24
 
 
 def _batch_for(key: str, batch_size: int) -> int:
