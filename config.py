@@ -249,8 +249,12 @@ MAX_DELTA = 60.0
 # deliberately absent from _TUNING_KEYS below). Regressing actual margin on predicted margin across
 # v1.0's full1 holdout: actual = -0.31 + 0.745*predicted -- predicted margins run ~25% too extreme
 # for their information content. slope=1.0/intercept=0.0 = off.
-MARGIN_CALIBRATION_SLOPE = 0.745
-MARGIN_CALIBRATION_INTERCEPT = -0.31
+# Neutralised for the 2.0 train: 0.745 / -0.31 were regressed on v1.0's full1 holdout, so
+# leaving them on would report 2.0's spread and win metrics through v1.0's calibration and
+# quietly flatter (or flatten) them. This is refit from games.parquet without re-simulating
+# anything -- the raw per-game record never passes through it -- so measure 2.0 raw first.
+MARGIN_CALIBRATION_SLOPE = 1.0
+MARGIN_CALIBRATION_INTERCEPT = 0.0
 
 # Rollout dials captured into each evaluation report (reporting/eval_report.py) so tuning settings
 # are recorded alongside results for cross-run analysis. Order is the display order in the report.
