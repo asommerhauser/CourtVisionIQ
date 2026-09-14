@@ -80,6 +80,36 @@ is pytest plus TF-free measurement until the 2.0 train.
 > checks provenance, and runs the train under `nohup` into a log file. **Push the branch before
 > cloning it on a pod** — that is the step that was missing.
 
+> **2026-09-14, the train landed and run 1 is tuned.** `artifacts/version2/` holds all twelve
+> heads (`training/full_run_state.json` status `trained`), so standing rule 5 is lifted: there is
+> a loadable model again. Three pre-flight checks ran before any GPU time was committed, all
+> TF-free and all green:
+>
+> 1. **Holdout pairing (review §5.8).** The state's 100 ids are byte-identical, in order, to
+>    `results/v1.0/full4-s100/holdout.json` (298324–298423). The paired v1-vs-v2 comparison is
+>    clean and no GPU hours are at risk of buying an unpaired verdict.
+> 2. **Vocabularies.** `artifacts/version2/vocabs/` matches the committed `encoder/vocabs/`
+>    token-for-token across all five — the only key that differs is `frozen` (True in the
+>    shipped snapshot, which is the correct inference setting: unseen tokens map to UNK rather
+>    than silently appending). Gate C's byte-identical check passes on content.
+> 3. **`norm_stats.json` drifted.** The shipped copy and the committed one disagree on
+>    `delta_mean` (5.8423 vs 5.8390), `delta_std`, `rest_mean` and `rest_std`. It does not affect
+>    `evaluate.py`, which loads `artifacts/version2/vocabs/` via `shell.actions` — but
+>    `simulation.diagnostics` calls `GameSimulator.load` with no encoder and so falls back to
+>    `encoder/vocabs/`, which would normalise Δt with stats the model never trained on. **Sync
+>    the shipped vocabs over `encoder/vocabs/` on the pod** before running diagnostics.
+>
+> Run 1's tuning is `dials/v2-run1.json`, and its rule is: **a dial that corrected a defect 2.0
+> fixed at the source goes to neutral; a dial that is not a fit stays.** Starting from v1.0's
+> package would double-correct — `TYPE_BIAS.foul_type["loose ball"] = +1.2` and
+> `EVENT_BIAS.foul = +0.11` both compensate for bugs workstreams 1 and 12 removed — and it would
+> also destroy the one number §4.2 calls the verdict, since the size of the refit package only
+> means something measured against zero. `PLAYER_TEMPERATURE` 2.0 is the single held exception
+> and is argued in `dials/README.md`. `MARGIN_CALIBRATION_SLOPE/INTERCEPT` are neutralised too:
+> they are not dials, no dial file can reach them, and at v1.0's 0.745 / -0.31 they would report
+> 2.0's spread and win metrics through a regression fit on v1.0's holdout.
+
+
 **Workstream 11 is complete. Phases 1 and 2, Gate B, all of §9 and all of §8 are merged into
 `feature/version2`.** The full suite is green.
 
