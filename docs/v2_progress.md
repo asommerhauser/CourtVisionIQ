@@ -109,6 +109,61 @@ is pytest plus TF-free measurement until the 2.0 train.
 > they are not dials, no dial file can reach them, and at v1.0's 0.745 / -0.31 they would report
 > 2.0's spread and win metrics through a regression fit on v1.0's holdout.
 
+> **2026-09-15, run 1 is read and run 2 is loaded.** `results/version2/v2-run1/` against
+> `results/v1.0/full4-s100/` (paired holdout, 298324—298423). Read the box score before the
+> headline numbers: pick accuracy 0.571 vs 0.63 and spread MAE 10.28 vs 9.49 look like a
+> regression, and **they are mostly one bug.**
+>
+> | | actual | v1.0 full4 | v2 run 1 |
+> |---|---|---|---|
+> | fta | 23.97 | +1.44 | **-10.68** |
+> | dreb | 32.31 | +0.66 | **-10.45** |
+> | tov | 12.92 | -0.37 | **+4.50** |
+> | pts | 115.95 | -0.52 | **-6.55** |
+> | tpa | 33.95 | +2.31 | **+0.60** |
+> | tpm | 12.70 | -0.60 | **-0.30** |
+> | eFG | .555 | -.017 | **-.008** |
+>
+> **§4.2's verdict passes.** `SHOT_RESULT_BIAS["made"]` refits at **-0.022**; v1.0 needed **+0.40**
+> and never fully closed the gap. eFG is better with the dial *off* than v1.0 was with it on, and
+> the 3pt mix is the best it has ever been with `assist_type` empty. The workstreams reached the
+> weights, so the next step is not the ablations.
+>
+> **The three bad rows are two causes, and the analysis is in the two commits, `dials/README.md`
+> and `config.py` next to each dial.**
+>
+> 1. **The fouler's side was never drawn** (`a68266e`). `_do_foul` sampled from all ten and then
+>    *looked up* the side, so the player head — which does not know who has the ball, flattened
+>    further by `PLAYER_TEMPERATURE = 2.0` — split ~50/50 against a real ~13%. Half of every foul
+>    was masked to `OFFENSIVE_SIDE_FOUL_TYPES`, where `shooting 2pt` is not legal: shooting fouls
+>    20.23 → 10.11/game, offensive fouls 3.82 → 13.34. That is FTA, tov (box turnovers count
+>    offensive fouls; turnover *events* ran slightly **under**) and most of pts. FT% was exact at
+>    77.6% throughout — only the count was wrong. PF read fine at -0.31 because box PF excludes
+>    technicals, which is how a +3.37/game foul excess hid.
+> 2. **`rebound_type` over-produces the two new TEAM tokens 3.2x** (`1d992b1`). 31.7/game vs 9.25
+>    real. A team rebound credits no player, so it leaves the box entirely: that is all of dreb,
+>    and why `oreb_pct` read .345 vs .242 — the denominator collapsed, not the numerator.
+>
+> **Both are another entry for "tests do not find the real bugs".** Rebound *events* were correct
+> the whole time (97.4/game vs 98.35) and PF was correct the whole time; each defect was visible
+> only by counting one distribution two ways. The suite was green for both.
+>
+> Run 2's tuning is `dials/v2-run2.json`, and `config.py`'s defaults now equal it so a run without
+> `--dials` no longer gets a v1.0/2.0 mix. `DELTA_TIME_SCALE` is **held at 1.0** although pace fits
+> at 1.0198: run 1 was missing 40% of its free throws, so that measurement is not clean, and
+> changing the foul path and the clock in the same run would make neither readable. It is run 3's
+> first knob. `PLAYER_TEMPERATURE` is held at 2.0 for the same one-change-per-run reason.
+>
+> **Expected in run 2 if the diagnosis is right:** fta ~24, dreb ~32, tov ~12.9, pts ~115,
+> `oreb_pct` ~.24. If those land and win/spread do *not* move, the remaining gap is the rotation
+> and the margin correlation rather than the box score.
+>
+> **Run 2 must use 100 sims, not 20.** Run 1 used 20 against full4-s100's 100, and the predicted
+> margin is a mean over sims, so its sampling error is sqrt(5) larger — a meaningful part of
+> spread corr 0.299 vs 0.468 (roughly 0.39 equivalent). The sim count has to match before that
+> comparison means anything, and it is also the one thing that would make run 2 not comparable to
+> run 1.
+
 
 **Workstream 11 is complete. Phases 1 and 2, Gate B, all of §9 and all of §8 are merged into
 `feature/version2`.** The full suite is green.
