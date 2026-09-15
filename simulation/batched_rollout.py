@@ -70,7 +70,6 @@ class _WorkerSim(GameSimulator):
     def __init__(self, master: GameSimulator, coordinator: "_BatchCoordinator", worker_id: int):
         super().__init__(master.model, master.instance)
         self.heads = master.heads
-        self.stint_norm_stats = master.stint_norm_stats
         self.condtime_norm_stats = master.condtime_norm_stats
         self._coordinator = coordinator
         self._worker_id = worker_id
