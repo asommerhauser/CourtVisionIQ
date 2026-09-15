@@ -42,6 +42,11 @@ def main() -> None:
     mode.add_argument("--continue", dest="cont", action="store_true",
                       help="Resume an interrupted full train at the next unfinished head.")
     mode.add_argument("--status", action="store_true", help="Show full-run progress.")
+    mode.add_argument("--extend-holdout", dest="extend_holdout", action="store_true",
+                      help="Re-cut the holdout to FINAL_HOLDOUT_GAMES on an already-trained "
+                           "model, without re-running setup (which would reset the train). "
+                           "Extends forward from the stored train cut only, and refuses if the "
+                           "existing ids are not a prefix of the new ones.")
 
     ap.add_argument("--name", help="Model name, e.g. v1.1 or endgame-feats (required with --full). "
                                    "Free-form; a retrain takes a NEW name rather than overwriting.")
@@ -83,6 +88,13 @@ def main() -> None:
         run.retrain_model(args.model, batch_size=args.batch_size)
     elif args.cont:
         run.train()
+    elif args.extend_holdout:
+        if name and run.state.get("version") not in (None, name):
+            ap.error(f"--extend-holdout targets the currently trained model "
+                     f"'{run.state.get('version')}', not '{name}'.")
+        # data_dir is left to the state: for a trained model the corpus it was cut against is
+        # authoritative, and argparse's "./data" default would silently override a different one.
+        run.extend_holdout()
     elif args.status:
         run.status()
 

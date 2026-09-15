@@ -12,11 +12,14 @@ State machine (``full_run_state.json``), each step user-launched:
   setup      : compute the cut (``FINAL_SEASON_FRACTION`` through the last season) + next-N holdout.
   train      : one fresh full train of every model on the train slice -> artifacts/v<version>/.
   retrain    : retrain ONE head in place, keeping the rest (train.py --model <name>).
+  extend     : re-cut the holdout to ``FINAL_HOLDOUT_GAMES`` WITHOUT re-running setup, so a
+               finished train survives an eval-sizing change (train.py --extend-holdout).
   eval       : predict the next ``EVAL_BATCH`` holdout games + write a report (evaluate.py).
   report     : rebuild the aggregate report over everything finished.
 
 ``train.py --full --version X.Y --batch-size N`` runs setup+train; ``--continue`` re-runs train
-(resumes at the next unfinished head); ``--model <name>`` runs retrain.
+(resumes at the next unfinished head); ``--model <name>`` runs retrain; ``--extend-holdout`` runs
+extend.
 """
 from __future__ import annotations
 
@@ -115,6 +118,82 @@ class FullRun:
         print(f"[setup] full-train weights -> {artifacts_root}")
         print(f"State -> {self.state_path}\nNext:  python train.py --full --name {name} "
               f"--batch-size {batch_size}")
+
+    # ----------------------------------------------------- extend holdout
+    def extend_holdout(self, *, data_dir: str | None = None) -> None:
+        """Re-cut the holdout window to ``FINAL_HOLDOUT_GAMES`` on an ALREADY-TRAINED model.
+
+        :meth:`setup` is the only other consumer of that constant, and it also stamps
+        ``status="setup"`` and ``trained_models=[]`` -- so raising the constant and re-running
+        setup would throw away a finished train to change an eval knob. This does the one thing
+        that is actually wanted, and nothing else.
+
+        Three invariants, because the failure mode here is leaking training games into the
+        holdout and never noticing:
+
+        * the boundary is read from ``state["boundary_idx"]``, never recomputed, so the
+          train/holdout cut cannot move -- the window only extends FORWARD from where this
+          model actually stopped training;
+        * the new list must START WITH the existing one, or this refuses. That keeps the first
+          N ids the same N ids, so earlier runs stay directly comparable rather than being
+          re-sliced under a total they never covered (their own ``results/<run>/holdout.json``
+          pin holds them at their original count either way -- see ``pin_run_holdout``);
+        * it refuses to SHRINK, since finished games in an existing run would fall outside the
+          set they were scored against.
+
+        ``status`` and ``trained_models`` are untouched, so the next call is ``evaluate.py``.
+        """
+        self._require()
+        if "boundary_idx" not in self.state:
+            raise SystemExit("state has no boundary_idx -- this predates the full-run cut; "
+                             "re-run setup for a fresh model instead.")
+        boundary = int(self.state["boundary_idx"])
+        data_dir = data_dir or self.state.get("data_dir", "./data")
+        idx = game_index(data_dir)
+        ordered = idx["game_id"].to_numpy()
+        available = len(ordered) - boundary
+
+        if len(idx) != self.state.get("n_games", len(idx)):
+            print(f"[extend] WARNING: corpus is {len(idx)} games, state recorded "
+                  f"{self.state['n_games']} -- the data has been re-cleaned since the train. "
+                  f"The prefix check below is what decides whether that matters.")
+        if FINAL_HOLDOUT_GAMES > available:
+            raise SystemExit(
+                f"only {available} games sit after the train cut (boundary {boundary}, corpus "
+                f"{len(ordered)}); FINAL_HOLDOUT_GAMES is {FINAL_HOLDOUT_GAMES}.")
+
+        current = [int(g) for g in self.state.get("holdout_game_ids", [])]
+        wanted = [int(g) for g in ordered[boundary:boundary + FINAL_HOLDOUT_GAMES]]
+        if len(wanted) < len(current):
+            raise SystemExit(
+                f"refusing to shrink the holdout {len(current)} -> {len(wanted)}: games already "
+                f"simulated in an existing run would fall outside the set they were scored "
+                f"against. Raise FINAL_HOLDOUT_GAMES instead.")
+        if wanted[:len(current)] != current:
+            first = next(i for i, (a, b) in enumerate(zip(wanted, current)) if a != b)
+            raise SystemExit(
+                f"refusing to extend: the corpus no longer starts the holdout with the same "
+                f"games (position {first}: {current[first]} recorded, {wanted[first]} now). "
+                f"Earlier runs would stop being comparable. Re-clean and re-train, or evaluate "
+                f"a new model name.")
+        if wanted == current:
+            print(f"[extend] holdout is already {len(current)} games "
+                  f"(g{current[0]} .. g{current[-1]}); nothing to do.")
+            return
+
+        self.state["holdout_game_ids"] = wanted
+        self._save()
+        # Merge-only write: the manifest keeps its arch snapshot / seed / head records.
+        write_manifest(self.state["artifacts_root"], holdout_game_ids=wanted)
+
+        by_id = idx.set_index("game_id")
+        first_g, last_g = by_id.loc[wanted[0]], by_id.loc[wanted[-1]]
+        print(f"[extend] holdout {len(current)} -> {len(wanted)} games "
+              f"(g{wanted[0]} .. g{wanted[-1]}, {first_g['game_date']} .. "
+              f"{last_g['game_date']}); the first {len(current)} are unchanged.")
+        print(f"[extend] train cut untouched at boundary {boundary}; "
+              f"status stays '{self.state.get('status')}'.")
+        print(f"State -> {self.state_path}")
 
     # -------------------------------------------------------------- subset
     def _subset_games(self, *, tag: str) -> set[int]:

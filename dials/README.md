@@ -128,3 +128,177 @@ One caveat on reading the comparison: run 1 used **20 sims** against v1.0 `full4
 The predicted margin is a mean over sims, so its sampling error is sqrt(5) larger, which accounts
 for a meaningful part of spread corr 0.299 vs 0.468 -- roughly 0.39 equivalent, not 0.30. Match the
 sim count before calling that a regression.
+
+## `v2-run3.json` -- the share refit; every volume dial held
+
+Run 2's own exit criterion (the end of the previous section) was: *"If FTA and dreb land and the
+win/spread numbers do not move, the remaining gap is the rotation and the margin correlation, not
+the box score."* Both halves came true, so this package is built on that verdict.
+
+FTA 13.29 -> 20.60, dreb 21.86 -> 32.32, tov 17.42 -> 13.13, pts 109.41 -> 114.34, `oreb_pct`
+.345 -> .252. And the win/spread numbers did not move: paired over the same 100 holdout game ids
+against v1.0 `full4-s100`, Brier +0.0128 (SE 0.0140), score-view Brier +0.0029 (SE 0.0133),
+|margin error| +0.48 (SE 0.58). Nothing at even one sigma. **At 100 games the win and spread
+metrics cannot resolve a dial change** -- which is what the eval-config change beside this package
+is for. Do not fit anything against them.
+
+So run 3 fits only what 100 games *can* resolve, and splits the residual by what a dial reaches:
+
+| Box residual | sigma (200 team-games) | Verdict |
+|---|---|---|
+| `ft_rate` -.0452, `fta` -3.28, `ftm` -2.60 | 7.8 / 6.9 / 6.5 | **code fix, not a dial** (below) |
+| `fga` +3.10, pace +1.52 | 6.7 / 4.6 | held -- the code fix moves this regime |
+| `efg` -.0136 | 3.2 | **fitted**, as mix + per-zone rate |
+| `blk` +0.46 | 3.1 | held -- 1.7 sigma as a *share*; the count rides the FGA excess |
+| pts, fgm, tpa, tpm, oreb, dreb, ast, stl, tov, pf, `oreb_pct` | all < 3 | held, with the measurement |
+| spread bias +1.10 | **0.9** | `HOME_COURT_SHOT_BIAS` stays 0.055 |
+
+That last row is worth stating plainly: the spread-bias SE at 100 games is 1.25, so v1.0's three
+successive retunings of `HOME_COURT_SHOT_BIAS` (0.10 -> 0.07 -> 0.047 -> 0.055, each chasing a bias
+of +1.47, +1.29, -0.69) were fitting noise. It does not move again until the holdout is big enough
+to see it.
+
+### The free-throw deficit is the and-1 check, and no dial reaches it
+
+Attributing every free throw in the run to the foul that caused it (2,000 sim play-by-plays against
+the same 100 games' real ones) puts 88% of the -6.55 FT/game on one number: free throws per
+`shooting 2pt` foul, sim **1.56** against real **1.75**. The controller gives an and-1 one attempt
+and everything else two, so that ratio *is* the and-1 rate: 8.41/game sim against 5.10 real.
+
+`_do_shooting_foul`'s and-1 test asks whether the previous row is a made field goal by the shooting
+team. It never asks *when*. Bucketing those fouls by the gap since that basket:
+
+| gap since the made FG | sim/game | real/game | real 1-FT trips |
+|---|---|---|---|
+| 0s | 0.32 | 5.00 | 5.00 |
+| 1-2s | 1.47 | 0.00 | 0.00 |
+| 3-5s | 1.81 | 0.13 | 0.00 |
+| 6-12s | 3.81 | 1.56 | 0.00 |
+| 13s+ | 1.28 | 2.88 | 0.00 |
+
+In the real data **every** and-1 sits at dt = 0, and a shooting foul three or more seconds after a
+basket *always* gets two. The sim treats all 8.68 as and-1s, 8.37 of them on a later possession.
+The fix is a dt == 0 guard, and it is the same shape as run 2's fouler-side bug: the mass is in the
+wrong branch, so no offset on `foul_type` or `FOUL_OFFENSE_SIDE_PROB` can reach it -- pushing
+shooting fouls up just produces more mis-classified ones.
+
+**This is why every volume dial is held.** The guard alone moves free throws 41.20 -> ~49.6 against
+a real 47.75, i.e. it *over*-corrects the deficit by ~1.8/game. An FTA dial written now would
+double-correct by about that much in the wrong direction. And free throws enter possessions at 0.44
+each, so the guard adds ~+1.4 to a pace bias that is already +1.52: `DELTA_TIME_SCALE` fits at
+**1.015** against run 2 as it stands (pace 102.20 vs 100.68), and that number is void the moment
+the guard lands. Pace is still run 3's knob, one run later than the previous section pencilled it.
+
+The guard also exposes the other half, a diagnostic rather than a dial: the sim emits a same-instant
+foul after a made basket **0.32/game against a real 5.00**. It over-produces false and-1s and
+under-produces true ones by 15x, so the guard's net effect depends on both. Measure it before
+fitting free throws again.
+
+Two smaller reads from the same pass, both held: the foul `result` token `op` is 2.70/game real and
+**0.00** in the sim (loose-ball fouls resolve somewhere else), though the FTs they generate match
+(1.25 vs 1.28), so it looks like a label mapping rather than a behaviour; and `timeout` runs
+7.08/game against 10.96 real, which matters because timeouts consume clock -- part of the pace
+excess is the missing timeout volume, and `DELTA_TIME_SCALE` would paper over it.
+
+### What is fitted
+
+Every value below is a log-ratio from the pooled play-by-play (2,000 sim games against the same 100
+real ones), kept only at >= 3 sigma. Shares are scale-free, so none of them is disturbed by the
+and-1 fix -- which is exactly why they can ship alongside it.
+
+| Dial | run 2 | run 3 | sigma | Why |
+|---|---|---|---|---|
+| `TYPE_BIAS.shot_type` | *(never dialled)* | 4 zones | 4.1-6.9 | the live-FG mix funnels threes to the top of the arc and twos to the paint |
+| `SHOT_RESULT_BIAS_BY_ZONE` | `{}` | 12 zones | 4.0-4.5 | first use ever; 2P% is exact, the whole rate error is 3pt and mid-range |
+| `TYPE_BIAS.rebound_type` | 3 tokens | 2 re-fitted | 3.7-7.2 | the TEAM tokens are still over, 13.44/game against 10.04 |
+
+**`shot_type`** (relative to `rim` = 0), from 364,770 sim and 17,619 real live attempts: `top3`
+-0.196 (share .1165 vs .1022), `paint` -0.173 (.2181 vs .1959), `wing3_r` +0.052, `wing3_l` +0.031.
+Held: `heave` fits at +1.566 and is 12.9 sigma, but its real share is .0047 -- a large offset on a
+near-zero-mass token is precisely v1.0's `loose ball` +1.2 mistake, and a heave is an end-of-period
+behaviour, not a calibration. Both corner threes and all seven mid-range zones are under 3 sigma
+and stay at 0.
+
+**`SHOT_RESULT_BIAS_BY_ZONE`** -- the hook this dial was added for. Decomposing `efg` -.0136 by
+holding one factor at a time: the mix error is worth +.0056 and the per-zone rate error +.0096.
+Pooled to the four physical groups, because the real side is only 100 games and fifteen separate
+make-rate fits would be noise:
+
+| group | sim att | sim FG% | real FG% | d logit | sigma | applied |
+|---|---|---|---|---|---|---|
+| rim | 104,661 | .6696 | .6638 | -0.026 | 0.9 | no |
+| paint | 79,561 | .4337 | .4389 | +0.021 | 0.6 | no |
+| mid (7 zones) | 41,318 | .4678 | .4216 | **-0.187** | 4.0 | yes |
+| three (5 zones) | 138,871 | .3490 | .3761 | **+0.117** | 4.5 | yes |
+| heave | 359 | .3398 | .1807 | -0.847 | 2.8 | no |
+
+Two-point efficiency is already right (55.0% sim against 54.8% real). The entire make-rate error is
+3P% 34.90 against 37.61, plus mid-range running 4.6pp too generous. `made` is still 0 in the global
+`SHOT_RESULT_BIAS` and stays there -- the correction is per-zone or it is nothing, which is what the
+previous section's "made fits at -0.022" was already saying. `blocked` -0.134 carries over
+unchanged: per-zone entries merge key-by-key on top of the global, so every zone keeps it.
+
+**`rebound_type`**: `team offensive` -1.617 -> **-1.963**, `team defensive` -1.653 -> **-1.872**
+(increments -0.346 / -0.219 on top of run 2's, since the shares were measured with run 2's dials
+live). `offensive` stays at -0.564 -- it fits at +0.003, 0.1 sigma, it landed exactly.
+
+Held at neutral **with the measurement**, on the same rule as the previous two packages:
+
+- **`turnover_type`.** `violation` is 1.5x under as a *share* (.1287 vs .1835, 7.9 sigma) and
+  fitting it would put +0.445 on the token. But that renormalises mass off `steal`, and box `stl`
+  is only +0.30 at **1.4 sigma** -- applying it trades a +0.30 error for about -0.34. The two
+  references also disagree on what a turnover is: the real play-by-play has 23.54 turnover events
+  plus 3.83 offensive fouls = 27.37/game where the real box says 25.94, so no single value satisfies
+  both. The box is what is scored, and box `tov` is +0.16 at 0.6 sigma. Nothing to win here.
+- **`EVENT_BIAS`.** `assist` now lands *exactly* on the open-play mix (share .17389 sim against
+  .17390 real) with -0.087 applied -- leave it. `turnover` +0.083 and `foul` +0.032 would both
+  break box numbers that are already inside a sigma (`tov` +0.16, `pf` +0.05).
+- **`SHOT_RESULT_BIAS.blocked`.** Box `blk` +0.46 is 3.1 sigma, but as a share of live attempts it
+  is .0571 against .0539 -- 1.7 sigma, and the FGA excess it rides on is +3.5%. Fix the denominator
+  first.
+- **`foul_type`, `FOUL_OFFENSE_SIDE_PROB`.** The run 2 solve still reproduces every token
+  (`shooting 2pt` 19.26 vs 20.49, `personal` 12.36 vs 10.60, `offensive` 3.84 vs 3.83, total 40.90
+  vs 40.79) and it was fitted jointly. The and-1 guard changes what a shooting foul *costs*, not how
+  often one is called, so this refits after the guard or not at all.
+- **`PLAYER_TEMPERATURE` 2.0, `SUB_INCOMING_TEMPERATURE` 1.0.** See the probe below.
+
+## `v2-run3-pt17.json` -- the rotation probe, and why minutes MAE must not judge it
+
+Identical to `v2-run3.json` except `PLAYER_TEMPERATURE` 1.7, the value sec 4.2 pencilled in. Run it
+as an A/B against `v2-run3.json` on the same games and the same `--seed`.
+
+Run 2 compresses the rotation harder than v1.0 did. Starters (36+ actual minutes) are predicted at
+32.8 against 38.8, bias **-5.98** against v1.0's -4.96; the deep bench (0-8 actual) at 12.4 against
+4.4, **+8.01** against +6.28. sd of predicted minutes is 8.86 against a real 10.98 (v1.0: 9.96).
+
+The trap: a cross-validated monotone recalibration of predicted minutes -- map predicted to expected
+actual on four folds, rescale each player's counting stats by the ratio, score the fifth -- makes
+every number **worse**. Minutes MAE +2.6%, pts MAE +1.0%, minutes RMSE +0.5%. MAE and RMSE under
+uncertainty are minimised by shrinking toward the middle, so the compression is already at the
+error-minimising point and un-flattening the rotation *costs* box-score MAE by construction.
+
+Which means the previous section's reason for holding `SUB_INCOMING_TEMPERATURE` at neutral --
+"neutral beat v1.0's sharpened 0.45 on player-minutes MAE, 5.552 vs 5.664" -- was decided on a
+metric that structurally prefers the flatter rotation. That is not evidence the `sub_decision` head
+learned the rotation; it is evidence MAE likes compression. Judge this probe on win/spread and on a
+proper scoring rule (CRPS / pinball over the sim's own minutes distribution, which the run already
+stores as `player_std`), and expect minutes MAE to get *worse* if it is working.
+
+The reason to care is the margin. Correcting for Monte-Carlo noise with the within-game margin sd
+(17.60 at 20 sims = 3.94 on the mean), run 2's spread corr of 0.375 is 0.420 of signal against
+0.483 for v1.0 `full4-s100` -- much closer than the raw numbers, and inside the noise at n=100. But
+decomposing it says the deficit is not knowledge:
+
+| | v1.0 full4 | v2 run 2 | real |
+|---|---|---|---|
+| corr(pred team pts, actual), home / away | 0.313 / 0.204 | **0.391 / 0.297** | -- |
+| corr(pred game total, actual total) | 0.170 | **0.323** | -- |
+| corr(ORtg differential) | 0.452 | 0.432 | -- |
+| corr(pred home pts, pred away pts) | +0.450 | **+0.120** | +0.342 |
+| corr(pred home poss, pred away poss) | +0.958 | +0.932 | +0.883 |
+| corr(pred home eFG, pred away eFG) | -0.086 | -0.154 | +0.162 |
+
+2.0 is better at every level except the margin. v1.0 *over*-coupled the two teams' scores, so shared
+game-level error cancelled out of the difference and flattered its margins; 2.0 is under-coupled, so
+per-side error survives the subtraction. Possessions are still coupled correctly -- it is efficiency
+that has come apart. That is the thing to chase after the rotation, and it is structural, not a dial.

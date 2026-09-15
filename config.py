@@ -564,7 +564,31 @@ MASK_PERIOD_BREAK_TIME = True
 # games, and predict them EVAL_BATCH at a time (pausing between batches). Full-train weights go to
 # their own root so the curriculum's ./artifacts is never clobbered.
 FINAL_SEASON_FRACTION = 0.5
-FINAL_HOLDOUT_GAMES = 100
+# Raised 100 -> 300 after v2-run2. 100 games cannot resolve a dial change on the win/spread
+# metrics, which is the only reason those metrics kept reading as flat across v1.0 full1..full4
+# and v2-run1..run2. Paired over the same 100 game ids, run 2 vs v1.0 full4-s100 came in at
+# Brier +0.0128 (SE 0.0140), score-view Brier +0.0029 (SE 0.0133), |margin error| +0.48 (SE
+# 0.58) -- every comparison inside one sigma. The per-game paired Brier sd is 0.133, so 80%
+# power at two-sided 5% needs ~350 games to see a 0.02 Brier move and ~1,400 to see 0.01. 300
+# puts a 0.02 move (about half the whole span from an always-pick-home baseline at 0.245 to a
+# sportsbook at ~0.20) just inside reach; the box-score biases were always resolvable, since
+# they are scored over 200 team-games and 2,071 player-games rather than 100 win/loss bits.
+#
+# For metric RESOLUTION more games beats more sims: the paired SE falls as 1/sqrt(games) while
+# sims only remove the per-game Monte-Carlo term (which at 20 sims inflates the sim-count Brier
+# by ~0.010 and attenuates spread corr from a signal 0.420 down to 0.375). Both matter, so the
+# recommended shape is 300 games x --monte-carlo 50: expected spread corr ~0.400, Brier MC
+# inflation ~0.004, paired Brier SE ~0.008. That is 15,000 sims against run 2's 2,000 and v1.0
+# full4-s100's 10,000. STAGE_SIMS deliberately STAYS at 21 -- it feeds EVAL_POOL_JOBS, whose
+# comment explains why a high default there is a RAM trap; pass the sim count on the CLI.
+#
+# The window only ever extends FORWARD from the stored boundary_idx, so the train/holdout cut
+# cannot move and the first 100 ids stay the first 100 -- v2-run1 and v2-run2 remain directly
+# comparable, and their own results/<run>/holdout.json pins keep them at 100 games regardless.
+# Room to grow: the corpus holds 26,969 games against a boundary at 26,267, so 702 are available.
+# On an ALREADY-TRAINED model this constant is not read again (full_run.setup consumes it, and
+# re-running setup would reset status/trained_models) -- use `python train.py --extend-holdout`.
+FINAL_HOLDOUT_GAMES = 300
 EVAL_BATCH = 10
 # Models live one-per-dir under ./artifacts/<name>/ (see models.artifacts.model_root).
 # Names are free-form slugs -- "v1.0", "endgame-feats" -- and a name IS the train identity:
