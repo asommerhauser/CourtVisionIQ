@@ -383,15 +383,21 @@ Lower `--concurrency` (48 default → ~24 per child) if you crowd VRAM; each chi
 `CVIQ_TF_INFER=1` is the opt-in compiled-inference path — measure it on the rented card before
 trusting it.
 
-**Anything over ~30 games needs a harvester running beside it** (its own `nohup`, or a second
-SSH session), or the volume fills mid-run:
+**Play-by-play costs ~0.12 MB per game-sim**, so a run needs roughly `games x sims x 0.12 MB`
+of disk: 100 games x 20 sims is ~240 MB, 100 games x 100 sims is ~1.2 GB (the measured size of
+`full4-s100`). Sims drive this as hard as games do, so check `df -h` against that product
+before a long run. Most runs need nothing. When the figure is a real fraction of the free
+space, run a harvester beside the pool (its own `nohup`, or a second SSH session) and the disk
+stays flat instead of filling mid-run:
 
 ```bash
 python harvest.py --run results/v1.0/full1 --out /workspace/archive --loop 60 --keep 2
 ```
 
 It only touches games that have finished, so it is safe beside a live pool — see
-[Long runs](#long-runs--harvestpy).
+[Long runs](#long-runs--harvestpy). It also DELETES the pbp it archives (`--keep N` spares the
+N newest), so skip it when the run fits comfortably: per-game play-by-play is what you read a
+first run's event mix and foul types out of, and the report never needs it either way.
 
 ### 6. Pull the results back down, then terminate
 
