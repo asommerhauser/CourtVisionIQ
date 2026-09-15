@@ -1,0 +1,39 @@
+{
+  "DELTA_TIME_SCALE": 1.0,
+  "EVENT_BIAS": {
+    "assist": -0.087
+  },
+  "EVENT_TEMPERATURE": 1.0,
+  "FOUL_OFFENSE_SIDE_PROB": 0.1286,
+  "FOUL_OUT_LIMIT": 6,
+  "HOME_COURT_SHOT_BIAS": 0.055,
+  "MAX_DELTA": 60.0,
+  "PLAYER_TEMPERATURE": 2.0,
+  "RESULT_TEMPERATURE": 1.0,
+  "SHOT_RESULT_BIAS": {
+    "blocked": -0.134
+  },
+  "SHOT_RESULT_BIAS_BY_ZONE": {},
+  "SUB_INCOMING_TEMPERATURE": 1.0,
+  "SUB_MAX_GAP_SECONDS": 600.0,
+  "SUB_TEMPERATURE": 1.0,
+  "TYPE_BIAS": {
+    "assist_type": {},
+    "foul_type": {
+      "flagrant-1": -1.491,
+      "flagrant-2": -1.912,
+      "loose ball": -0.761,
+      "offensive": -0.386,
+      "shooting 2pt": 0.268,
+      "shooting 3pt": 0.774,
+      "technical": -1.188
+    },
+    "rebound_type": {
+      "offensive": -0.564,
+      "team defensive": -1.653,
+      "team offensive": -1.617
+    },
+    "turnover_type": {}
+  },
+  "TYPE_TEMPERATURE": 1.0
+}

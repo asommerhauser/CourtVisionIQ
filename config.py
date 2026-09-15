@@ -74,7 +74,12 @@ EVENT_TEMPERATURE = 1.0    # next-event head (shot / foul / turnover / … mix)
 # Pace scales ~inversely with seconds/event, so 1.06 x (92.1/100.7) ≈ 0.97 targets real pace as a
 # first cut without a retrain. Re-confirm against sim vs real Δt with `simulation.diagnostics` and
 # set precisely = real_Δt_mean/sim_Δt_mean. (Secondary pace lever if this still lags: MAX_DELTA.)
-DELTA_TIME_SCALE = 0.97
+# v2-run1: pace ran 102.57 vs 100.58 real (+2.0), which would fit at 1.0198 -- HELD AT NEUTRAL
+# ANYWAY. Pace is FGA-driven and run 1 was missing 40% of its free throws (the fouler-side bug,
+# see FOUL_OFFENSE_SIDE_PROB), so possessions were counted under a regime that no longer exists
+# and that +2.0 is not a clean fit. Fixing pace and the foul path in the same run would also make
+# neither readable. This is run 3's first knob, once run 2 re-measures pace honestly.
+DELTA_TIME_SCALE = 1.0
 SUB_TEMPERATURE = 1.0      # outgoing substitution pick (legacy path) / generic sub sampling
 # Incoming-sub pick temperature. The substitution head emits over the *player* vocab, so — like
 # the actor head — its small, real preferences (which bench player actually checks in) should
@@ -83,7 +88,10 @@ SUB_TEMPERATURE = 1.0      # outgoing substitution pick (legacy path) / generic 
 # than the actor head by default since a coach's bench order is more concentrated than shot usage.
 # Lowered from 0.7: the stage eval over-played the deep bench (rank 15+ by +4..+14 min) and
 # under-played starters (~9 min); sharpening concentrates check-ins on the real 8–9 man rotation.
-SUB_INCOMING_TEMPERATURE = 0.45
+# 0.45 was fit to deep-bench over-play under the STINT SCHEDULER, which workstream 11 deleted.
+# v2-run1 ran this neutral and player-minutes MAE came in at 5.552 against v1.0's 5.664 with the
+# sharpening on, so the sub_decision head does not need it. Stays neutral.
+SUB_INCOMING_TEMPERATURE = 1.0
 TYPE_TEMPERATURE = 1.0     # shot_type / assist_type / turnover_type / foul_type / rebound_type
 RESULT_TEMPERATURE = 1.0   # shot_result (made / missed / blocked)
 # Per-outcome logit offset applied to the live-shot result sample (made / missed / blocked) via the
@@ -95,7 +103,13 @@ RESULT_TEMPERATURE = 1.0   # shot_result (made / missed / blocked)
 # RE-MEASURE after any retrain of shot_result — a modern-heavier train should need less of this.
 # v1.0 full1 (100-game holdout, this bias already applied): eFG% still -2.17% / FGM -1.04 vs real
 # -- the +0.27 correction closed most but not all of the original make-rate gap. Bumped further.
-SHOT_RESULT_BIAS: dict[str, float] = {"made": 0.40, "blocked": -0.15}
+# 2.0 REFIT (v2-run1): made fits at -0.022, i.e. ZERO. This is the single clearest sign the
+# workstreams reached the weights -- v1.0 needed +0.40 here and the refit needs nothing, so the
+# make-rate defect this dial existed to paper over is fixed at the source rather than dialled
+# around. eFG bias went -0.017 -> -0.008 with the dial OFF. Left at 0 rather than at -0.022:
+# that is noise, and points are still short until the free throws come back.
+# `blocked` does need it -- 11.00 blocks/game vs 9.55 real, fitted from the 3-way live-shot table.
+SHOT_RESULT_BIAS: dict[str, float] = {"blocked": -0.134}
 # Per-ZONE override of the above, keyed zone then outcome, e.g. {"rim": {"made": 0.1}}. Merged on
 # top of SHOT_RESULT_BIAS for the zone actually sampled, so an absent zone just gets the global.
 # Default {} = global only, which is what v1.0 had to live with: the fitted per-type ideal was
@@ -114,7 +128,17 @@ SHOT_RESULT_BIAS_BY_ZONE: dict[str, dict[str, float]] = {}
 # +1.44 but total fouls overshot the other way -- PF flipped from +0.41 to -0.71 (team level).
 # Restoring some volume here; foul_type.shooting is cut further below to keep FTA falling without
 # re-inflating PF.
-EVENT_BIAS: dict[str, float] = {"foul": 0.11, "turnover": -0.08}
+# 2.0 REFIT (v2-run1), from the open-play mix (shot / assist / turnover / foul per game, FTs and
+# rebounds excluded since neither comes from this head):
+#   assist    54.34 sim vs 48.55 real  -> -0.087, applied.
+#   foul      44.42 sim vs 41.05 real  -> would fit at -0.053, NOT applied. The foul-type refit
+#             already takes the total to 40.93 on its own (technicals 4.63 -> 1.05 is most of it),
+#             so applying this too would double-correct -- the same trap the run 1 package was
+#             designed to avoid.
+#   turnover  22.04 sim vs 22.80 real  -> would fit at +0.060, NOT applied. Box turnovers count
+#             offensive fouls, and once those land at 3.82/game the box number is 12.93 against
+#             12.92 real. The event count is mildly under; the number that matters is exact.
+EVENT_BIAS: dict[str, float] = {"assist": -0.087}
 # Per-head per-token logit offset on the conditional type heads (GameSimulator.predict_type),
 # keyed by head then token, e.g. {"turnover_type": {"steal": -0.2}} to pull steal-type turnovers
 # down without moving the overall turnover rate. Default {} = raw model. Fit to v1.0 trial1:
@@ -125,30 +149,58 @@ EVENT_BIAS: dict[str, float] = {"foul": 0.11, "turnover": -0.08}
 #   turnover_type — steal share slightly high (56.8% vs 54.8% of TOs).
 #   assist_type  — assisted-3 share 38.5% vs 41.0% (drives the residual TPM gap).
 #   rebound_type — offensive share of rebounds 23.4% vs 27.3%.
-# v1.0 full1 (all values below already applied): FTA over-produced +3.845 (16% high) -- "loose
-# ball" is named directly as a likely culprit (a very large offset on a near-zero-mass token);
-# roughly halved rather than zeroed, since the original trial1 gap it corrected was real. OREB% is
-# now over +2.48% (was under at trial1, hence the original +0.20) -- halved since it's overshooting.
-# v1.0 full2 (all values below already applied): FTA still over +1.44 (team level) even with PF now
-# under -0.71 -- cut shooting-foul share further so FTA keeps falling as EVENT_BIAS.foul is restored
-# above. OREB landed close (+0.46) while DREB is still over (+1.17); bumped the offensive split back
-# up a touch to protect OREB's share while the deadball-rebound dial (since removed) pulled volume,
-# mostly from DREB, on the next pass. "loose ball" left untouched to isolate its effect this round.
+# ------------------------------------------------------------------------------------------------
+# 2.0 REFIT, from v2-run1 (the first 2.0 eval, every dial at neutral -- that was the point of it).
+# Every v1.0 note above is history now; the live values below are fitted against 2.0's heads.
+# Method: pool the sim play-by-play (20 games x 5 sims) and the real 2023 cleaned season, and take
+# log(real_share / sim_share) per token, shifted so the modal token sits at 0.
+#
+#   foul_type    -- NOT a plain log-ratio, because the head is masked per side and the two masks
+#                   overlap on only four tokens. Solved jointly with FOUL_OFFENSE_SIDE_PROB as a
+#                   two-sided masked multinomial (least squares on the per-token shares). That
+#                   coupling is the whole point: `offensive` ran 13.34/game vs 3.82 real, but
+#                   almost all of that excess was the side draw, not the head -- fitting the
+#                   marginal alone would have put ~-1.25 on it and double-corrected hard once the
+#                   side was fixed. The joint solve puts -0.386 on it. It reproduces every token:
+#                   shooting 2pt 20.23/game (real 20.23), personal 11.53 (11.53), offensive 3.82
+#                   (3.82), loose ball 2.41 (2.41), technical 1.05 (1.05), total 40.93 (40.99).
+#                   `shooting 3pt` at +0.774 is the one value to watch -- a large offset on a
+#                   small-mass token is the exact shape of v1.0's `loose ball` +1.2 mistake -- but
+#                   it is worth only ~2 FTA if it overshoots, against the ~21 being recovered.
+#   rebound_type -- a clean log-ratio: all four tokens are always allowed and the head is sampled
+#                   with next_player=None, so no mask distorts it. The two TEAM tokens workstream
+#                   7 added are over-produced 3.2x (31.7/game vs 9.25 real). A team rebound
+#                   credits no player, so it leaves the box score entirely -- that is the whole of
+#                   dreb -10.45/team, and it is also why oreb_pct read .345 vs .242: the
+#                   denominator collapsed, not the numerator. Rebound EVENTS were already right
+#                   (97.4/game vs 98.35), which is what kept this invisible until the split was
+#                   counted directly. Another one that no test would have found.
+#
+# Left at {} deliberately, with the measurement, so run 2 stays readable:
+#   turnover_type -- steal lands exactly (14.53/game vs 14.52) and steals are what the box score
+#                    measures. error/violation are under (4.57/2.94 vs 5.40/4.26) and would fit at
+#                    +0.167/+0.371, but applying them renormalizes mass OFF steal and breaks the
+#                    one number here that is already right.
+#   assist_type   -- mid-range zones are mildly inflated (mid_base_r 1.37/game vs 0.40), but eFG
+#                    is -0.008 and tpa/tpm are the best they have ever been (+0.60 / -0.30, from
+#                    +2.31 / -0.60 in v1.0). Do not tune what 2.0 just fixed.
+# ------------------------------------------------------------------------------------------------
 TYPE_BIAS: dict[str, dict[str, float]] = {
-    # "shooting" split into two tokens in 2.0; the fitted +0.15 is carried onto both so the
-    # shooting-foul family keeps the same aggregate nudge relative to the other foul types.
-    # The 2pt/3pt split between them is the head's to learn, so neither is biased toward the
-    # other. Re-fit from zero after the train like everything else here.
-    "foul_type": {"shooting 2pt": 0.15, "shooting 3pt": 0.15,
-                  "personal": -0.45, "offensive": -0.30,
-                  "loose ball": 1.2, "technical": 1.5},
-    "turnover_type": {"steal": -0.12},
+    # Relative to "personal" = 0. Read together with FOUL_OFFENSE_SIDE_PROB -- they were solved
+    # as one system and neither is meaningful on its own. "personal take" / "transition take" /
+    # "away from play" were left free at 0 and land within 0.03/game of real anyway.
+    "foul_type": {"shooting 2pt": 0.268, "shooting 3pt": 0.774,
+                  "offensive": -0.386, "loose ball": -0.761,
+                  "technical": -1.188, "flagrant-1": -1.491, "flagrant-2": -1.912},
+    "turnover_type": {},
     # assist_type was {"3pt": 0.10}. That key can no longer match anything -- assist rows now
     # carry a zone token, not the 2pt/3pt binary -- so it is removed rather than left as config
     # that silently does nothing. Re-key per zone when the dials are fitted from zero after the
     # 2.0 train (the mechanism needs no change: TYPE_BIAS is already head -> token).
     "assist_type": {},
-    "rebound_type": {"offensive": 0.13},
+    # Relative to "defensive" = 0, the token the head under-produces (.433 of rebounds vs .684).
+    "rebound_type": {"offensive": -0.564,
+                     "team offensive": -1.617, "team defensive": -1.653},
 }
 # Home-court edge. The rollout is otherwise home/away symmetric (HOME just inbounds first), so the
 # sim can't separate winners and win-pick accuracy sits near a coin flip. This adds a logit nudge to
