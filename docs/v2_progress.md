@@ -158,11 +158,21 @@ is pytest plus TF-free measurement until the 2.0 train.
 > `oreb_pct` ~.24. If those land and win/spread do *not* move, the remaining gap is the rotation
 > and the margin correlation rather than the box score.
 >
-> **Run 2 must use 100 sims, not 20.** Run 1 used 20 against full4-s100's 100, and the predicted
-> margin is a mean over sims, so its sampling error is sqrt(5) larger — a meaningful part of
-> spread corr 0.299 vs 0.468 (roughly 0.39 equivalent). The sim count has to match before that
-> comparison means anything, and it is also the one thing that would make run 2 not comparable to
-> run 1.
+> **Sim count: run 2 stays at 20, and the 100-sim run waits.** Run 1 used 20 against
+> full4-s100's 100. A predicted margin is a mean over sims, so run 1's sampling error is sqrt(5)
+> larger, and that is a real part of spread corr 0.299 vs 0.468 — roughly 0.39 equivalent, not
+> 0.30. **Do not read run 1's win/spread numbers against v1.0's as like-for-like.**
+>
+> The fix is not to raise run 2, though. Run 1 took 8h13m for 100 games x 20 sims, so 100 sims is
+> ~41h, and the box-score biases run 2 exists to check — fta, dreb, tov, pts — converge long
+> before 20 sims. A -10.68 FTA bias is not noise. Holding 20 also makes run 2 a controlled A/B
+> against run 1: same games, same seed, same sim count, one set of changes.
+>
+> **The 100-sim run is what the v1.0 comparison needs, and it belongs after the box score is
+> settled** — at that point win, spread and the margin correlation are the only things left to
+> read, and they are exactly the metrics that need the sims. Budget ~41h for it and run the
+> harvester beside it (100 games x 100 sims is ~1.2 GB of play-by-play; `full3-s100` died on a pod
+> disk quota at 32/100 without one).
 
 
 **Workstream 11 is complete. Phases 1 and 2, Gate B, all of §9 and all of §8 are merged into
