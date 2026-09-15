@@ -576,25 +576,45 @@ class GameController:
     def _do_foul(self, delta: float, *, rebounding: bool = False) -> None:
         """Foul: derive result from foul type (data_cleaner.py:137) + NBA bonus, expand FTs.
 
-        Order is fouler → side → type: the fouler is sampled from all ten, his side resolved off
-        the full-roster team map, and only then is the foul-type head masked — to that side's
-        legal types, intersected with the rebounding mask when a missed shot is in the air. A
-        foul drawn during a rebound is masked to common (non-shooting) types. A shooting foul is
-        handled specially for free-throw *count*: a 3pt shooting foul is 3 FTs, a 2pt is 2, and a
-        foul on a basket that just went in is an **and-1** (the basket counts, plus 1 FT).
-        ``delta`` enters as the marginal Δt and is reassigned to the authoritative Δt after the
-        fouler is chosen.
+        Order is side → fouler → type, the same order :meth:`_do_rebound` already uses: the side
+        is drawn first, the fouler sampled from *that side's five*, and only then is the foul-type
+        head masked — to that side's legal types, intersected with the rebounding mask when a
+        missed shot is in the air. A foul drawn during a rebound is masked to common
+        (non-shooting) types. A shooting foul is handled specially for free-throw *count*: a 3pt
+        shooting foul is 3 FTs, a 2pt is 2, and a foul on a basket that just went in is an
+        **and-1** (the basket counts, plus 1 FT). ``delta`` enters as the marginal Δt and is
+        reassigned to the authoritative Δt after the fouler is chosen.
+
+        The side used to be a *consequence* of the pick — sample from all ten, then look up whose
+        team he is on. That is what run 1 measured as the single largest defect in the 2.0 eval.
+        The player head has no notion of offense/defense and PLAYER_TEMPERATURE=2.0 flattens what
+        little it has, so the pick came out ~50/50 by side against a real ~13%. Half of every
+        foul was then force-typed into OFFENSIVE_SIDE_FOUL_TYPES, where `shooting 2pt` is not
+        even legal, and three of the four worst numbers in the run 1 report followed from it:
+        shooting fouls exactly halved (20.23 -> 10.11/game) so FTA came in -10.7/team, offensive
+        fouls tripled (3.82 -> 13.34/game) which IS the entire tov +4.50/team since box turnovers
+        count them, and the missing 8.3 FTM/team is most of pts -6.55. FT% itself was already
+        exact (77.6% vs 77.6%) and PF read fine (-0.31) only because box PF excludes technicals,
+        which is how the excess stayed hidden. No TYPE_BIAS can reach this: the mass is on the
+        wrong side of the mask, so suppressing `offensive` only spills it into `loose ball`.
         """
-        fouler = self.sim.predict_player("foul", self._all_ten(),
+        # Draw the side first, from the one thing the model cannot supply. Sampling the player
+        # from a five rather than from ten is what pins the rate; the head still chooses WHO
+        # within that five, which is the part it is actually good at.
+        # ``greedy`` takes the modal side rather than drawing one, so the deterministic path stays
+        # deterministic the way every other head's greedy branch is (argmax, not a seeded sample).
+        foul_offense = self._foul_offense()
+        p_off = config.FOUL_OFFENSE_SIDE_PROB
+        on_defense = p_off < 0.5 if self.greedy else self.rng.random() >= p_off
+        fouler_team = self._other(foul_offense) if on_defense else foul_offense
+        fouler = self.sim.predict_player("foul", self._five_of(fouler_team),
                                          delta_seconds=delta, greedy=self.greedy,
                                          temperature=self.player_temp)
         delta = self._advance_for("foul", fouler, delta)
 
-        # Resolve the side BEFORE typing the foul, then mask the head to what that side can
-        # commit. Typing first and asking about the side afterwards is what let an offensive
-        # player's foul resolve as a defensive one (and vice versa).
-        fouler_team = self._team_of(fouler)
-        on_defense = fouler_team == self._other(self._foul_offense())
+        # `fouler_team` and `on_defense` are now the inputs to the pick rather than a lookup
+        # after it, so the side the head was masked to and the side the outcome resolves for
+        # cannot disagree — they are the same draw.
         side_types = DEFENSIVE_SIDE_FOUL_TYPES if on_defense else OFFENSIVE_SIDE_FOUL_TYPES
         base_types = REBOUNDING_FOUL_TYPES if rebounding else FOUL_TYPES
         allowed_types = [t for t in base_types if t in side_types]

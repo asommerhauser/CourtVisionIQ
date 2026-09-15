@@ -166,6 +166,25 @@ TYPE_BIAS: dict[str, dict[str, float]] = {
 # of that swing is noise. Split the difference via linear interpolation between the two known
 # (dial, bias) points, targeting bias ~0.
 HOME_COURT_SHOT_BIAS = 0.055
+# Probability that the player who commits a foul is on the OFFENSE (GameController._do_foul).
+# Like HOME_COURT_SHOT_BIAS, this supplies information the model structurally lacks rather than
+# calibrating something it knows: the player head is conditioned on the sequence, not on which
+# side has the ball, so asked for a fouler out of all ten it splits ~50/50 by side — and
+# PLAYER_TEMPERATURE=2.0 flattens away whatever weak signal it does carry. The controller now
+# draws the side from this dial FIRST and samples the fouler from that side's five, so the head
+# still decides who fouls while the rate is pinned here.
+#
+# 0.1286 is a joint least-squares solve of the two-sided masked foul-type multinomial (this dial
+# plus TYPE_BIAS["foul_type"]) against the real 2023 per-game marginals, fitted to v2-run1. It
+# agrees with an independent read of the same file: offensive fouls are offense-side by
+# definition (3.82/game) and roughly half of loose-ball + technical + flagrant are
+# (~1.8/game), i.e. ~13.7% of 40.99 fouls/game.
+#
+# RE-MEASURE after any retrain of the player head, and note the two are coupled — a lower
+# PLAYER_TEMPERATURE lets more of the head's own (weak) side preference through, which would
+# show up here as an over-correction. Run 1 held PLAYER_TEMPERATURE at 2.0 deliberately, so this
+# fit is against that value.
+FOUL_OFFENSE_SIDE_PROB = 0.1286
 # SUB_FATIGUE_WEIGHT is GONE (2.0, workstream 11). It was a logit bonus per second of a player's
 # on-court stint, nudging the outgoing pick toward whoever had been on longest -- a hand-written
 # stand-in for exactly what the roster encoder now sees directly, since every head reads stint
@@ -263,7 +282,7 @@ _TUNING_KEYS = (
     "PLAYER_TEMPERATURE", "EVENT_TEMPERATURE", "TYPE_TEMPERATURE", "RESULT_TEMPERATURE",
     "SUB_TEMPERATURE", "SUB_INCOMING_TEMPERATURE", "SUB_MAX_GAP_SECONDS", "FOUL_OUT_LIMIT",
     "SHOT_RESULT_BIAS", "SHOT_RESULT_BIAS_BY_ZONE", "EVENT_BIAS", "TYPE_BIAS",
-    "HOME_COURT_SHOT_BIAS",
+    "HOME_COURT_SHOT_BIAS", "FOUL_OFFENSE_SIDE_PROB",
 )
 
 
