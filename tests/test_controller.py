@@ -118,9 +118,12 @@ class FakeSim:
         return row
 
 
-def make_controller(possession=HOME):
+def make_controller(possession=HOME, *, condtime=False):
+    """``condtime`` opts into the conditional time head, so ``predict_delta`` (and its scripted
+    ``delta`` queue) is what the controller asks for a play's gap -- the and-1 probe reads it."""
     ctrl = GameController(FakeSim(), seed=0)
     ctrl.possession = possession
+    ctrl.use_condtime = condtime
     return ctrl
 
 
@@ -270,7 +273,7 @@ def test_shooting_foul_on_3pt_yields_three_free_throws():
 
 def test_and_one_keeps_basket_and_adds_one_free_throw():
     # The time head says "no gap" for this foul (delta 0.0) -> P(and-1) = 1: this foul IS the and-1.
-    ctrl = make_controller(AWAY)            # made FG already flipped possession to AWAY
+    ctrl = make_controller(AWAY, condtime=True)   # made FG already flipped possession to AWAY
     ctrl.sim.append_event("shot", "A", "paint", "made", time=0)   # A (home) just scored
     ctrl.score[HOME] = 2                     # the basket counted
     # An away player fouls on the made basket → and-1: A shoots a single FT.
@@ -288,7 +291,7 @@ def test_a_foul_after_a_basket_is_an_ordinary_foul_when_the_head_says_a_long_gap
     """The other 66%: the head's gap is at or past the scale -> P(and-1) = 0. The ball changed
     hands, so it is a foul on the NEW possession -- re-drawn from that possession's side and
     paid at the token's count -- and its gap is floored at the later-foul scale."""
-    ctrl = make_controller(AWAY)            # the made FG flipped possession to AWAY
+    ctrl = make_controller(AWAY, condtime=True)   # the made FG flipped possession to AWAY
     ctrl.sim.append_event("shot", "A", "paint", "made", time=0)
     ctrl.score[HOME] = 2
     # Probe: F (away, the defender on the old possession) with a 20s gap -> not on the shot.
@@ -309,7 +312,7 @@ def test_a_foul_after_a_basket_is_an_ordinary_foul_when_the_head_says_a_long_gap
 def test_an_and_one_sits_at_the_baskets_clock():
     """No time elapses between the basket and the whistle: the foul row carries the shot's clock.
     The head is asked once (the probe) and its answer is the branch, not a clock advance."""
-    ctrl = make_controller(AWAY)
+    ctrl = make_controller(AWAY, condtime=True)
     ctrl.clock = 100.0
     ctrl.sim.append_event("shot", "A", "paint", "made", time=100.0)
     ctrl.sim.script(player=["G"], type=[SHOOTING_2PT], result=["made"], delta=[0.0])
@@ -342,6 +345,7 @@ def test_greedy_takes_the_modal_and_one_branch():
     scale = config.AND_ONE_GAP_SCALE
     ctrl = GameController(FakeSim(), seed=0, greedy=True)
     ctrl.possession = AWAY
+    ctrl.use_condtime = True
     ctrl.sim.append_event("shot", "A", "paint", "made", time=0)
     ctrl.sim.script(player=["F", "B", "G"], type=[SHOOTING_2PT], result=["made", "made"],
                     delta=[scale * 0.8, 12.0])           # p = 0.2 -> the ordinary foul
@@ -350,6 +354,7 @@ def test_greedy_takes_the_modal_and_one_branch():
 
     ctrl = GameController(FakeSim(), seed=0, greedy=True)
     ctrl.possession = AWAY
+    ctrl.use_condtime = True
     ctrl.sim.append_event("shot", "A", "paint", "made", time=0)
     ctrl.sim.script(player=["G"], type=[SHOOTING_2PT], result=["made"],
                     delta=[scale * 0.2])                 # p = 0.8 -> the and-1
@@ -509,7 +514,7 @@ def test_foul_by_a_subbed_off_player_still_resolves_to_his_own_team():
 
 def test_and_one_survives_the_possession_flip_on_the_made_basket():
     """A made FG flips possession, so the and-1 foul must not read as an offensive-side foul."""
-    ctrl = make_controller(AWAY)                 # made FG already flipped possession to AWAY
+    ctrl = make_controller(AWAY, condtime=True)  # made FG already flipped possession to AWAY
     ctrl.sim.append_event("shot", "A", "paint", "made", time=0)   # A (home) just scored
     ctrl.sim.script(player=["G"], type=[SHOOTING_2PT], result=["made"], delta=[0.0])
     ctrl._do_foul(delta=5.0)
@@ -761,7 +766,7 @@ def test_a_shooting_foul_names_the_fouled_shooter():
 
 
 def test_an_and_one_names_the_scorer_as_the_fouled_player():
-    ctrl = make_controller(AWAY)                 # made FG already flipped possession
+    ctrl = make_controller(AWAY, condtime=True)  # made FG already flipped possession
     ctrl.sim.append_event("shot", "A", "paint", "made", time=0)
     ctrl.score[HOME] = 2
     ctrl.sim.script(player=["G"], type=[SHOOTING_2PT], result=["made"], delta=[0.0])
@@ -840,7 +845,7 @@ def test_a_shooting_foul_never_samples_the_shot_type_head():
 
 def test_an_and_one_is_one_free_throw_whatever_the_token_says():
     """The made basket already counted, so the and-1 branch overrides the token's count."""
-    ctrl = make_controller(AWAY)                 # made FG already flipped possession
+    ctrl = make_controller(AWAY, condtime=True)  # made FG already flipped possession
     ctrl.sim.append_event("shot", "A", "top3", "made", time=0)
     ctrl.score[HOME] = 3
     ctrl.sim.script(player=["G"], type=[SHOOTING_3PT], result=["made"], delta=[0.0])
