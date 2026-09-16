@@ -237,18 +237,25 @@ HOME_COURT_SHOT_BIAS = 0.055
 # show up here as an over-correction. Run 1 held PLAYER_TEMPERATURE at 2.0 deliberately, so this
 # fit is against that value.
 FOUL_OFFENSE_SIDE_PROB = 0.1286
-# P(and-1 | the event head samples a foul as the very next row after a made field goal). The
-# controller draws this BEFORE the side and the type: an and-1 is a defensive shooting foul at the
-# basket's clock with the scorer shooting one; a miss is an ordinary foul on the NEXT possession.
+# The and-1 read off the conditional time head. For a foul sampled as the very next row after a
+# made field goal, the controller asks the head for its gap and takes P(and-1) = 1 - gap / SCALE,
+# clipped to [0, 1], BEFORE the side and the type are drawn: a hit is a defensive shooting foul at
+# the basket's clock with the scorer shooting one; a miss is an ordinary foul on the NEXT
+# possession with its gap floored at SCALE (the long branch of the mixture).
 #
-# 0.338 is the real 2023 rate, 5.24 and-1s out of 15.50 fouls-after-a-basket per game over 1320
-# games; the 64 v2-run3 holdout games read 0.337. Pinned here for the same reason the fouler's
-# side is: the conditional time head regresses ONE mean gap, so it cannot put a spike at 0s next
-# to a hump at ~10s, and runs 2-3 measured the consequence at 0.29 and-1s/game against 5.24 with
-# 8.4 fouls/game paid at one free throw instead of two (88% of the FTA deficit). See
-# dials/README.md, `v2-run4.json`. RE-MEASURE the sim's fouls-after-a-basket count (17.4/game vs
-# 15.5 real in run 3, an event-head property) -- the and-1 COUNT is this rate times that.
-AND_ONE_PROB = 0.338
+# Why a gap, not a rate: the real gap after a basket is 0 on an and-1 (35% of these fouls, 2023)
+# and ~13s otherwise, and the head regresses the MEAN -- so its output is (1 - p) * later_gap and
+# p is recoverable from it. Run 3's recorded gaps show the head learned the structure: rim 5.4s
+# vs corner three 12.0s (real and-1 rates .44 vs .04; rank corr -0.94 across 14 zones), Giannis
+# 4.5s vs Buddy Hield 10.5s (Spearman -0.61 across 250 scorers). Inverting reproduces the zone
+# rates to 0.033 MAE where a flat 0.338 is off by 0.142. The variation is the model's; this dial
+# sets only the level.
+#
+# 10.10s is the value at which the implied mean over run 3's 55,794 fouls-after-a-basket equals
+# the real 0.338 (5.24 of 15.50/game over 1320 games). The physical later-foul gap is 13.2s; the
+# head's mean runs short of the mixture mean (7.4s vs 8.7s), and the fit absorbs that. RE-FIT
+# after any retrain of the conditional time head. See dials/README.md, `v2-run4.json`.
+AND_ONE_GAP_SCALE = 10.10
 # SUB_FATIGUE_WEIGHT is GONE (2.0, workstream 11). It was a logit bonus per second of a player's
 # on-court stint, nudging the outgoing pick toward whoever had been on longest -- a hand-written
 # stand-in for exactly what the roster encoder now sees directly, since every head reads stint
@@ -346,7 +353,7 @@ _TUNING_KEYS = (
     "PLAYER_TEMPERATURE", "EVENT_TEMPERATURE", "TYPE_TEMPERATURE", "RESULT_TEMPERATURE",
     "SUB_TEMPERATURE", "SUB_INCOMING_TEMPERATURE", "SUB_MAX_GAP_SECONDS", "FOUL_OUT_LIMIT",
     "SHOT_RESULT_BIAS", "SHOT_RESULT_BIAS_BY_ZONE", "EVENT_BIAS", "TYPE_BIAS",
-    "HOME_COURT_SHOT_BIAS", "FOUL_OFFENSE_SIDE_PROB", "AND_ONE_PROB",
+    "HOME_COURT_SHOT_BIAS", "FOUL_OFFENSE_SIDE_PROB", "AND_ONE_GAP_SCALE",
 )
 
 

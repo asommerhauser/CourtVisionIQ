@@ -315,18 +315,21 @@ class GameController:
                                         temperature=config.EVENT_TEMPERATURE, bias=config.EVENT_BIAS)
         return event, pred["delta_seconds"]
 
-    def _advance_for(self, event: str, actor: str | None, marginal: float) -> float:
+    def _advance_for(self, event: str, actor: str | None, marginal: float, *,
+                     min_delta: float = 0.0) -> float:
         """Advance the clock by the play's Δt and return it (real seconds, pre-clamp).
 
         When the conditional time head is loaded and we have an actor, Δt follows the sampled play
         (``predict_delta``); otherwise we fall back to the event head's marginal Δt. The returned
         value conditions the play's type/result heads. ``_advance_clock`` applies DELTA_TIME_SCALE
-        and the MAX_DELTA clamp.
+        and the MAX_DELTA clamp. ``min_delta`` floors the gap for a play the caller has already
+        resolved as the long branch of a mixture (see the and-1 in :meth:`_do_foul`).
         """
         if self.use_condtime and actor is not None:
             delta = self.sim.predict_delta(event, actor)
         else:
             delta = marginal
+        delta = max(float(delta), float(min_delta))
         self._advance_clock(delta)
         return delta
 
@@ -612,24 +615,39 @@ class GameController:
         # is at the basket's clock, the fouler is a defender on the possession that just ended,
         # and the scorer shoots one. The other 66% are ordinary fouls on the NEXT possession: the
         # ball has changed hands, so the side draw below is framed by the new possession like
-        # any other foul. The conditional time head cannot express the split -- it regresses one
-        # mean gap, and a distribution with a spike at 0 and a hump near 10s has its mean in the
-        # valley between them -- so before this branch existed the sim produced 0.29 and-1s/game
-        # against 5.24 while paying 8.4 fouls/game up to a minute after a basket at ONE free
-        # throw. That was 88% of the FTA deficit in runs 2 and 3, and no dial reaches it, so the
-        # rate is pinned here (AND_ONE_PROB) the same way the fouler's side is.
+        # any other foul.
+        #
+        # The decision is READ OFF THE TIME HEAD, not drawn from a flat rate. The head regresses
+        # one mean gap for this foul, and the real gap is a mixture: 0 on an and-1, ~13s
+        # otherwise. So its prediction for a given scorer, zone and defender is
+        # (1 - p) * later_gap, and p falls out as 1 - gap / AND_ONE_GAP_SCALE. Run 3's recorded
+        # gaps prove the head carries the signal: rim 5.4s vs corner three 12.0s (real and-1
+        # rates .44 vs .04, rank corr -0.94 over 14 zones), Giannis 4.5s vs Buddy Hield 10.5s
+        # (Spearman -0.61 over 250 scorers). Before this branch existed the sim used the mean
+        # gap AS the gap -- 0.29 and-1s/game at the basket's clock against 5.24, and 8.4/game up
+        # to a minute later paid at one free throw, 88% of the FTA deficit in runs 2 and 3.
         scorer_team = self._made_basket_scorer_team()
-        if scorer_team is not None and not rebounding and self._draw_and_one():
+        after_basket = scorer_team is not None and not rebounding
+        if after_basket:
+            # Probe: the defender on the possession that just ended, and the head's gap for him.
             fouler_team = self._other(scorer_team)
             fouler = self.sim.predict_player("foul", self._five_of(fouler_team),
                                              delta_seconds=0.0, greedy=self.greedy,
                                              temperature=self.player_temp)
-            # On the shot: no clock elapses between the basket and the whistle, and an and-1 is
-            # a shooting foul by definition (the head still picks 2pt vs 3pt -- a four-point play).
-            ftype = self.sim.predict_type("foul_type", "foul", fouler, list(SHOOTING_FOUL_TYPES),
-                                          delta_seconds=0.0, greedy=self.greedy)
-            self._do_shooting_foul(fouler, fouler_team, ftype, 0.0, and_one=True)
-            return
+            gap = (self.sim.predict_delta("foul", fouler)
+                   if self.use_condtime else delta)
+            if self._draw_and_one(gap):
+                # On the shot: no clock elapses between the basket and the whistle, and an and-1
+                # is a shooting foul by definition (the head still picks 2pt vs 3pt).
+                ftype = self.sim.predict_type("foul_type", "foul", fouler,
+                                              list(SHOOTING_FOUL_TYPES),
+                                              delta_seconds=0.0, greedy=self.greedy)
+                self._do_shooting_foul(fouler, fouler_team, ftype, 0.0, and_one=True)
+                return
+            # Not on the shot: an ordinary foul on the new possession, re-drawn below from that
+            # possession's side. Its gap is floored at the later-foul gap -- the head's mean is
+            # the mixture mean, and conditional on "not an and-1" the gap is the long branch.
+            # E[clock] is preserved exactly: p*0 + (1-p)*scale == the head's gap.
 
         # Draw the side first, from the one thing the model cannot supply. Sampling the player
         # from a five rather than from ten is what pins the rate; the head still chooses WHO
@@ -643,7 +661,8 @@ class GameController:
         fouler = self.sim.predict_player("foul", self._five_of(fouler_team),
                                          delta_seconds=delta, greedy=self.greedy,
                                          temperature=self.player_temp)
-        delta = self._advance_for("foul", fouler, delta)
+        delta = self._advance_for("foul", fouler, delta,
+                                  min_delta=config.AND_ONE_GAP_SCALE if after_basket else 0.0)
 
         # `fouler_team` and `on_defense` are now the inputs to the pick rather than a lookup
         # after it, so the side the head was masked to and the side the outcome resolves for
@@ -716,13 +735,28 @@ class GameController:
             return self._team_of(prev.get("player"))
         return None
 
-    def _draw_and_one(self) -> bool:
-        """Is the foul that follows a made basket an and-1? ``AND_ONE_PROB``; greedy takes the mode.
+    @staticmethod
+    def _and_one_prob(gap: float) -> float:
+        """P(and-1) read off the time head's predicted gap for a foul after a made basket.
+
+        The head's output is the mean of a mixture -- 0 on an and-1, the later-foul gap
+        otherwise -- so ``gap = (1 - p) * scale`` and ``p = 1 - gap / scale``, clipped. Scale is
+        ``AND_ONE_GAP_SCALE``: the gap at which the head is saying "certainly not on the shot".
+        Fitted at 10.10s so the 2023 level (0.338) is reproduced over run 3's recorded gaps; the
+        variation across scorers, zones and defenders is the head's, not the dial's.
+        """
+        scale = float(config.AND_ONE_GAP_SCALE)
+        if scale <= 0.0:
+            return 0.0
+        return min(1.0, max(0.0, 1.0 - float(gap) / scale))
+
+    def _draw_and_one(self, gap: float) -> bool:
+        """Draw the and-1 from :meth:`_and_one_prob`; greedy takes the mode.
 
         The extremes short-circuit without touching the rng so a test that pins the branch does
         not perturb the draws that follow it.
         """
-        p = config.AND_ONE_PROB
+        p = self._and_one_prob(gap)
         if p <= 0.0:
             return False
         if p >= 1.0:

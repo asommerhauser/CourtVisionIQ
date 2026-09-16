@@ -181,17 +181,20 @@ is pytest plus TF-free measurement until the 2.0 train.
 > in `dials/README.md` under `v2-run4.json`. Two findings, both **contexts the controller never
 > put on the menu**, and neither reachable by a dial:
 >
-> 1. **The and-1 was inferred, not drawn.** Every foul whose previous row was a made FG was
->    paid one free throw -- 8.4/game up to a minute after the basket, against 0.29 real
->    and-1s/game emitted at the basket's clock (real: 5.24). `_do_foul` now draws it first from
->    `AND_ONE_PROB` = 0.338 (the real conditional rate; the time head regresses one mean gap
->    and cannot place a spike at 0). That was 88% of the FTA deficit that has read -3 per team
->    across runs 2 and 3.
+> 1. **The and-1 was inferred, not read.** Every foul whose previous row was a made FG was
+>    paid one free throw -- 8.4/game up to a minute after the basket, against 0.29 and-1s/game
+>    at the basket's clock (real: 5.24). The signal was in the time head all along: its gap is
+>    the mean of a mixture (0 on an and-1, ~13s otherwise), and run 3's recorded gaps rank the
+>    14 zones at -0.94 and 250 scorers at -0.61 against real and-1 rates. `_do_foul` now
+>    inverts it -- P(and-1) = 1 - gap / `AND_ONE_GAP_SCALE` -- so the decision is the
+>    model's per scorer, zone and defender; the dial (10.10s) sets only the level. A flat
+>    real-rate draw was the first cut and was rejected as player-blind. That was 88% of the
+>    FTA deficit that has read -3 per team across runs 2 and 3.
 > 2. **Timeouts after a made basket were gated out.** 6.55 of 10.89 real timeouts/game follow
 >    a made FG; `_event_menu` offered one only at a dead ball. Sim 7.03/game, 0.58 after a
 >    basket. The gate now includes a made basket. No timeout dial is set: measure raw.
 >
-> `dials/v2-run4.json` carries one measured dial (`AND_ONE_PROB`), one 3-sigma residual
+> `dials/v2-run4.json` carries one fitted level (`AND_ONE_GAP_SCALE`), one 3-sigma residual
 > (`shot_type.mid_top`), and **two projections** -- the shooting-foul offsets brought down by
 > 0.245 and `DELTA_TIME_SCALE` 1.015 -- each with its basis and its re-read order in the README.
 > They are projections because the alternative was a run known to overshoot FTA by ~2/team.
@@ -203,7 +206,7 @@ is pytest plus TF-free measurement until the 2.0 train.
 > -- not evidence of distance-from-training decay. A 300-game window is the first honest test.
 >
 > **Pytest has not been run on these changes** (standing rule 1). The and-1 tests pin the draw
-> with `monkeypatch.setattr(config, "AND_ONE_PROB", ...)`; five tests are new.
+> by scripting the probe gap (0.0 = and-1, past the scale = ordinary); five tests are new.
 
 **Workstream 11 is complete. Phases 1 and 2, Gate B, all of §9 and all of §8 are merged into
 `feature/version2`.** The full suite is green.

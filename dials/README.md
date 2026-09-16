@@ -318,7 +318,7 @@ what the run 3 package predicted: shot-zone dials move eFG, not the pick. The bo
 | `efg` | -.0136 | -.0100 | half-landed: 3P% 35.2 vs 36.7 (2.1 sigma), 2P% exact (55.0 vs 55.0); mix within 2 sigma everywhere but `mid_top` |
 | `oreb` +0.89, `stl` +0.52, `tov` +0.51, `blk` +0.30 | | | all < 3 sigma at 128 team-games; held |
 
-### The and-1 branch is now a drawn decision, not an inference from the previous row
+### The and-1 is read off the time head, not inferred from the previous row
 
 The measurement that settled it, real 2023 (1320 games) against the run 3 sims (64 x 50):
 
@@ -334,14 +334,40 @@ The measurement that settled it, real 2023 (1320 games) against the run 3 sims (
 
 The sim was not short of fouls after baskets -- it had two more than real -- it classified
 nearly all of them as and-1s (previous row is a made FG, never mind when) and paid each one
-free throw. `_do_foul` now draws the and-1 first, from **`AND_ONE_PROB` = 0.338**, before the
-side and the type: a hit is a defensive shooting foul at the basket's clock with the scorer
-shooting one (no clock advance, the time head is not asked); a miss is an ordinary foul on the
-next possession, framed by the new possession's side draw and paid at the token's count. The
-conditional time head cannot express this on its own -- it regresses one mean gap, and a spike
-at 0 beside a hump near 10s has its mean in the valley -- so the rate is pinned, exactly as the
-fouler's side is. The proper model-side fix (a zero-inflated gap head) is a one-head retrain and
-is deferred until the 300-game run says the foul path is the last big box residual.
+free throw.
+
+The signal was in the model the whole time, in the gap. The real gap after a basket is a
+mixture -- 0 on an and-1, 13.2s otherwise -- and the conditional time head regresses the
+**mean**, so for a given scorer, zone and defender it outputs (1 - p) x later_gap. Run 3's
+recorded gaps are that output, and they carry the structure:
+
+| | real and-1 rate | sim mean gap | inverted p |
+|---|---|---|---|
+| rim | .443 | 5.4s | .476 |
+| paint | .436 | 6.2s | .402 |
+| mid-range (7 zones) | .07-.34 | 8.2-11.4s | .05-.23 |
+| threes (5 zones) | .04-.06 | 11.9-12.0s | .04-.06 |
+| rank correlation over 14 zones | | **-0.94** | |
+| Giannis / Gobert / Butler | .64 / .57 / .56 | 4.5 / 4.7 / 5.6s | .58 / .54 / .47 |
+| Hield / Bullock / Harris | .09 / .04 / .08 | 10.5 / 10.3 / 10.1s | .20 / .22 / .24 |
+| Spearman over 250 scorers | | **-0.61** | |
+
+So `_do_foul` now asks the head for the gap of a foul after a basket (probing with a defender
+from the possession that just ended), takes **P(and-1) = 1 - gap / `AND_ONE_GAP_SCALE`**, and
+draws. A hit is a defensive shooting foul at the basket's clock with the scorer shooting one; a
+miss is an ordinary foul on the next possession, re-drawn from that possession's side and paid
+at the token's count, with its gap floored at the scale (conditional on "not on the shot", the
+gap is the long branch). E[clock] is preserved exactly: p x 0 + (1 - p) x scale = the head's
+gap. The dial sets the **level only** -- 10.10s is where the implied mean over run 3's 55,794
+fouls-after-a-basket equals the real 0.338; the physical later-foul gap is 13.2s and the head's
+mean runs short of the mixture mean (7.4s vs 8.7s). At that scale the inversion reproduces the
+14 zone rates to **0.033 MAE** where a flat 0.338 is off by 0.142, and puts the right spread on
+scorers (sd .128 vs .111 real). A flat rate was the first cut and was rejected for exactly the
+reason it is wrong: whether a foul is on the shot depends on who scored and where.
+
+The proper model-side version (a zero-inflated gap head, which would make the level the
+model's too) is a one-head retrain and is deferred until the 300-game run says the foul path is
+the last big box residual.
 
 ### Timeouts after a made basket were never on the menu
 
@@ -359,14 +385,16 @@ run that over-corrects by a known amount, and each one says what to re-read.
 
 | Dial | run 3 | run 4 | Basis |
 |---|---|---|---|
-| `AND_ONE_PROB` | -- | 0.338 | **measured**, real conditional rate |
-| `TYPE_BIAS.foul_type` shooting 2pt / 3pt | +0.268 / +0.774 | **+0.023 / +0.529** | projected (-0.245 on both): those offsets were solved while 8.4 shooting fouls/game were mis-paid. With and-1s at 0.338 x 17.4 = 5.9 and the other 11.5 fouls-after-a-basket typed at the ordinary 49.4% shooting share, shooting fouls land at 23.1 vs 21.0 real; -0.245 logit on the non-and-1 shooting share (49.4% -> 43.3%) puts them at 21.0 |
+| `AND_ONE_GAP_SCALE` | -- | 10.10s | **fitted level**: the scale at which the head's gap inverts to the real 0.338; the per-context variation is the head's |
+| `TYPE_BIAS.foul_type` shooting 2pt / 3pt | +0.268 / +0.774 | **+0.023 / +0.529** | projected (-0.245 on both): those offsets were solved while 8.4 shooting fouls/game were mis-paid. With and-1s at the implied 0.338 x 17.4 = 5.9 and the other 11.5 fouls-after-a-basket typed at the ordinary 49.4% shooting share, shooting fouls land at 23.1 vs 21.0 real; -0.245 logit on the non-and-1 shooting share (49.4% -> 43.3%) puts them at 21.0 |
 | `DELTA_TIME_SCALE` | 1.0 | **1.015** | projected: pace is +1.42 raw; the FT recovery adds 0.44 x 2.9 = +1.3 possessions/team to the box formula; 3.9 more timeouts at the sim's ~7s of clock around one take -1.0; 102.6 / 100.9 = 1.017, rounded down because the timeout dt after a basket is unmeasured |
 | `TYPE_BIAS.shot_type.mid_top` | -- | -0.190 | measured, 3.5 sigma over-production (3.51% vs 2.89% of live attempts) |
 | everything else | | held | 3P% -1.5pp is 2.1 sigma on 64 games; `oreb`, `stl`, `tov`, `blk` under 3 |
 
 **Re-read in this order once run 4 has ~100 games:** (1) and-1s/game (target 5.2) and
-fouls-after-a-basket (17.4 is the event head; if it moves, so does the and-1 count); (2) FTA per
+fouls-after-a-basket (17.4 is the event head; if it moves, so does the and-1 count), plus the
+per-zone and-1 rates against the real column above -- that is the check that the head, not the
+dial, is doing the work; (2) FTA per
 team (23.6) -- if it overshoots by more than a sigma, the foul_type projection was too shallow, and
 the shooting offsets refit from the play-by-play as before; (3) timeouts/game (10.9) and the dt
 into and out of one; (4) pace, last, and only then move `DELTA_TIME_SCALE` off 1.015. Do not

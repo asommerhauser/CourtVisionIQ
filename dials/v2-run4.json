@@ -1,5 +1,5 @@
 {
-  "AND_ONE_PROB": 0.338,
+  "AND_ONE_GAP_SCALE": 10.10,
   "DELTA_TIME_SCALE": 1.015,
   "EVENT_BIAS": {
     "assist": -0.087
