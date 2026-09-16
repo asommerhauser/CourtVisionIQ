@@ -268,7 +268,8 @@ def test_shooting_foul_on_3pt_yields_three_free_throws():
     assert ctrl.score[HOME] == 3
 
 
-def test_and_one_keeps_basket_and_adds_one_free_throw():
+def test_and_one_keeps_basket_and_adds_one_free_throw(monkeypatch):
+    monkeypatch.setattr(config, "AND_ONE_PROB", 1.0)   # pin the draw: this foul IS the and-1
     ctrl = make_controller(AWAY)            # made FG already flipped possession to AWAY
     ctrl.sim.append_event("shot", "A", "paint", "made", time=0)   # A (home) just scored
     ctrl.score[HOME] = 2                     # the basket counted
@@ -281,6 +282,63 @@ def test_and_one_keeps_basket_and_adds_one_free_throw():
     assert ctrl.score[HOME] == 3            # 2 (basket) + 1 (and-1 FT)
     # The fouled attempt was a made FG, so it is the only field-goal attempt logged (no phantom).
     assert sum(1 for r in rows(ctrl) if r["type"] in ZONE_TOKENS) == 1
+
+
+def test_a_foul_after_a_basket_is_an_ordinary_foul_when_the_and_one_draw_misses(monkeypatch):
+    """The other 66%: the ball changed hands, so it is a foul on the NEW possession -- framed by
+    that possession's side draw and paid at the token's count, not one free throw."""
+    monkeypatch.setattr(config, "AND_ONE_PROB", 0.0)
+    ctrl = make_controller(AWAY)            # the made FG flipped possession to AWAY
+    ctrl.sim.append_event("shot", "A", "paint", "made", time=0)
+    ctrl.score[HOME] = 2
+    # Home is defending now: B fouls G in the act of shooting -> two free throws for G.
+    ctrl.sim.script(player=["B", "G"], type=[SHOOTING_2PT], result=["made", "made"])
+    ctrl._do_foul(delta=5.0)
+
+    foul = [r for r in rows(ctrl) if r["event"] == "foul"][0]
+    fts = [r for r in rows(ctrl) if r["type"] == "free throw"]
+    assert foul["secondary_player"] == "G"           # a fresh victim draw, not the scorer
+    assert len(fts) == 2 and all(r["player"] == "G" for r in fts)
+    assert ctrl.score == {HOME: 2, AWAY: 2}
+    assert [c for c in ctrl.sim.calls if c[0] == "delta"]   # the clock advanced like any foul
+
+
+def test_an_and_one_sits_at_the_baskets_clock(monkeypatch):
+    """No time elapses between the basket and the whistle: the foul row carries the shot's clock
+    and the conditional time head is never asked -- every real and-1 sits at dt = 0."""
+    monkeypatch.setattr(config, "AND_ONE_PROB", 1.0)
+    ctrl = make_controller(AWAY)
+    ctrl.clock = 100.0
+    ctrl.sim.append_event("shot", "A", "paint", "made", time=100.0)
+    ctrl.sim.script(player=["G"], type=[SHOOTING_2PT], result=["made"], delta=[12.0])
+    ctrl._do_foul(delta=5.0)
+
+    foul = [r for r in rows(ctrl) if r["event"] == "foul"][0]
+    assert foul["time"] == 100.0 and ctrl.clock == 100.0
+    assert not [c for c in ctrl.sim.calls if c[0] == "delta"]
+    type_call = [c for c in ctrl.sim.calls if c[0] == "type"][0]
+    assert set(type_call[3]) == set(SHOOTING_FOUL_TYPES)   # an and-1 is a shooting foul
+
+
+def test_the_and_one_rate_is_a_pinned_dial(monkeypatch):
+    """Like the fouler's side: the rate the time head cannot express is drawn from a dial."""
+    assert "AND_ONE_PROB" in config._TUNING_KEYS
+    monkeypatch.setattr(config, "AND_ONE_PROB", 0.338)
+    ctrl = make_controller(AWAY)
+    n = 20000
+    hits = sum(ctrl._draw_and_one() for _ in range(n))
+    assert abs(hits / n - 0.338) < 0.015
+
+
+def test_greedy_takes_the_modal_and_one_branch():
+    """The committed rate is under one half, so the deterministic path never draws an and-1."""
+    assert config.AND_ONE_PROB < 0.5
+    ctrl = GameController(FakeSim(), seed=0, greedy=True)
+    ctrl.possession = AWAY
+    ctrl.sim.append_event("shot", "A", "paint", "made", time=0)
+    ctrl.sim.script(player=["B", "G"], type=[SHOOTING_2PT], result=["made", "made"])
+    ctrl._do_foul(delta=5.0)
+    assert len([r for r in rows(ctrl) if r["type"] == "free throw"]) == 2
 
 
 def test_rebounding_foul_is_masked_to_common_types():
@@ -433,8 +491,9 @@ def test_foul_by_a_subbed_off_player_still_resolves_to_his_own_team():
     assert ctrl._team_of("A") == HOME
 
 
-def test_and_one_survives_the_possession_flip_on_the_made_basket():
+def test_and_one_survives_the_possession_flip_on_the_made_basket(monkeypatch):
     """A made FG flips possession, so the and-1 foul must not read as an offensive-side foul."""
+    monkeypatch.setattr(config, "AND_ONE_PROB", 1.0)
     ctrl = make_controller(AWAY)                 # made FG already flipped possession to AWAY
     ctrl.sim.append_event("shot", "A", "paint", "made", time=0)   # A (home) just scored
     ctrl.sim.script(player=["G"], type=[SHOOTING_2PT], result=["made"])
@@ -514,6 +573,21 @@ def test_a_timeout_is_only_offered_at_a_dead_ball():
     ctrl.ball_dead = True
     assert "timeout" in ctrl._event_menu(post_miss=False)
     assert "timeout" not in ctrl.open_play_events        # never in the base menu itself
+
+
+def test_a_timeout_is_offered_after_a_made_basket():
+    """The ball is live for rebound purposes after a basket, but the team inbounding may call
+    time -- and 60% of real timeouts are called exactly there. Gating on the dead ball alone
+    never put that context on the menu."""
+    ctrl = _timeout_ctrl()
+    ctrl.ball_dead = False
+    assert "timeout" not in ctrl._event_menu(post_miss=False)
+    ctrl.sim.append_event("shot", "A", "paint", "made", time=0)
+    assert "timeout" in ctrl._event_menu(post_miss=False)
+    ctrl.sim.append_event("shot", "A", "paint", "missed", time=5)
+    assert "timeout" not in ctrl._event_menu(post_miss=True)
+    ctrl.sim.append_event("shot", "A", "free throw", "made", time=9)   # a made FT is not a FG
+    assert "timeout" not in ctrl._event_menu(post_miss=False)
 
 
 def test_a_team_out_of_timeouts_cannot_be_offered_one():
@@ -671,7 +745,8 @@ def test_a_shooting_foul_names_the_fouled_shooter():
     assert len(fts) == 3 and all(r["player"] == "C" for r in fts)
 
 
-def test_an_and_one_names_the_scorer_as_the_fouled_player():
+def test_an_and_one_names_the_scorer_as_the_fouled_player(monkeypatch):
+    monkeypatch.setattr(config, "AND_ONE_PROB", 1.0)
     ctrl = make_controller(AWAY)                 # made FG already flipped possession
     ctrl.sim.append_event("shot", "A", "paint", "made", time=0)
     ctrl.score[HOME] = 2
@@ -749,8 +824,9 @@ def test_a_shooting_foul_never_samples_the_shot_type_head():
     assert [c[1] for c in ctrl.sim.calls if c[0] == "type"] == ["foul_type"]
 
 
-def test_an_and_one_is_one_free_throw_whatever_the_token_says():
-    """The made basket already counted, so the structural check overrides the token's count."""
+def test_an_and_one_is_one_free_throw_whatever_the_token_says(monkeypatch):
+    """The made basket already counted, so the and-1 branch overrides the token's count."""
+    monkeypatch.setattr(config, "AND_ONE_PROB", 1.0)
     ctrl = make_controller(AWAY)                 # made FG already flipped possession
     ctrl.sim.append_event("shot", "A", "top3", "made", time=0)
     ctrl.score[HOME] = 3

@@ -237,6 +237,18 @@ HOME_COURT_SHOT_BIAS = 0.055
 # show up here as an over-correction. Run 1 held PLAYER_TEMPERATURE at 2.0 deliberately, so this
 # fit is against that value.
 FOUL_OFFENSE_SIDE_PROB = 0.1286
+# P(and-1 | the event head samples a foul as the very next row after a made field goal). The
+# controller draws this BEFORE the side and the type: an and-1 is a defensive shooting foul at the
+# basket's clock with the scorer shooting one; a miss is an ordinary foul on the NEXT possession.
+#
+# 0.338 is the real 2023 rate, 5.24 and-1s out of 15.50 fouls-after-a-basket per game over 1320
+# games; the 64 v2-run3 holdout games read 0.337. Pinned here for the same reason the fouler's
+# side is: the conditional time head regresses ONE mean gap, so it cannot put a spike at 0s next
+# to a hump at ~10s, and runs 2-3 measured the consequence at 0.29 and-1s/game against 5.24 with
+# 8.4 fouls/game paid at one free throw instead of two (88% of the FTA deficit). See
+# dials/README.md, `v2-run4.json`. RE-MEASURE the sim's fouls-after-a-basket count (17.4/game vs
+# 15.5 real in run 3, an event-head property) -- the and-1 COUNT is this rate times that.
+AND_ONE_PROB = 0.338
 # SUB_FATIGUE_WEIGHT is GONE (2.0, workstream 11). It was a logit bonus per second of a player's
 # on-court stint, nudging the outgoing pick toward whoever had been on longest -- a hand-written
 # stand-in for exactly what the roster encoder now sees directly, since every head reads stint
@@ -334,7 +346,7 @@ _TUNING_KEYS = (
     "PLAYER_TEMPERATURE", "EVENT_TEMPERATURE", "TYPE_TEMPERATURE", "RESULT_TEMPERATURE",
     "SUB_TEMPERATURE", "SUB_INCOMING_TEMPERATURE", "SUB_MAX_GAP_SECONDS", "FOUL_OUT_LIMIT",
     "SHOT_RESULT_BIAS", "SHOT_RESULT_BIAS_BY_ZONE", "EVENT_BIAS", "TYPE_BIAS",
-    "HOME_COURT_SHOT_BIAS", "FOUL_OFFENSE_SIDE_PROB",
+    "HOME_COURT_SHOT_BIAS", "FOUL_OFFENSE_SIDE_PROB", "AND_ONE_PROB",
 )
 
 

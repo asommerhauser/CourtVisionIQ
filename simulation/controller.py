@@ -283,12 +283,20 @@ class GameController:
     def _event_menu(self, post_miss: bool) -> list[str]:
         """The events the event head may be sampled from right now.
 
-        A timeout is the one context-gated entry: legal only while the ball is dead, only when
-        some team still has one under the budget, and only when the timeout head is loaded at
-        all. Everything else is the fixed open-play / post-miss mask.
+        A timeout is the one context-gated entry: legal at a stoppage, only when some team still
+        has one under the budget, and only when the timeout head is loaded at all. Everything
+        else is the fixed open-play / post-miss mask.
+
+        A stoppage is a dead ball OR a made basket. The ball is live after a basket in the
+        rebound sense (no whistle, no substitution window -- clause 10), but the team inbounding
+        may call time, and that is where 60% of real timeouts are called: 6.55 of 10.89/game
+        follow a made field goal (2023 holdout, 64 games). Gating on ``ball_dead`` alone never
+        put that context on the menu, and the sim sat at 7.0 timeouts/game with 0.58 after a
+        basket -- a missing-context defect, not a rate the event head got wrong.
         """
         allowed = POST_MISS_EVENTS if post_miss else self.open_play_events
-        if self.use_timeouts and self.ball_dead and self._timeout_teams():
+        stoppage = self.ball_dead or self._made_basket_scorer_team() is not None
+        if self.use_timeouts and stoppage and self._timeout_teams():
             return [*allowed, TIMEOUT_EVENT]
         return list(allowed)
 
@@ -598,12 +606,37 @@ class GameController:
         which is how the excess stayed hidden. No TYPE_BIAS can reach this: the mass is on the
         wrong side of the mask, so suppressing `offensive` only spills it into `loose ball`.
         """
+        # The and-1 is decided before anything else, because it changes what every later draw
+        # means. A foul sampled as the very next row after a made field goal is an and-1 in 33.8%
+        # of real cases (2023, 1320 games: 5.24 of 15.50/game); in every one of those the whistle
+        # is at the basket's clock, the fouler is a defender on the possession that just ended,
+        # and the scorer shoots one. The other 66% are ordinary fouls on the NEXT possession: the
+        # ball has changed hands, so the side draw below is framed by the new possession like
+        # any other foul. The conditional time head cannot express the split -- it regresses one
+        # mean gap, and a distribution with a spike at 0 and a hump near 10s has its mean in the
+        # valley between them -- so before this branch existed the sim produced 0.29 and-1s/game
+        # against 5.24 while paying 8.4 fouls/game up to a minute after a basket at ONE free
+        # throw. That was 88% of the FTA deficit in runs 2 and 3, and no dial reaches it, so the
+        # rate is pinned here (AND_ONE_PROB) the same way the fouler's side is.
+        scorer_team = self._made_basket_scorer_team()
+        if scorer_team is not None and not rebounding and self._draw_and_one():
+            fouler_team = self._other(scorer_team)
+            fouler = self.sim.predict_player("foul", self._five_of(fouler_team),
+                                             delta_seconds=0.0, greedy=self.greedy,
+                                             temperature=self.player_temp)
+            # On the shot: no clock elapses between the basket and the whistle, and an and-1 is
+            # a shooting foul by definition (the head still picks 2pt vs 3pt -- a four-point play).
+            ftype = self.sim.predict_type("foul_type", "foul", fouler, list(SHOOTING_FOUL_TYPES),
+                                          delta_seconds=0.0, greedy=self.greedy)
+            self._do_shooting_foul(fouler, fouler_team, ftype, 0.0, and_one=True)
+            return
+
         # Draw the side first, from the one thing the model cannot supply. Sampling the player
         # from a five rather than from ten is what pins the rate; the head still chooses WHO
         # within that five, which is the part it is actually good at.
         # ``greedy`` takes the modal side rather than drawing one, so the deterministic path stays
         # deterministic the way every other head's greedy branch is (argmax, not a seeded sample).
-        foul_offense = self._foul_offense()
+        foul_offense = self.possession
         p_off = config.FOUL_OFFENSE_SIDE_PROB
         on_defense = p_off < 0.5 if self.greedy else self.rng.random() >= p_off
         fouler_team = self._other(foul_offense) if on_defense else foul_offense
@@ -623,7 +656,7 @@ class GameController:
                                       delta_seconds=delta, greedy=self.greedy)
 
         if ftype in SHOOTING_FOUL_TYPES:
-            self._do_shooting_foul(fouler, fouler_team, ftype, delta)
+            self._do_shooting_foul(fouler, fouler_team, ftype, delta, and_one=False)
             return
 
         # Free throws always go to the fouler's OPPONENT, in every branch. Reading possession
@@ -667,27 +700,38 @@ class GameController:
                               live_last=not retain, retain=retain)
         # else "nothing" → common foul, no FTs, possession unchanged.
 
-    def _foul_offense(self) -> str:
-        """Which team counts as the offense for a foul sampled right now.
+    def _made_basket_scorer_team(self) -> str | None:
+        """The team that scored if the previous row is a made field goal, else ``None``.
 
-        Normally whoever has the ball. The exception is the **and-1**: a made basket flips
-        possession the instant it drops (``_do_shot``), so a foul sampled as the very next play
-        would classify the defender who fouled on the shot as an offensive player — masking
-        ``shooting`` away and making and-1s unreachable. While the previous row is a made field
-        goal, the possession that just ended is still the one this foul belongs to, so the
-        scoring team is the offense and the team scored on is the defense.
+        A made basket flips possession the instant it drops (``_do_shot``), so the next play
+        sits on a boundary: a foul there is either an and-1 on the possession that just ended or
+        an ordinary foul on the new one (:meth:`_do_foul` draws which), and the ball is about to
+        be inbounded, which is a timeout opportunity (:meth:`_event_menu`). This used to be
+        ``_foul_offense``, which treated EVERY foul after a made basket as belonging to the old
+        possession -- the framing that made the and-1 path over-fire.
         """
         prev = self.sim.history[-1] if self.sim.history else None
         if (prev is not None and prev.get("event") == "shot" and prev.get("result") == "made"
                 and prev.get("type") in FIELD_GOAL_TYPES):
-            scorer_team = self._team_of(prev.get("player"))
-            if scorer_team is not None:
-                return scorer_team
-        return self.possession
+            return self._team_of(prev.get("player"))
+        return None
+
+    def _draw_and_one(self) -> bool:
+        """Is the foul that follows a made basket an and-1? ``AND_ONE_PROB``; greedy takes the mode.
+
+        The extremes short-circuit without touching the rng so a test that pins the branch does
+        not perturb the draws that follow it.
+        """
+        p = config.AND_ONE_PROB
+        if p <= 0.0:
+            return False
+        if p >= 1.0:
+            return True
+        return p >= 0.5 if self.greedy else self.rng.random() < p
 
     def _do_shooting_foul(self, fouler: str, fouler_team: str, ftype: str,
-                          delta: float) -> None:
-        """A shooting foul: and-1 if a basket just went in, else the count ``ftype`` carries.
+                          delta: float, *, and_one: bool) -> None:
+        """A shooting foul: one free throw on an and-1, else the count ``ftype`` carries.
 
         The free-throw count now comes from the **foul token itself** — ``shooting 3pt`` is three
         attempts, ``shooting 2pt`` is two. Before 2.0 the controller sampled the live shot-type
@@ -696,9 +740,12 @@ class GameController:
         answer off the real trip's ``outof`` instead, so the foul-type head learns the true share
         of three-shot trips in context: who is fouling, who is shooting, where in the game.
 
-        And-1 — the previous row is a made field goal — still overrides the count structurally:
-        the basket already counted, so it is one attempt whatever the token says. That path is
-        properly reachable now (see :meth:`_foul_offense`).
+        ``and_one`` is decided by the caller (:meth:`_do_foul`) BEFORE the side and the type are
+        drawn, because it is not a property of the token: the basket already counted, so it is
+        one attempt whatever the token says, and the fouled player is the scorer. It used to be
+        inferred here from "the previous row is a made field goal", which was true of every foul
+        the event head placed after a basket -- including the 8.4/game that belonged to the next
+        possession -- and paid all of them one free throw.
 
         ``fouler_team`` is resolved by the caller before the type is sampled, so "a shooting foul
         is defensive by definition" is true by construction: neither shooting token is in the
@@ -706,15 +753,10 @@ class GameController:
         """
         shooting_team = self._other(fouler_team)
 
-        # The and-1 check reads the row BEFORE the foul, so it must run before the foul row is
-        # appended -- the fouled player has to be known to ride in secondary_player.
-        prev = self.sim.history[-1] if self.sim.history else None
-        and_one = (prev is not None and prev.get("event") == "shot"
-                   and prev.get("result") == "made" and prev.get("type") in FIELD_GOAL_TYPES
-                   and self._team_of(prev.get("player")) == shooting_team)
-
         if and_one:
-            fouled = prev["player"]                    # the player who made the basket
+            # Read the scorer off the row BEFORE the foul is appended -- he rides in
+            # secondary_player and shoots the one free throw.
+            fouled = self.sim.history[-1]["player"]
             n_ft = 1                                   # the basket already counted
         else:
             fouled = self._pick_fouled_player(shooting_team)
