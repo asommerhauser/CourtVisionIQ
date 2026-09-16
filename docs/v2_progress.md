@@ -175,6 +175,36 @@ is pytest plus TF-free measurement until the 2.0 train.
 > disk quota at 32/100 without one).
 
 
+> **2026-09-16, run 3 stopped at 64/300 and read; two controller fixes; run 4 loaded.** Run 3 at
+> 64 games was run 2 to three decimals on the winner (vote Brier 0.211 vs 0.211 on the same 64
+> ids), as its package predicted, so it was stopped rather than paid out to 300. The box read is
+> in `dials/README.md` under `v2-run4.json`. Two findings, both **contexts the controller never
+> put on the menu**, and neither reachable by a dial:
+>
+> 1. **The and-1 was inferred, not drawn.** Every foul whose previous row was a made FG was
+>    paid one free throw -- 8.4/game up to a minute after the basket, against 0.29 real
+>    and-1s/game emitted at the basket's clock (real: 5.24). `_do_foul` now draws it first from
+>    `AND_ONE_PROB` = 0.338 (the real conditional rate; the time head regresses one mean gap
+>    and cannot place a spike at 0). That was 88% of the FTA deficit that has read -3 per team
+>    across runs 2 and 3.
+> 2. **Timeouts after a made basket were gated out.** 6.55 of 10.89 real timeouts/game follow
+>    a made FG; `_event_menu` offered one only at a dead ball. Sim 7.03/game, 0.58 after a
+>    basket. The gate now includes a made basket. No timeout dial is set: measure raw.
+>
+> `dials/v2-run4.json` carries one measured dial (`AND_ONE_PROB`), one 3-sigma residual
+> (`shot_type.mid_top`), and **two projections** -- the shooting-foul offsets brought down by
+> 0.245 and `DELTA_TIME_SCALE` 1.015 -- each with its basis and its re-read order in the README.
+> They are projections because the alternative was a run known to overshoot FTA by ~2/team.
+>
+> **Also this session, TF-free:** the holdout Brier does rise across the 15-day window (0.217
+> Jan 10-14 to 0.254 Jan 20-24, pooled over eight runs), but a season-record log5 baseline with no
+> training cutoff rises by the same amount (0.218 to 0.258) and model-minus-baseline is flat
+> (slope +0.0003/day, p = 0.92). The late slice was harder for everyone -- upset rate 34% -> 42%
+> -- not evidence of distance-from-training decay. A 300-game window is the first honest test.
+>
+> **Pytest has not been run on these changes** (standing rule 1). The and-1 tests pin the draw
+> with `monkeypatch.setattr(config, "AND_ONE_PROB", ...)`; five tests are new.
+
 **Workstream 11 is complete. Phases 1 and 2, Gate B, all of §9 and all of §8 are merged into
 `feature/version2`.** The full suite is green.
 

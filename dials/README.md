@@ -302,3 +302,72 @@ decomposing it says the deficit is not knowledge:
 game-level error cancelled out of the difference and flattered its margins; 2.0 is under-coupled, so
 per-side error survives the subtraction. Possessions are still coupled correctly -- it is efficiency
 that has come apart. That is the thing to chase after the rotation, and it is structural, not a dial.
+
+
+## `v2-run4.json` -- two simulator fixes, and the dials re-read around them
+
+Run 3 was stopped at 64 of 300 games (50 sims). At 64 games it was run 2 to three decimals on
+the winner -- vote Brier 0.211 / 0.211, score-view 0.204 / 0.204 on the same 64 ids -- which is
+what the run 3 package predicted: shot-zone dials move eFG, not the pick. The box read:
+
+| Box residual | run 2 (100 g) | run 3 (64 g) | Verdict |
+|---|---|---|---|
+| `fta` / `ftm` | -3.28 / -2.60 | -2.89 / -2.64 | **the and-1 path** -- fixed in the controller, not dialled |
+| `fga` +, pace + | +3.10 / +1.52 | +2.69 / +1.42 | 1.4 of the FGA excess is the FT deficit wearing an FGA label (0.44 x 3.3); the rest is the clock |
+| timeouts/game | -- | 7.03 vs 10.89 | **a gated-out context** -- fixed in the controller, not dialled |
+| `efg` | -.0136 | -.0100 | half-landed: 3P% 35.2 vs 36.7 (2.1 sigma), 2P% exact (55.0 vs 55.0); mix within 2 sigma everywhere but `mid_top` |
+| `oreb` +0.89, `stl` +0.52, `tov` +0.51, `blk` +0.30 | | | all < 3 sigma at 128 team-games; held |
+
+### The and-1 branch is now a drawn decision, not an inference from the previous row
+
+The measurement that settled it, real 2023 (1320 games) against the run 3 sims (64 x 50):
+
+| per game | real 2023 | actual 64 | sim 64x50 |
+|---|---|---|---|
+| fouls whose previous row is a made FG | 15.50 | 15.44 | **17.44** |
+| of which at the basket's clock (dt = 0) | 5.42 | 5.34 | 0.33 |
+| of which shooting, dt = 0 (the and-1) | 5.24 | 5.20 | **0.29** |
+| of which shooting, dt > 0 | 4.43 | 4.38 | **8.43** |
+| ... paid at ONE free throw | 1.40 | 1.44 | **8.29** |
+| P(and-1 given a foul after a basket) | **0.338** | 0.337 | 0.016 |
+| FTA | 46.8 | 47.2 | 41.4 |
+
+The sim was not short of fouls after baskets -- it had two more than real -- it classified
+nearly all of them as and-1s (previous row is a made FG, never mind when) and paid each one
+free throw. `_do_foul` now draws the and-1 first, from **`AND_ONE_PROB` = 0.338**, before the
+side and the type: a hit is a defensive shooting foul at the basket's clock with the scorer
+shooting one (no clock advance, the time head is not asked); a miss is an ordinary foul on the
+next possession, framed by the new possession's side draw and paid at the token's count. The
+conditional time head cannot express this on its own -- it regresses one mean gap, and a spike
+at 0 beside a hump near 10s has its mean in the valley -- so the rate is pinned, exactly as the
+fouler's side is. The proper model-side fix (a zero-inflated gap head) is a one-head retrain and
+is deferred until the 300-game run says the foul path is the last big box residual.
+
+### Timeouts after a made basket were never on the menu
+
+Of 10.89 real timeouts/game, **6.55 follow a made field goal**; the sim's 7.03 had 0.58 there.
+`_event_menu` offered a timeout only at `ball_dead`, and a made basket is not a dead ball
+except late (clause 10, correctly -- it is not a substitution window). It now offers one at a
+dead ball OR a made basket. This is a context the event head was trained on and could never
+emit, so no `EVENT_BIAS.timeout` is set: measure the raw rate first.
+
+### What is fitted, and what is projected
+
+Three values in this package are **projections** from the run 3 play-by-play under the two
+fixes, not measurements of a run that contains them. They are here because the alternative was a
+run that over-corrects by a known amount, and each one says what to re-read.
+
+| Dial | run 3 | run 4 | Basis |
+|---|---|---|---|
+| `AND_ONE_PROB` | -- | 0.338 | **measured**, real conditional rate |
+| `TYPE_BIAS.foul_type` shooting 2pt / 3pt | +0.268 / +0.774 | **+0.023 / +0.529** | projected (-0.245 on both): those offsets were solved while 8.4 shooting fouls/game were mis-paid. With and-1s at 0.338 x 17.4 = 5.9 and the other 11.5 fouls-after-a-basket typed at the ordinary 49.4% shooting share, shooting fouls land at 23.1 vs 21.0 real; -0.245 logit on the non-and-1 shooting share (49.4% -> 43.3%) puts them at 21.0 |
+| `DELTA_TIME_SCALE` | 1.0 | **1.015** | projected: pace is +1.42 raw; the FT recovery adds 0.44 x 2.9 = +1.3 possessions/team to the box formula; 3.9 more timeouts at the sim's ~7s of clock around one take -1.0; 102.6 / 100.9 = 1.017, rounded down because the timeout dt after a basket is unmeasured |
+| `TYPE_BIAS.shot_type.mid_top` | -- | -0.190 | measured, 3.5 sigma over-production (3.51% vs 2.89% of live attempts) |
+| everything else | | held | 3P% -1.5pp is 2.1 sigma on 64 games; `oreb`, `stl`, `tov`, `blk` under 3 |
+
+**Re-read in this order once run 4 has ~100 games:** (1) and-1s/game (target 5.2) and
+fouls-after-a-basket (17.4 is the event head; if it moves, so does the and-1 count); (2) FTA per
+team (23.6) -- if it overshoots by more than a sigma, the foul_type projection was too shallow, and
+the shooting offsets refit from the play-by-play as before; (3) timeouts/game (10.9) and the dt
+into and out of one; (4) pace, last, and only then move `DELTA_TIME_SCALE` off 1.015. Do not
+touch the shooting-foul offsets and the clock scale in the same re-read.
