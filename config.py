@@ -40,6 +40,20 @@ ROSTER_SAB_LAYERS = 3      # Set-Attention blocks in the roster set-encoder (was
 # them into an all-global graph is silently wrong rather than an error -- the manifest check is
 # what catches it. A/B-ing the setting therefore means a retrain, not a re-run.
 #
+# --- W3: the per-game regime latent (models/regime.py) ---------------------------------------
+# One free vector per training game, concatenated into the fusion, sampled once per rollout at
+# inference. It exists because the simulator's two teams do not share a game: corr(home pts, away
+# pts) across the sims of one game is 0.02 against a real 0.35, which makes the margin sd 16.5
+# against a real 13.7 AND the total sd 16.7 against a real 19.7 -- one missing shared term, seen
+# from both sides. A shrinkage dial cannot add a term that is not there.
+#
+# Four dimensions: enough for tempo, shooting and whistle to separate, small enough that the L2
+# keeps it from memorising a game outright. These are ARCHITECTURE, not rollout dials -- they
+# change weight shapes, so they belong in the manifest's arch snapshot and not in _TUNING_KEYS.
+REGIME_ENABLED = True
+REGIME_DIM = 4
+REGIME_L2 = 1e-3
+
 # LOCAL_ATTENTION_HEADS = 0 disables the mechanism entirely and rebuilds the pre-2.0 graph
 # unchanged, which is what makes that A/B a clean comparison.
 LOCAL_ATTENTION_HEADS = 2   # heads per block restricted to the window (0 = all global)
