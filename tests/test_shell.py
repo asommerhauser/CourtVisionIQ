@@ -98,9 +98,12 @@ def test_set_dict_dial_takes_json(sh, capsys):
 
 
 def test_dials_changed_shows_before_and_after(sh, capsys):
+    # Read the "before" off config rather than hardcoding it: this asserts that the session
+    # snapshots the startup value and renders it, not what that value currently happens to be.
+    before = config.DELTA_TIME_SCALE
     run(sh, capsys, "set DELTA_TIME_SCALE 0.99")
     out = run(sh, capsys, "dials --changed")
-    assert "0.97" in out and "0.99" in out
+    assert f"{before!r}" in out and "0.99" in out
 
 
 def test_unset_restores_one_dial(sh, capsys):

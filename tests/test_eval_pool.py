@@ -514,8 +514,9 @@ def test_build_run_report_uses_the_run_dials_not_the_live_config(tmp_path, monke
 
     seen = {}
 
-    def fake_build_report(*, records, aggregate, n_sims, run_name, tuning=None):
-        seen.update(n_sims=n_sims, run_name=run_name, tuning=tuning, n=len(records))
+    def fake_build_report(*, records, aggregate, n_sims, run_name, tuning=None, window=0):
+        seen.update(n_sims=n_sims, run_name=run_name, tuning=tuning, window=window,
+                    n=len(records))
         return {"n_sims": n_sims}
 
     monkeypatch.setattr("reporting.eval_report.build_report", fake_build_report)

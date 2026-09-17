@@ -56,8 +56,9 @@ def _run_stage(tmp_path, monkeypatch, *, records, n_sims):
 
     seen = {}
 
-    def fake_build_report(*, records, aggregate, n_sims, run_name):
+    def fake_build_report(*, records, aggregate, n_sims, run_name, window=0):
         seen["n_sims"] = n_sims
+        seen["window"] = window
         return {"n_sims": n_sims, "n_games": len(records)}
 
     monkeypatch.setattr("reporting.eval_report.build_report", fake_build_report)

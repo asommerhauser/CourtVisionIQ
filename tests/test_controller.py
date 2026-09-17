@@ -131,6 +131,24 @@ def rows(ctrl):
     return ctrl.sim.history
 
 
+# ``_do_foul`` DRAWS the fouler's side from FOUL_OFFENSE_SIDE_PROB and only then samples the
+# fouler from that side's five (controller.py). Scripting an offensive player as the fouler
+# therefore does not put the foul on the offense any more -- the scripted name is returned
+# whichever five was asked for, so the side has to be pinned or the test asserts against a
+# coin flip. p = 1.0 makes ``rng.random() >= p`` false for every draw and p = 0.0 makes it
+# true for every draw, so both fixtures are deterministic without leaning on the seed.
+@pytest.fixture
+def offense_side(monkeypatch):
+    """Pin the fouler to the team with the ball."""
+    monkeypatch.setattr(config, "FOUL_OFFENSE_SIDE_PROB", 1.0)
+
+
+@pytest.fixture
+def defense_side(monkeypatch):
+    """Pin the fouler to the team defending."""
+    monkeypatch.setattr(config, "FOUL_OFFENSE_SIDE_PROB", 0.0)
+
+
 # ===================================================================== #
 # Assist → made shot
 # ===================================================================== #
@@ -372,7 +390,7 @@ def test_rebounding_foul_is_masked_to_common_types():
     assert (foul["event"], foul["type"]) == ("foul", "personal")
 
 
-def test_offensive_foul_is_a_turnover_no_fts():
+def test_offensive_foul_is_a_turnover_no_fts(offense_side):
     ctrl = make_controller(HOME)
     ctrl.sim.script(player=["A", "F"], type=["offensive"])  # fouler A on offense, victim F
     ctrl._do_foul(delta=5.0)
@@ -420,7 +438,7 @@ def test_flagrant2_ejects_fouler_and_keeps_possession():
 # Side-aware fouls — the fouler's side is resolved before the type is sampled
 # ===================================================================== #
 
-def test_offense_side_fouler_is_masked_to_offensive_side_types():
+def test_offense_side_fouler_is_masked_to_offensive_side_types(offense_side):
     ctrl = make_controller(HOME)
     ctrl.sim.script(player=["A", "F"], type=["offensive"])  # A is on the offense; victim F
     ctrl._do_foul(delta=5.0)
@@ -435,7 +453,7 @@ def test_offense_side_fouler_is_masked_to_offensive_side_types():
     assert set(allowed) == {"offensive", "loose ball", "technical", "flagrant-1", "flagrant-2"}
 
 
-def test_defense_side_fouler_is_masked_to_everything_but_offensive():
+def test_defense_side_fouler_is_masked_to_everything_but_offensive(defense_side):
     ctrl = make_controller(HOME)
     ctrl.sim.script(player=["F", "A"], type=[SHOOTING_2PT], result=["made", "made"])
     ctrl._do_foul(delta=5.0)
@@ -456,7 +474,7 @@ def test_foul_side_is_resolved_before_the_type_is_sampled():
     assert kinds[:2] == ["player", "type"]
 
 
-def test_offense_side_technical_sends_free_throws_to_the_defense():
+def test_offense_side_technical_sends_free_throws_to_the_defense(offense_side):
     ctrl = make_controller(HOME)                 # home has the ball
     # A (home, on offense) picks up a technical: the AWAY team shoots it, not home.
     ctrl.sim.script(player=["A", "F"], type=["technical"], result=["made"])
@@ -469,7 +487,7 @@ def test_offense_side_technical_sends_free_throws_to_the_defense():
     assert ctrl.team_fouls[HOME] == 0            # technicals never count toward the penalty
 
 
-def test_offense_side_flagrant_sends_free_throws_and_the_ball_to_the_defense():
+def test_offense_side_flagrant_sends_free_throws_and_the_ball_to_the_defense(offense_side):
     ctrl = make_controller(HOME)
     ctrl.sim.script(player=["A", "F"], type=["flagrant-1"], result=["made", "made"])
     ctrl._do_foul(delta=5.0)
@@ -479,7 +497,7 @@ def test_offense_side_flagrant_sends_free_throws_and_the_ball_to_the_defense():
     assert ctrl.team_fouls[HOME] == 1            # charged to the fouling team, offense or not
 
 
-def test_offense_side_loose_ball_foul_counts_and_keeps_possession():
+def test_offense_side_loose_ball_foul_counts_and_keeps_possession(offense_side):
     ctrl = make_controller(HOME)
     ctrl.sim.script(player=["A", "F"], type=["loose ball"])
     ctrl._do_foul(delta=5.0)
@@ -778,7 +796,7 @@ def test_an_and_one_names_the_scorer_as_the_fouled_player():
     assert not [c for c in ctrl.sim.calls if c[0] == "player" and c[1] == "shot"]
 
 
-def test_an_offensive_foul_names_the_defender_who_drew_it():
+def test_an_offensive_foul_names_the_defender_who_drew_it(offense_side):
     ctrl = make_controller(HOME)
     ctrl.sim.script(player=["A", "G"], type=["offensive"])
     ctrl._do_foul(delta=5.0)
