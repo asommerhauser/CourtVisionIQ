@@ -88,6 +88,15 @@ from models.rotation_features import (
     make_rotation_inputs,
     side_scalars,
 )
+from models.regime import (
+    GAME_INDEX_KEY,
+    build_regime_model,
+    REGIME_KEY,
+    append_regime_batches,
+    make_regime_input,
+    regime_projection,
+    regime_std,
+)
 from models.prior_features import (
     PRIOR_INPUT_KEYS,
     append_prior_batches,
@@ -147,7 +156,7 @@ _PROCESSED = {"train": "cond_train.npz", "test": "cond_test.npz", "holdout": "co
 _BASE_INPUT_KEYS = (
     "event", "player", "type", "result", "season", "secondary_player",
     "home_roster", "away_roster", "time_abs", "delta_time",
-    *SEASON_INPUT_KEYS, *GAME_STATE_INPUT_KEYS, *ROSTER_STATE_KEYS, *PRIOR_INPUT_KEYS,
+    *SEASON_INPUT_KEYS, *GAME_STATE_INPUT_KEYS, *ROSTER_STATE_KEYS, *PRIOR_INPUT_KEYS, REGIME_KEY,
     "pad_mask",
 )
 
@@ -354,7 +363,7 @@ class ConditionalTypeModel:
         keys_next_cat = ["next_event", "next_player", "next_type", "next_result"]
 
         batches = {k: [] for k in (*keys_1d, *keys_roster, *keys_cont, *SEASON_INPUT_KEYS,
-                                   *GAME_STATE_INPUT_KEYS, *ROSTER_STATE_KEYS, *PRIOR_INPUT_KEYS,
+                                   *GAME_STATE_INPUT_KEYS, *ROSTER_STATE_KEYS, *PRIOR_INPUT_KEYS, REGIME_KEY, GAME_INDEX_KEY,
                                    *keys_next_cat, "next_delta_time",
                                    "pad_mask", "loss_mask")}
 
@@ -386,6 +395,7 @@ class ConditionalTypeModel:
             append_game_state_batches(batches, cols, idx, n, SEQ)
             append_rotation_batches(batches, cols, idx, n, SEQ)
             append_prior_batches(batches, cols, idx, n, SEQ)
+            append_regime_batches(batches, len(batches[REGIME_KEY]), SEQ)
 
             # Conditioning / target arrays: next-step shift within this game.
             for k in keys_next_cat:
@@ -457,6 +467,7 @@ class ConditionalTypeModel:
         rest_home, rest_away, team_inputs = make_season_inputs(SEQ)
         rotation_inputs = make_rotation_inputs(SEQ)
         prior_inputs, team_prior_inputs = make_prior_inputs(SEQ)
+        regime_input = make_regime_input(SEQ)
         game_state_inputs = make_game_state_inputs(SEQ)
         next_event = Input(shape=(SEQ,), dtype="int32", name="next_event")
         next_delta_time = Input(shape=(SEQ, 1), dtype="float32", name="next_delta_time")
@@ -503,12 +514,13 @@ class ConditionalTypeModel:
         t_next_delta = layers.Dense(16, name="next_delta_time_proj")(next_delta_time)
         t_team = season_team_projections(team_inputs)  # games-played + team rest per side
         t_gs = game_state_projections(game_state_inputs)
-        t_prior = prior_team_projections(team_prior_inputs)  # season-to-date team rates  # score / period-clock / team fouls
+        t_prior = prior_team_projections(team_prior_inputs)  # season-to-date team rates
+        t_regime = regime_projection(regime_input)  # the per-game shared component  # score / period-clock / team fouls
 
         # ---- Fusion + the shared causal backbone (models/backbone.py) ----
         x = build_backbone(
             [*embs, *cond_vecs, home_vec, away_vec, t_abs, t_delta, t_next_delta, *t_team,
-             *t_gs, *t_prior],
+             *t_gs, *t_prior, t_regime],
             pad_mask, seq_len=SEQ, d_model=D,
             num_layers=num_layers, num_heads=num_heads, ff_dim=ff_dim, dropout=dropout,
         )
@@ -521,7 +533,7 @@ class ConditionalTypeModel:
             "home_roster": home_roster, "away_roster": away_roster,
             "time_abs": time_abs, "delta_time": delta_time,
             "rest_home": rest_home, "rest_away": rest_away, **team_inputs,
-            **prior_inputs, **team_prior_inputs,
+            **prior_inputs, **team_prior_inputs, REGIME_KEY: regime_input,
             **game_state_inputs,
             **rotation_inputs,
             "next_event": next_event, "next_delta_time": next_delta_time,
@@ -557,6 +569,12 @@ class ConditionalTypeModel:
         (shot_type: live field goals {2pt, 3pt} only — free-throw shot rows are excluded).
         """
         inputs = {k: split[k] for k in self.INPUT_KEYS}
+        # game_index rides along in the batch but is NOT a model input: RegimeModel.train_step pops
+        # it, looks the game's latent row up and writes it into the `regime` plane before the
+        # forward pass. Absent from a split written before 3.0, in which case the zeros plane
+        # stands and the head trains exactly as it did.
+        if GAME_INDEX_KEY in split:
+            inputs[GAME_INDEX_KEY] = split[GAME_INDEX_KEY]
         target_arr = split[f"next_{self.spec.target_field}"]
         targets = {self.output_name: target_arr}
 
@@ -620,6 +638,13 @@ class ConditionalTypeModel:
                            ff_dim=ff_dim, dropout=dropout)
         model.summary()
         warm_start_weights(model, self.KEY, init_weights_root)
+
+        # W3: wrap the functional head in its per-game latent table. `inner` stays the thing that is
+        # compiled, evaluated and SAVED -- build_regime_model returns `model` untouched when the
+        # latent is off, so nothing below has to branch. See models/regime.py for why val_loss will
+        # read worse than a run without it, and why that is the honest number.
+        inner = model
+        model = build_regime_model(inner, int(train_split["pad_mask"].shape[0]))
 
         steps_per_epoch = int(np.ceil(train_split["pad_mask"].shape[0] / batch_size))
         total_steps = steps_per_epoch * epochs
@@ -700,7 +725,15 @@ class ConditionalTypeModel:
                 collector.finalize(status=status)
             raise
 
-        self.save_artifacts(model, root=artifacts_root)
+        # The latent table is a TRAINING device: what survives it is the per-dimension spread the
+        # rollout samples from. Written before save_artifacts so norm_stats.json carries it.
+        if model is not inner:
+            self.norm_stats["regime_std"] = regime_std(model.fitted_table())
+            print(f"[regime] fitted latent sd per dim: "
+                  f"{[round(v, 4) for v in self.norm_stats['regime_std']]}")
+
+        # The INNER functional model, always -- the table is not part of the graph a rollout loads.
+        self.save_artifacts(inner, root=artifacts_root)
 
         if collector is not None:
             test_metrics = model.evaluate(val_ds, return_dict=True, verbose=0)

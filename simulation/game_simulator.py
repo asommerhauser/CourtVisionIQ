@@ -46,13 +46,14 @@ import numpy as np
 # module between runs. ROSTER_SIZE is a fixed architectural constant, not a dial, so it is safe
 # to bind. See config._TUNING_KEYS and tests/test_dials.py.
 import config
-from config import BENCH_SIZE, ROSTER_SIZE
+from config import BENCH_SIZE, ROSTER_SIZE, REGIME_DIM
 from models.conditional_time_model import ConditionalTimeModel
 from encoder.encoder import Encoder
 from models.artifacts import DEFAULT_ARTIFACTS_ROOT
 from models.event_time_model import CATEGORICAL_FIELDS, EventTimeModel
 from models.model_bundle import ModelBundle
 from models.player_model import PlayerModel
+from models.regime import REGIME_KEY, sample_regime
 from models.prior_features import (
     N_PLAYER_PRIORS,
     TEAM_PRIOR_COLS,
@@ -194,6 +195,10 @@ class GameSimulator:
         self.away_priors: dict[str, list] = {}
         self.home_team_priors: dict[str, float] = {}
         self.away_team_priors: dict[str, float] = {}
+        # The game's regime draw: one vector, sampled at start_game and held for every row, so both
+        # teams' events condition on the same night. See models/regime.py. Zeros until a game
+        # starts, and zeros forever for weights trained without a latent.
+        self.regime = np.zeros((REGIME_DIM,), dtype=np.float32)
         # Growing sequence of event rows; each carries its own post-update roster
         # snapshot + absolute time. This list IS the model's input context.
         self.history: list[dict] = []
@@ -249,6 +254,7 @@ class GameSimulator:
         self.home_rest, self.away_rest = {}, {}
         self.home_priors, self.away_priors = {}, {}
         self.home_team_priors, self.away_team_priors = {}, {}
+        self.regime = np.zeros((REGIME_DIM,), dtype=np.float32)
         self.history = []
         self._cache.reset()
 
@@ -272,6 +278,11 @@ class GameSimulator:
         self.away_priors = dict(ctx.get("away_priors", {}) or {})
         self.home_team_priors = dict(ctx.get("home_team_priors", {}) or {})
         self.away_team_priors = dict(ctx.get("away_team_priors", {}) or {})
+        # Drawn ONCE per game, from this sim's own rng, so repeat sims of one matchup get different
+        # nights while the two teams inside a sim share one. norm_stats carries the per-dimension
+        # spread the trained table produced; absent (a pre-3.0 model) it is zeros and the latent
+        # contributes nothing, which reproduces the old behaviour exactly.
+        self.regime = sample_regime(self.rng, self.norm_stats.get("regime_std", ()))
         # Rest / team-scalar columns are derived from this context, so anything already encoded
         # is stale. Free in practice (every start_* sets context before its first append).
         self._cache.on_context_change()
@@ -986,6 +997,11 @@ class GameSimulator:
                 buf = np.zeros((SEQ, 1), dtype=np.float32)
                 buf[:n, 0] = team_map.get(key, normalize_team(key, TEAM_DEFAULTS[key]))
                 inputs[f"{side}_prior_{key}"] = buf
+
+        # The regime latent: the same vector on every real row of the window.
+        regime = np.zeros((SEQ, REGIME_DIM), dtype=np.float32)
+        regime[:n] = self.regime
+        inputs[REGIME_KEY] = regime
 
         team_values = {
             "home_games_played": self.home_games_played,

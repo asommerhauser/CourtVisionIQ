@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from config import ROSTER_SIZE
+from config import ROSTER_SIZE, REGIME_DIM
 from models.event_time_model import CATEGORICAL_FIELDS, EventTimeModel
 from models.game_state_features import (
     GAME_STATE_KEYS, GameStateScan, normalize_game_state_row,
@@ -37,6 +37,7 @@ from models.game_state_features import (
 from models.rotation_features import (
     ROSTER_STATE_KEYS, LineupScan, normalize_lineup_state_row,
 )
+from models.regime import REGIME_KEY
 from models.prior_features import (
     N_PLAYER_PRIORS,
     PRIOR_LIST_COLS,
@@ -119,6 +120,8 @@ class HistoryEncoder:
         # The one column that does NOT pad with zero. A zero prior vector says "a player who does
         # nothing", which is a strong and wrong claim about an empty slot; the league mean says
         # "no information", and it is what the batch path pads with too (append_prior_batches).
+        self._pads[REGIME_KEY] = 0.0
+        buf[REGIME_KEY] = np.zeros((CAP, REGIME_DIM), dtype=np.float32)
         for name in PRIOR_LIST_COLS:
             self._pads[name] = _DEFAULT_PLAYER
             buf[name] = np.repeat(_DEFAULT_PLAYER[None, None, :], CAP * ROSTER_SIZE, axis=0)                 .reshape(CAP, ROSTER_SIZE, N_PLAYER_PRIORS).astype(np.float32)
@@ -212,6 +215,10 @@ class HistoryEncoder:
         }
         for name in TEAM_SCALAR_COLS:
             buf[name][k, 0] = team_values[name]
+
+        # Game-constant, like the priors -- written on every row rather than memoised, because it
+        # is four floats and the memo is keyed by roster, which the latent has nothing to do with.
+        buf[REGIME_KEY][k] = sim.regime
 
         for side, team_map in (("home", sim.home_team_priors), ("away", sim.away_team_priors)):
             for pkey in TEAM_PRIOR_KEYS:
