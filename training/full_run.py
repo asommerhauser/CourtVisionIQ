@@ -29,6 +29,7 @@ from pathlib import Path
 
 from config import (
     DEFAULT_MODEL, EVAL_BATCH, EVAL_GAMES_PER_BATCH, FINAL_HOLDOUT_GAMES, FINAL_SEASON_FRACTION,
+    HOLDOUT_WINDOW_GAMES,
     FULL_RUN_STATE_PATH, ROLLOUT_BATCH_SIZE, SEED, STAGE_SIMS, SUBSET_GAMES_PATH,
     SUBSET_MODEL_KEYS, TEST_FRAC,
 )
@@ -286,11 +287,38 @@ class FullRun:
         print("=" * 70)
 
     # --------------------------------------------------------------- eval
+    def window_ids(self, k: int = 0) -> list[int]:
+        """The ``k``-th rotating holdout window out of the pool in state.
+
+        The pool (``holdout_game_ids``) is every untrained game the model is allowed to be scored
+        on; a window is the ~100 of them one run actually simulates. Windows are disjoint and
+        contiguous, and window 0 is the first games after the train cut -- the ones every run
+        before 3.0 used -- so ``k = 0`` reproduces history exactly.
+
+        Later windows sit further from the cut (March games on January knowledge), which is why
+        every run records its own k: drift with k is a finding, not noise (docs/v3_direction.md §4).
+        """
+        pool = [int(g) for g in self.state.get("holdout_game_ids", [])]
+        width = HOLDOUT_WINDOW_GAMES
+        if k < 0:
+            raise SystemExit(f"window index must be >= 0, got {k}")
+        start = k * width
+        if start >= len(pool):
+            raise SystemExit(
+                f"window {k} starts at pool position {start} but the pool holds {len(pool)} "
+                f"games. Widen it first:  python train.py --extend-holdout  "
+                f"(FINAL_HOLDOUT_GAMES is {FINAL_HOLDOUT_GAMES}).")
+        window = pool[start:start + width]
+        if len(window) < width:
+            print(f"[eval] WARNING: window {k} is short -- {len(window)} games, not {width}. "
+                  f"Its numbers are not directly comparable with a full window.")
+        return window
+
     def eval(self, *, version: str | None = None, name: str | None = None,
              n_sims: int | None = None, concurrency: int | None = None,
              max_new: int | None = None, report_every: int | None = None,
              shard: tuple[int, int] | None = None, seed: int = 0,
-             subset: int | None = None) -> None:
+             subset: int | None = None, window: int = 0) -> None:
         """Predict the holdout into a results run at results/v<version>/<eval-name>/.
 
         ``version`` defaults to the trained run's version. ``name`` names the eval folder (default:
@@ -301,6 +329,11 @@ class FullRun:
         in cohorts of this width, so memory is bounded by ``concurrency`` no matter how many games/sims
         are pooled. ``max_new`` caps NEW games this call (batched / interrupt-friendly); ``None`` runs
         the whole holdout, flushing an intermediate report every ``report_every`` games.
+
+        ``window`` (--window K) picks which ~100-game slice of the holdout pool this run scores.
+        It applies FIRST, before ``subset`` and before the shard stride, so "window 2, 50 games,
+        4 shards" means a 50-game subset OF window 2, split four ways -- never a subset of the
+        whole pool that happens to land near window 2. The order is asserted in the tests.
 
         ``subset`` (--holdout N) narrows the run to an N-game slice of the holdout, pinned to the
         run dir so every later call against it -- resume, shard, merge -- covers the same games.
@@ -331,12 +364,13 @@ class FullRun:
         # `batch_size`, so VRAM is bounded by concurrency regardless of the total pooled.
         batch_size = concurrency or ROLLOUT_BATCH_SIZE
         games_per_batch = EVAL_GAMES_PER_BATCH
-        full_holdout = self.state["holdout_game_ids"]
+        # Window first, then subset, then shard -- see the docstring.
+        full_holdout = self.window_ids(window)
         # Resolve the run dir against the count this run will actually cover (an auto eval-NNN
         # decides "still incomplete?" from it), then pin the ids inside it.
         run_dir = resolve_results_run_dir(
             name_, name=name, holdout_total=len(subset_holdout(full_holdout, subset)))
-        holdout = pin_run_holdout(run_dir, full_holdout, subset=subset)
+        holdout = pin_run_holdout(run_dir, full_holdout, subset=subset, window=window)
         run_total = len(holdout)
         if len(holdout) != len(full_holdout):
             print(f"[eval] holdout subset: {run_total} of {len(full_holdout)} games "
@@ -355,7 +389,7 @@ class FullRun:
             report_every=report_every, data_dir=self.state["data_dir"],
             processed_dir=self.state["processed_dir"], artifacts_root=model_root(name_),
             results_run_dir=run_dir, batch_size=batch_size, games_per_batch=games_per_batch,
-            write_report=shard is None,
+            write_report=shard is None, window=window,
         )
         done, total = report["done"], report["total"]
         print("\n" + "=" * 70)

@@ -243,7 +243,7 @@ class Shard:
 
 def shard_commands(*, model: str | None, run: str, n: int, dials_path, state_path,
                    run_dir, sims=None, concurrency=None, seed=0, python: str | None = None,
-                   tag: str = "", subset=None, gpus=None) -> list[Shard]:
+                   tag: str = "", subset=None, window: int = 0, gpus=None) -> list[Shard]:
     """Build the N ``evaluate.py --shard i/N`` commands, their cards, and their log paths.
 
     ``dials_path`` is required, not optional: it is the only thing stopping a child from re-reading
@@ -253,6 +253,10 @@ def shard_commands(*, model: str | None, run: str, n: int, dials_path, state_pat
 
     ``subset`` (--holdout N) is forwarded for the record, so a shard log shows the run's real shape;
     the run dir's pinned ``holdout.json`` is what actually governs which games a child sees.
+    ``window`` (--window K) is forwarded for a stronger reason: a child that re-reads the state file
+    without being told the window would select a DIFFERENT 100 games of the same size, and every id
+    it produced would look perfectly legitimate. The run dir's ``window.json`` pin refuses the
+    mismatch, but only because the child asserts a value at all.
 
     ``gpus`` (default: every visible device) is dealt round-robin, one card per shard, and applied
     as ``CUDA_VISIBLE_DEVICES`` at launch. Nothing in the stack is multi-GPU -- TensorFlow places
@@ -281,6 +285,12 @@ def shard_commands(*, model: str | None, run: str, n: int, dials_path, state_pat
             cmd += ["--seed", str(seed)]
         if subset:
             cmd += ["--holdout", str(subset)]
+        if window:
+            # Forwarded for the same reason --dials is mandatory: a child that re-reads the state
+            # file without being told the window would simulate a DIFFERENT 100 games of the same
+            # size, and every id would still look legitimate. The run dir's window.json pin catches
+            # it on arrival, but only because this line makes the child assert a value at all.
+            cmd += ["--window", str(window)]
         shards.append(Shard(index=i, total=n, cmd=cmd,
                             gpu=cards[(i - 1) % len(cards)] if len(cards) > 1 else None,
                             log=logs / f"shard{tag}-{i}of{n}.log"))
@@ -552,7 +562,7 @@ def build_run_report(run_dir, *, model: str, echo=print) -> dict | None:
 
     Returns None when no game has finished yet.
     """
-    from reporting.eval_report import build_report, write_eval_report
+    from reporting.eval_report import build_report, run_window, write_eval_report
     from simulation.eval_metrics import _aggregate, print_summary, reported_sims
 
     run_dir = Path(run_dir)
@@ -576,8 +586,12 @@ def build_run_report(run_dir, *, model: str, echo=print) -> dict | None:
     aggregate = _aggregate(records)
     # run_name is the MODEL name, matching what evaluate_stage stamps, so a mid-run report and a
     # --report-only merge are indistinguishable.
+    # The window comes from the run dir's own pin, not from this process's arguments: the
+    # supervisor may be rebuilding a report for a run it did not launch (a resume, a later merge),
+    # and the pin is the only thing that knows which 100 games these records came from.
     rep = build_report(records=records, aggregate=aggregate,
-                       n_sims=reported_sims(records, default=0), run_name=model, tuning=tuning)
+                       n_sims=reported_sims(records, default=0), run_name=model, tuning=tuning,
+                       window=run_window(run_dir))
     write_eval_report(rep, run_dir=run_dir)
     print_summary(aggregate, len(records), rep["n_sims"])
     return rep
@@ -626,6 +640,17 @@ def run_procs(args) -> None:
 
     name_ = model_name(args.model or state.get("version") or config.DEFAULT_MODEL)
     subset = getattr(args, "holdout", None)
+    # Window first, then subset -- identical to FullRun.eval, so a pooled run and a single-process
+    # run with the same flags cover the same games. Reversing these would silently score a subset
+    # of the whole pool that merely overlaps the window asked for.
+    window = int(getattr(args, "window", 0) or 0)
+    width = config.HOLDOUT_WINDOW_GAMES
+    start = window * width
+    if start >= len(holdout):
+        raise SystemExit(
+            f"window {window} starts at pool position {start} but the pool holds "
+            f"{len(holdout)} games. Widen it first:  python train.py --extend-holdout")
+    holdout = holdout[start:start + width]
     run_dir = resolve_results_run_dir(
         name_, name=args.run, holdout_total=len(subset_holdout(holdout, subset)))
     run_name = run_dir.name
@@ -633,7 +658,7 @@ def run_procs(args) -> None:
     # Narrow to (and pin) the games this run covers BEFORE sizing the pool -- autosize_procs and
     # every progress denominator below read len(holdout).
     full_total = len(holdout)
-    holdout = pin_run_holdout(run_dir, holdout, subset=subset)
+    holdout = pin_run_holdout(run_dir, holdout, subset=subset, window=window)
 
     # The dial package: written once, handed to every child. Without it each child re-reads
     # config.py and a runtime-tuned parent silently gets a report over two different tunings.
@@ -656,6 +681,7 @@ def run_procs(args) -> None:
             if n <= 1 and wave == 1:
                 return []      # caller falls back to the in-process path
             return shard_commands(model=name_, run=run_name, n=n, dials_path=dials_path,
+                                  window=window,
                                   state_path=state_path, run_dir=run_dir,
                                   sims=args.monte_carlo, concurrency=args.concurrency,
                                   seed=args.seed, subset=subset,

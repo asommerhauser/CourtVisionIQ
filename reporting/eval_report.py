@@ -90,6 +90,9 @@ def resolve_results_run_dir(model: str, *, name: str | None = None,
 # it instead of re-deriving from the training state, so a subset run's denominators stay right with
 # no flag to remember and the run stays self-describing.
 RUN_HOLDOUT_NAME = "holdout.json"
+# Which rotating window the run scored, pinned beside the ids. A run dir written before 3.0
+# has no such file and reads as window 0, which is true of every one of them.
+RUN_WINDOW_NAME = "window.json"
 
 
 def subset_holdout(ids, n: int | None):
@@ -113,7 +116,16 @@ def subset_holdout(ids, n: int | None):
     return ids[::len(ids) // n][:n]
 
 
-def pin_run_holdout(run_dir, full_holdout, *, subset: int | None = None) -> list[int]:
+def run_window(run_dir) -> int:
+    """The rotating-window index a run dir was scored at; 0 for any run written before 3.0."""
+    path = Path(run_dir) / RUN_WINDOW_NAME
+    if not path.is_file():
+        return 0
+    return int(json.loads(path.read_text(encoding="utf-8")).get("k", 0))
+
+
+def pin_run_holdout(run_dir, full_holdout, *, subset: int | None = None,
+                    window: int | None = None) -> list[int]:
     """The game ids this run covers, pinned to ``run_dir/holdout.json`` on first use.
 
     An existing pin wins: that is what makes a resume, a ``--shard`` child and a later
@@ -121,11 +133,30 @@ def pin_run_holdout(run_dir, full_holdout, *, subset: int | None = None) -> list
     ``subset`` that disagrees with the pin is an error rather than a silent re-slice -- the run's
     finished games were simulated against the pinned set, and re-slicing would report them under a
     total they never belonged to.
+
+    ``window`` gets the same treatment, and needs it more. A subset that disagrees with the pin at
+    least changes the game COUNT, so it is visible; a window that disagrees selects a different 100
+    games of the same size, and without this check a resume under the wrong ``--window`` would
+    quietly append games from another stretch of the calendar to a finished run and report the mix
+    under one headline. The pinned ids would not even catch it, because the child reads them back
+    from the pin -- it is the report's ``window`` field that would be the lie.
     """
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     path = run_dir / RUN_HOLDOUT_NAME
     wanted = [int(g) for g in subset_holdout(full_holdout, subset)]
+
+    window_path = run_dir / RUN_WINDOW_NAME
+    if window is not None:
+        if window_path.is_file():
+            pinned_k = int(json.loads(window_path.read_text(encoding="utf-8")).get("k", 0))
+            if pinned_k != int(window):
+                raise ValueError(
+                    f"{window_path} pins window k={pinned_k} for this run, but --window "
+                    f"{window} was asked for. A run scores one window; use a new --run name.")
+        else:
+            window_path.write_text(json.dumps({"k": int(window), "size": len(wanted)}, indent=2),
+                                   encoding="utf-8")
 
     if path.is_file():
         pinned = [int(g) for g in json.loads(path.read_text(encoding="utf-8"))]
@@ -161,7 +192,7 @@ def _git_commit() -> str:
         return ""
 
 
-def build_report(*, records: list[dict], aggregate: dict, n_sims: int,
+def build_report(*, records: list[dict], aggregate: dict, n_sims: int, window: int = 0,
                  run_name: str | None = None, tuning: dict | None = None) -> dict:
     """Package the harness output into a serializable report dict.
 
@@ -180,6 +211,10 @@ def build_report(*, records: list[dict], aggregate: dict, n_sims: int,
         "platform": platform.platform(),
         "n_games": len(records),
         "n_sims": n_sims,
+        # Which rotating window of the untrained tail these games came from. Recorded on every
+        # report because later windows sit further from the train cut -- March games judged on
+        # January weights -- so drift with k is a finding, not noise (docs/v3_direction.md §4).
+        "window": int(window),
         "tuning": tuning,
         "aggregate": aggregate,
         "records": records,
@@ -767,6 +802,7 @@ def render_html(report: dict) -> str:
         f"<h1>Holdout evaluation report</h1>"
         f"<p class='sub'>Run <code>{_esc(report['run_id'])}</code>{name} · "
         f"{_esc(report['n_games'])} games × {_esc(report['n_sims'])} sims · "
+        f"window k={_esc(report.get('window', 0))} · "
         f"{_esc(report['created_at'])} · commit {_esc(report['git_commit'] or '—')}</p>"
     )
     sections = [
@@ -943,6 +979,10 @@ def _run_summary_frame(report: dict) -> pd.DataFrame:
         "git_commit": report.get("git_commit"),
         "n_games": report["n_games"],
         "n_sims": report["n_sims"],
+        # The window this run scored. Pooling run_summary rows across runs is the whole point of
+        # rotating windows, and without this column the pooled table cannot tell six distinct
+        # 100-game windows from six re-runs of the same one.
+        "window_k": report.get("window", 0),
         # How many distinct tunings the holdout spanned (1 = single tuning; >1 = retuned mid-run, so
         # the run-level dials below are only the last segment's — see progression.parquet).
         "n_tuning_segments": len(agg.get("progression") or []),
