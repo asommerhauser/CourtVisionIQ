@@ -230,12 +230,19 @@ class FullRun:
     # --------------------------------------------------------------- train
     def train(self, *, rebuild_vocabs: bool = False) -> None:
         from models.pipeline import run_stage
+        from models.prior_features import require_priors
 
         self._require()
         if self.state["status"] == "trained":
             print("[train] already trained — run:  python evaluate.py --model "
                   f"{self.state.get('version', DEFAULT_MODEL)}")
             return
+        # W2.1's inputs come from a sidecar the cleaner does not build. merge_prior_features only
+        # WARNS when it is missing, because a synthetic fixture and a weights-only machine both
+        # legitimately have none -- but a train without it feeds every player the league mean, and
+        # the first sign of that would be the eval, hours later. Refuse here instead.
+        covered = require_priors(self.state["data_dir"])
+        print(f"[train] priors sidecar covers {covered:,} games")
         idx = game_index(self.state["data_dir"])
         partition = sequential_partition(idx, self.state["boundary_idx"],
                                          n_holdout=FINAL_HOLDOUT_GAMES, val_frac=TEST_FRAC, seed=SEED)

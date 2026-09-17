@@ -188,10 +188,10 @@ class ConditionalTimeModel(SubstitutionModel):
             refit=refit_norm_stats,
         )
         merge_game_state_features(df, cols)  # running score / period-clock / team fouls
-        merge_rotation_features(df, cols)
+        merge_rotation_features(df, cols)  # per-player stint / minutes / fouls
         # Season-to-date per-player and per-team rates, joined from the causal sidecar
         # (player_priors.py). Fixed-constant normalization, so no norm_stats keys.
-        merge_prior_features(df, cols, rosters, self.path)  # per-player stint / minutes / fouls
+        merge_prior_features(df, cols, rosters, str(self.data_dir))
 
         train = self._build_split(cols, game_id, train_games)
         test = self._build_split(cols, game_id, test_games)
