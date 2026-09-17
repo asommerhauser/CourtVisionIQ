@@ -49,6 +49,7 @@ from models.rotation_features import (
     make_rotation_inputs,
     side_scalars,
 )
+from models.rollout_selection import apply_selection, build_selector
 from models.scheduled_sampling import ScheduledSamplingSchedule
 from models.train_steps import build_trainer
 from models.regime import (
@@ -707,6 +708,7 @@ class EventTimeModel:
         return gpus
 
     def train(self, epochs=50, batch_size=64, lr=3e-4, time_loss_weight=0.5,
+              rollout_score_fn=None,
               patience=10, artifacts_root=DEFAULT_ARTIFACTS_ROOT,
               mixed_precision=True, jit_compile=False,
               num_layers=NUM_LAYERS, num_heads=NUM_HEADS, ff_dim=FF_DIM, dropout=0.2,
@@ -856,6 +858,14 @@ class EventTimeModel:
         if getattr(model, "scheduled_sampling", False):
             callbacks.append(ScheduledSamplingSchedule(model))
 
+        # W4 rung 2. The selector NEVER restores -- EarlyStopping(restore_best_weights=True) runs at
+        # on_train_end, after every callback's on_epoch_end, so a restore here would be silently
+        # undone and the run would report an epoch that is not what reached disk. apply_selection
+        # below runs after fit() returns, which is strictly later.
+        selector = build_selector(model, score_fn=rollout_score_fn) if rollout_score_fn else None
+        if selector is not None:
+            callbacks.append(selector)
+
         status = "completed"
         history = None
         try:
@@ -869,6 +879,12 @@ class EventTimeModel:
             if collector is not None:
                 collector.finalize(status=status)
             raise
+
+        # Rung 2's restore, strictly after EarlyStopping's. A no-op when the selector is off or
+        # nothing was ever scored, in which case the weights are exactly what EarlyStopping chose.
+        selection = apply_selection(model, selector, history=history)
+        if selection is not None:
+            self._checkpoint_selection = selection
 
         # The latent table is a TRAINING device: what survives it is the per-dimension spread the
         # rollout samples from. Written before save_artifacts so norm_stats.json carries it.
