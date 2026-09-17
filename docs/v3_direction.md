@@ -131,6 +131,56 @@ vector per name. Three implementations, stacked, in the order they should be bui
    `get_config` and `from_config`). Team-level: net rating, pace, off/def rating, same pass.
    This is the two-week experiment that says whether the ceiling is there. Inputs do not reduce
    variance: sampling does the variance; inputs move the centre.
+
+   **Where the data comes from: the play-by-play we already have. No external source, no join.**
+   - `generate_box_score(game_df, home_team, away_team)` in `simulation/box_score.py` already
+     turns one real game's event rows into a per-player box — minutes, pts, fga/fgm, tpa/tpm,
+     fta/ftm, ast, oreb, dreb, tov, pf. It is what builds `actual_boxscore.txt` for every
+     holdout game (`simulation/evaluation.py:338`). **Use it; do not write a second tally.** A
+     throwaway re-implementation during the 2.0 analysis matched only 81/96 final scores
+     (free-throw and heave edge cases) — the vetted function is the one the report already
+     scores against, so the prior and the target agree by construction.
+   - `season_context.py` already walks each season's games in date order carrying per-team and
+     per-player state (that is how `rest_home` / `games_played` are written). Player averages
+     are the same walk with one more accumulator. The order inside the loop is the whole
+     causality guarantee:
+     ```
+     for each game, in chronological order:
+         write priors for every rostered player   # from running totals — BEFORE this game
+         box = generate_box_score(game_df, ...)
+         add box to each player's running totals   # AFTER
+     ```
+     Game N's prior therefore contains games 1…N−1 only, and training and inference read the
+     same column, so they cannot disagree.
+   - Per player, keep running sums of minutes, pts, fga, tpa, fta, ast, oreb, dreb, tov and
+     games played; derive `min_pg` and the per-36 rates from them (`pts_36 = pts / minutes ×
+     36`, etc.) so the rate is role-independent and `min_pg` carries the role. Last-10 is the
+     same sums over a rolling window of that player's games.
+   - Shrinkage seed: the player's **previous-season** rate from the previous `season<YYYY>.csv`
+     (same display-name key, same files), else the league mean. This is what makes opening
+     night and a rookie's first ten games sane instead of noise. `k ≈ 10` games to start;
+     it is a training-side constant, not a `_TUNING_KEYS` dial.
+   - Why no external join: the pipeline has no player IDs (see `v3_planned_changes.md` §2 on
+     age — the join is the real work there). Priors key on the same display-name string, in
+     the same file, that the model already trains on. `'Desmond Bane'` in the roster column is
+     `'Desmond Bane'` in the shot rows.
+   - Team priors (net rating, pace, off/def rating) come from the same walk at the team level,
+     from `team_totals` / `possessions` in `simulation/stats.py` over the same per-game boxes.
+
+   **Plumbing, following the `rest_home` precedent exactly:** roster-parallel list columns
+   produced in `season_context.enrich_df` (add to `NEW_COLUMNS`); normalised and fed by
+   `models/season_features.py` (`REST_LIST_COLS`); fused into the player embedding in
+   `models/roster_set_encoder.py` through `scalar_proj` by raising
+   `RosterEncoderParams.num_scalars` — **in both `get_config` and `from_config`, or weight reload
+   silently breaks**; inference side, `simulation/game_input.py` needs the per-player maps
+   mirroring `home_rest` / `away_rest`, and `simulation/input_cache.py` (the `rest` block around
+   lines 142–156) picks them up. The bench bundle (`sub_decision`) gets the same columns.
+
+   **Tests that ship with it:** (i) causality — for a sample of games, every prior equals what is
+   recomputed from `date < game_date` only; (ii) a rookie on game 1 gets the league-mean prior,
+   not zero and not a crash; (iii) a player who appears in the roster but never in an event row
+   still gets minutes from the roster/`time` columns; (iv) the `num_scalars` round-trip
+   (`get_config` → `from_config` → identical weights load).
 2. **A learned recent-games summary.** The player's last K games of play-by-play through the
    same backbone, pooled, attached to his roster slot. Identity learned from how he has been used
    *lately*. (1) becomes the fill-in when K is small.
@@ -297,3 +347,85 @@ gate unlocks step 7.
 **Next action:** specs for W1 (probes + report metrics + rotating-window support) and W2.1
 (priors), in the format of `v2_planned_changes.md`, followed by one retrain carrying W2.1, W3's
 running-pace feature, and W4 rungs 1–2.
+
+---
+
+## 8. Implementation notes — rules for anyone building 3.0
+
+Collected from the 2.0 cycle. Most of these cost a retrain or a misread result when broken.
+
+**Process**
+- **Spec before code.** Each workstream gets a spec in the `v2_planned_changes.md` format
+  (what / why / how / next steps, with file:line anchors) and its gate copied from §6 before
+  anything is built. A commit at each major implementation step.
+- **Training and evaluation run on the GPU box**, not the dev machine. The dev side writes
+  the code, the tests, and the spec; the run happens on WSL/CUDA and the report comes back.
+  Local pytest and smoke runs stall — do not use them as the check.
+- **Before any train, check `encoder/vocabs/norm_stats.json` against git.** The test suite
+  rewrites the committed encoder vocabs and norm stats; a train that starts from polluted
+  stats is silently wrong.
+- **Line endings are mixed CRLF/LF per file.** A Python rewrite of a file flips them and the
+  diff becomes unreadable. Edit lines, do not round-trip whole files.
+
+**Data and features**
+- Every prior, rate, and game-state feature is computed **once, in one pass, and read by both
+  training and the simulator** — `season_context.py` for per-game constants,
+  `GameStateScan` (`models/game_state_features.py`) for per-row running state, which
+  `simulation/input_cache.py` consumes incrementally. Never compute a feature two ways.
+- **Box scores from play-by-play come from `generate_box_score`** (§3, W2.1). Any new tally
+  is a bug waiting to disagree with the report.
+- **Baselines frozen at the train cut** for every rotating window (§4). A baseline that sees
+  games the weights did not is not a baseline.
+- New per-player scalars go through `RosterEncoderParams.num_scalars` and **both**
+  `get_config` and `from_config`. The kernel shape then fails loudly on a mismatch instead of
+  loading quietly.
+
+**Evaluation and reading results**
+- **Never fit a dial to win / Brier / spread at n ≈ 100** (rule from `dials/README.md`; §1e
+  is the quantification). Gate dials on the box score at 3σ, from `run_summary.parquet`.
+- **Never compare confidence buckets across runs with different `--monte-carlo`.** State the
+  sim count next to every bucket. ≥ 200 sims before any bucket is read.
+- **Print the paired-Brier SE next to every Brier** (sd ≈ 0.133 per game → 0.013 at n = 100).
+  Two runs within ±0.026 on the same games are the same model.
+- **Report both win probabilities** — the sim-count vote and the Gaussian score prob — and
+  never fit the spread calibration into the win path with a nonzero intercept
+  (`simulation/eval_metrics.py:90`). `MARGIN_CALIBRATION_SLOPE` stays 1.0 until the W3 gate
+  passes, then retires.
+- **Repeat runs on the same window use a different `--seed`** so they are independent
+  Monte-Carlo draws; average their score probs. That is the only legitimate way to keep a
+  lucky run.
+- **Window index `k` is recorded** in `report.json` and `run_summary.parquet` and shown on
+  every headline. Drift with k is a finding, not noise.
+- **Judge rotation on CRPS over `player_std`, not minutes MAE** — MAE structurally prefers a
+  flat rotation and gets worse when the rotation model improves.
+- A subset that looks like an edge at n = 100 is checked against the v1 runs on the same
+  games before it is believed (§5). One bucket in nine at p ≈ 0.05 is the expected false
+  positive.
+
+**W1 specifics**
+- The three game-state diagnostics run on the **existing** per-sim play-by-plays under
+  `results/version2/v2-run4/games/*/playbyplay/sim_*.csv` — no re-simulation. Real-side
+  rates come from the same season CSV.
+- The context-sensitivity probe needs only the trained heads and real game prefixes: score
+  `p(next | prefix)` against `p(next | prefix with its last N rows replaced by a flat prefix of
+  the same players and game state)`. Report the mean absolute shift per head and where it
+  is largest.
+- Home/away correlation across sims and pace sd are added to `eval_metrics.py` and
+  `run_summary.parquet` in the same change, so every later run carries them.
+
+**W3 specifics**
+- Running pace (possessions so far ÷ minutes elapsed) is a `GameStateScan` key with a fixed
+  `_NORM` constant, added to `GAME_STATE_KEYS`; the incremental cache path picks it up
+  without a second implementation.
+- The regime latent is sampled **once per rollout** and held for the game; it is not a
+  per-event input. Its gate is the sim's corr(home, away), not any box number.
+
+**W4 specifics**
+- Rung 1 (scheduled sampling): two passes per batch — a no-grad forward to sample the
+  replacement events, then the training pass on the mixed sequence. The mixing probability
+  anneals from 0 and is logged per epoch.
+- Rung 2 (checkpoint selection): an eval hook every 3rd epoch, 20 games × 10 sims from the
+  training-era tail (never from a holdout window), scoring box MAE, margin sd against the
+  real residual sd, and the W1 game-state behaviours. The chosen epoch and its rollout score
+  are written to the run state next to the NLL-best epoch, so the rung-3 condition (§6, step
+  6) is a number, not a judgement.
