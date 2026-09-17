@@ -253,32 +253,52 @@ Run in order. Each step's gate is what decides whether the next one is worth doi
 
 ```bash
 # 0. Pre-flight, per standing rule 5.
+cd /mnt/c/Projects/CourtVisionIQ
 git checkout feature/version3 && git pull
+source ~/cviq-venv/bin/activate
 git status --porcelain encoder/vocabs/          # must be empty
 ```
 
 ```bash
-# 1. Build the priors sidecar on the GPU box (pure pandas, ~10 min, no GPU needed).
+# 1. The suite. This is the authority -- nothing on the dev machine ran pytest.
+python -m pytest -q
+```
+
+**Known state going in.** Six tests in `test_controller.py`, all on the offence-side foul path,
+fail on `main` as well — verified by running them against `main` in a throwaway worktree. They are
+not from 3.0. Everything else should pass; the 3.0 files are `test_standing_metrics`,
+`test_state_probes`, `test_rotating_windows`, `test_player_priors`, `test_regime`,
+`test_scheduled_sampling`, `test_rollout_selection`, `test_feature_manifest` and
+`test_tf_free_imports`.
+
+```bash
+# 2. pytest rewrites the committed encoder vocabs and norm stats. Restore them BEFORE any train.
+git checkout -- encoder/vocabs/
+git status --porcelain encoder/vocabs/          # must be empty again
+```
+
+```bash
+# 3. Build the priors sidecar on the GPU box (pure pandas, ~10 min, no GPU needed).
 python -m player_priors
 ```
 
 ```bash
-# 2. One retrain carrying W2.1 + W3a + W3b + W4 rung 1. Vocabs rebuild: the fusion width changed.
+# 4. One retrain carrying W2.1 + W3a + W3b + W4 rung 1. Vocabs rebuild: the fusion width changed.
 python train.py --full --name version3 --batch-size 64 --rebuild-vocabs
 ```
 
 ```bash
-# 3. Widen the holdout pool 100 -> 700. Passes the prefix guard untouched.
+# 5. Widen the holdout pool 100 -> 700. Passes the prefix guard untouched.
 python train.py --extend-holdout
 ```
 
 ```bash
-# 4. Window 0 -- directly comparable to v2-run1..4, which scored these same 100 games.
+# 6. Window 0 -- directly comparable to v2-run1..4, which scored these same 100 games.
 python evaluate.py --model version3 --run v3-run1 --window 0 --monte-carlo 200 --procs auto
 ```
 
 ```bash
-# 5. The probes and the baselines, on the finished run.
+# 7. The probes and the baselines, on the finished run.
 python -m reporting.state_probes results/version3/v3-run1 --seasons 2023
 ```
 
@@ -298,13 +318,13 @@ python -m reporting.state_probes results/version3/v3-run1 --seasons 2023
 Then, and only then, rung 2 as a **second pass** (it needs a finished bundle to roll out):
 
 ```bash
-# 6. Rung 2: retrain one head warm-started off the finished bundle, selecting on rollout metrics.
+# 8. Rung 2: retrain one head warm-started off the finished bundle, selecting on rollout metrics.
 #    Set ROLLOUT_SELECTION = True in config.py first.
 python train.py --model event_time --name version3
 python evaluate.py --model version3 --run v3-run1-rs --window 0 --monte-carlo 200 --procs auto
 ```
 
-Steps 4 and 6 are a model comparison on the same window, so the **seed is held fixed** — that is the
+Steps 6 and 8 are a model comparison on the same window, so the **seed is held fixed** — that is the
 one case where §8's "repeat runs use a different `--seed`" does not apply, and the run log should
 say so. `v3_direction.md` §6 step 6 (rung 3) fires only if `checkpoint_selection.epochs_disagree` is
 true in the run state.
