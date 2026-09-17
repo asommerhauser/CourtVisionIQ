@@ -36,6 +36,7 @@ import ast
 import numpy as np
 
 from config import BENCH_SIZE, ROSTER_SIZE
+from models.prior_features import N_PLAYER_PRIORS
 from models.game_state_features import iter_game_rows
 
 # Technicals are bench/team fouls and do not count toward the personal-foul disqualification --
@@ -604,19 +605,32 @@ def bench_scalars(bench_inputs, side: str) -> list:
 NUM_BENCH_SCALARS = 4
 
 
-def side_scalars(rest, rotation_inputs, side: str) -> list:
+def side_scalars(rest, rotation_inputs, side: str, prior_inputs=None) -> list:
     """The per-player scalars for one side, in the order the roster encoder expects them.
 
     Rest first, so the single-scalar ordering the encoder had before 2.0 is a prefix of this one
-    and the meaning of scalar 0 does not move. The rest follow ``ROSTER_STATE_KEYS``.
+    and the meaning of scalar 0 does not move. Then ``ROSTER_STATE_KEYS``, then 3.0's season-to-date
+    priors -- appended, never inserted, for the same reason.
+
+    ``prior_inputs`` is optional only so a caller can build a 2.0-shaped graph in a test; every
+    production head passes it, and ``NUM_ROSTER_SCALARS`` counts on it being there. Omitting it
+    produces a graph whose ``scalar_proj`` kernel is the wrong shape, which fails loudly at load
+    rather than quietly at inference -- that is the whole reason the count is baked into a kernel.
     """
-    return [rest] + [rotation_inputs[f"{stem}_{side}"]
-                     for stem in ("stint_seconds", "played_seconds", "court_fouls")]
+    scalars = [rest] + [rotation_inputs[f"{stem}_{side}"]
+                        for stem in ("stint_seconds", "played_seconds", "court_fouls")]
+    if prior_inputs is not None:
+        from models.prior_features import side_prior_scalars
+
+        scalars += side_prior_scalars(prior_inputs, side)
+    return scalars
 
 
-# Number of per-player scalars the roster encoder is built for: rest plus the three above.
-# Feeds RosterEncoderParams.num_scalars, whose kernel shape then encodes the count.
-NUM_ROSTER_SCALARS = 4
+# Number of per-player scalars the roster encoder is built for: rest, the three rotation-state
+# values, and 3.0's ten season-to-date priors. Feeds RosterEncoderParams.num_scalars, whose kernel
+# shape then encodes the count -- so a graph built with the wrong number fails on shapes at
+# load_weights instead of loading quietly and meaning something else.
+NUM_ROSTER_SCALARS = 4 + N_PLAYER_PRIORS
 
 
 # =====================

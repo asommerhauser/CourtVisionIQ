@@ -28,6 +28,7 @@ import pandas as pd
 
 from config import HOLDOUT_MANIFEST_NAME
 from data_loading import load_all_cleaned
+from models.prior_features import priors_for_season
 from models.season_features import DEFAULT_REST_DAYS, _to_list
 from simulation.box_score import _as_rows, _roster
 
@@ -51,6 +52,13 @@ class GameInput:
     away_days_rest: float = DEFAULT_REST_DAYS
     home_rest: dict = field(default_factory=dict)  # player -> days since last game
     away_rest: dict = field(default_factory=dict)
+    # --- Season-to-date priors (see player_priors.py; normalized vectors, PLAYER_PRIOR_KEYS order)
+    # Carried on the spec rather than looked up at rollout time so a saved holdout_inputs.json is
+    # self-contained: the sim reproduces exactly, on a machine with no data/priors/ at all.
+    home_priors: dict = field(default_factory=dict)  # player -> list[float]
+    away_priors: dict = field(default_factory=dict)
+    home_team_priors: dict = field(default_factory=dict)  # team rate -> float
+    away_team_priors: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -64,6 +72,10 @@ class GameInput:
             "away_days_rest": self.away_days_rest,
             "home_rest": dict(self.home_rest),
             "away_rest": dict(self.away_rest),
+            "home_priors": {k: list(v) for k, v in self.home_priors.items()},
+            "away_priors": {k: list(v) for k, v in self.away_priors.items()},
+            "home_team_priors": dict(self.home_team_priors),
+            "away_team_priors": dict(self.away_team_priors),
         }
 
     @classmethod
@@ -79,10 +91,16 @@ class GameInput:
             away_days_rest=float(d.get("away_days_rest", DEFAULT_REST_DAYS)),
             home_rest=dict(d.get("home_rest", {}) or {}),
             away_rest=dict(d.get("away_rest", {}) or {}),
+            # .get with a default on every one: a spec written before 3.0 loads and simulates, it
+            # simply gets league-mean priors -- the same convention every season key here follows.
+            home_priors={str(k): list(v) for k, v in (d.get("home_priors") or {}).items()},
+            away_priors={str(k): list(v) for k, v in (d.get("away_priors") or {}).items()},
+            home_team_priors=dict(d.get("home_team_priors", {}) or {}),
+            away_team_priors=dict(d.get("away_team_priors", {}) or {}),
         )
 
 
-def extract_game_input(game_rows) -> GameInput:
+def extract_game_input(game_rows, *, data_dir: str = "./data") -> GameInput:
     """Build the :class:`GameInput` for a single game's cleaned rows.
 
     ``game_rows`` is one game's rows as a ``pandas.DataFrame`` or a list of dicts. Each
@@ -111,6 +129,28 @@ def extract_game_input(game_rows) -> GameInput:
 
     season = _first_int(rows, "season")
     playoff = 1 if _first_int(rows, "playoff") == 2 else 0
+
+    # Season-to-date priors for the two rosters, from the sidecar keyed on this game id. Missing
+    # priors are not an error here: a spec can be built on a machine with no data/priors/, and the
+    # simulator falls back to the league mean, which is what a player with no history reads as
+    # anyway. merge_prior_features is the place that refuses, because a TRAIN on league means is
+    # the failure worth being loud about.
+    home_priors, away_priors = {}, {}
+    home_team_priors, away_team_priors = {}, {}
+    try:
+        gid = _first_int(rows, "game_id")
+        player_map, team_map = priors_for_season(data_dir, str(season))
+        game_players = player_map.get(gid, {})
+        home_priors = {n: [float(x) for x in game_players[n]]
+                       for n in home_roster if n in game_players}
+        away_priors = {n: [float(x) for x in game_players[n]]
+                       for n in away_roster if n in game_players}
+        sides = team_map.get(gid, {})
+        home_team_priors = dict(sides.get("home", {}))
+        away_team_priors = dict(sides.get("away", {}))
+    except (FileNotFoundError, KeyError, ValueError):
+        pass
+
     return GameInput(
         home_roster=home_roster, away_roster=away_roster, season=season, playoff=playoff,
         home_games_played=_first_float(rows, "home_games_played", DEFAULT_GAMES_PLAYED),
@@ -118,6 +158,8 @@ def extract_game_input(game_rows) -> GameInput:
         home_days_rest=_first_float(rows, "home_days_rest", DEFAULT_REST_DAYS),
         away_days_rest=_first_float(rows, "away_days_rest", DEFAULT_REST_DAYS),
         home_rest=home_rest, away_rest=away_rest,
+        home_priors=home_priors, away_priors=away_priors,
+        home_team_priors=home_team_priors, away_team_priors=away_team_priors,
     )
 
 
