@@ -56,7 +56,7 @@ _SKIP_EVENTS = {"start", "end", "none", "PAD", "UNK", ""}
 # Per-row scalar inputs (shape (SEQ, 1), projected + concatenated into the fusion).
 GAME_STATE_KEYS = (
     "score_diff", "score_total", "period_idx", "period_time_left",
-    "team_fouls_home", "team_fouls_away", "poss_clock",
+    "team_fouls_home", "team_fouls_away", "poss_clock", "running_pace",
 )
 GAME_STATE_INPUT_KEYS = GAME_STATE_KEYS
 
@@ -72,6 +72,17 @@ _NORM = {
     # can act on, and the clip is what keeps a stale possession (a data gap, a long dead ball)
     # from reading as an extreme input.
     "poss_clock": (0.0, 24.0, 24.0),
+    # Possessions per minute so far, counting BOTH teams -- poss_ends is a single game-level
+    # counter, not a per-side one. Measured over 485 real 2022-23 games (240k rows, opening minute
+    # excluded): median 4.03, p1 3.37, p99 4.70, end-of-game mean 3.98 +- 0.19, which is a team pace
+    # of 95.5 per 48. The divisor is 4.0 so an ordinary game sits at 1.0, and the clip is wide
+    # enough that the 99th percentile is nowhere near it -- a first draft used (0, 3.0, 2.0) on the
+    # assumption of a per-team count, which clipped every real row and made the feature a constant.
+    #
+    # Why the feature exists: the simulator's two teams do not share a game (sim corr(home, away)
+    # is 0.02 against a real 0.35), and nothing in its inputs says how fast THIS game has been
+    # going -- every other game-state value is a level, not a rate. This is the cheap half of W3.
+    "running_pace": (0.0, 8.0, 4.0),
 }
 
 
@@ -224,8 +235,10 @@ class GameStateScan:
         # _continuation_of). Read off the scan rather than returned, so step()'s tuple stays
         # exactly GAME_STATE_KEYS for the simulator's incremental path.
         self.is_continuation = False
-        # Possessions completed so far. Not a feature -- it is what the pace check counts, and it
-        # lives here so the check counts the same events the clock resets on, by construction.
+        # Possessions completed so far. As of 3.0 this IS a feature -- running_pace divides it by
+        # elapsed minutes -- as well as what the pace check counts. It lives here so the check counts
+        # the same events the clock resets on, by construction, and so the feature and the check can
+        # never disagree about what a possession is.
         self.poss_ends = 0
 
     def _track_free_throws(self, event, etype, result, t) -> None:
@@ -392,6 +405,11 @@ class GameStateScan:
             if boundary == POSSESSION_END:
                 self.poss_ends += 1
 
+        # Possessions per minute of elapsed clock. The first minute is held at the floor rather
+        # than divided by a near-zero elapsed time: one possession two seconds in would otherwise
+        # read as thirty possessions a minute and swamp the fusion on row two of every game.
+        running_pace = self.poss_ends / max(t / 60.0, 1.0)
+
         self.prev_row = (event, etype_raw, result_raw)
         return (self.home_pts - self.away_pts,
                 self.home_pts + self.away_pts,
@@ -399,7 +417,8 @@ class GameStateScan:
                 _period_end(t) - t,
                 self.fouls_home,
                 self.fouls_away,
-                poss_clock)
+                poss_clock,
+                running_pace)
 
 
 def derive_game_state(rows) -> dict[str, np.ndarray]:

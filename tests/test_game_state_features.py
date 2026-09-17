@@ -116,6 +116,7 @@ def test_normalize_uses_fixed_constants_and_clips():
         "team_fouls_home": np.array([6.0, 0.0, 99.0], dtype=np.float32),
         "team_fouls_away": np.array([6.0, 0.0, 0.0], dtype=np.float32),
         "poss_clock": np.array([24.0, 0.0, 90.0], dtype=np.float32),
+        "running_pace": np.array([4.0, 0.0, 20.0], dtype=np.float32),
     }
     out = gs.normalize_game_state(raw)
     assert np.isclose(out["score_diff"][0], 1.0)
@@ -128,6 +129,9 @@ def test_normalize_uses_fixed_constants_and_clips():
     assert np.isclose(out["team_fouls_home"][2], 12.0 / 6.0)  # clipped at 12
     assert np.isclose(out["poss_clock"][0], 1.0)
     assert np.isclose(out["poss_clock"][2], 1.0)              # clipped at the 24s clock
+    # 4.0 possessions/min (both teams) is an ordinary game -- the divisor is set so it reads 1.0.
+    assert np.isclose(out["running_pace"][0], 1.0)
+    assert np.isclose(out["running_pace"][2], 2.0)            # clipped at 8/min
     for k in gs.GAME_STATE_KEYS:
         assert out[k].dtype == np.float32
 
@@ -138,6 +142,12 @@ def test_normalize_uses_fixed_constants_and_clips():
 
 def _clock(rows):
     return list(gs.derive_game_state(rows)["poss_clock"])
+
+
+# GameStateScan.step returns a tuple in GAME_STATE_KEYS order. Index it BY NAME, never by a
+# position: this test used [-1] to mean poss_clock, and adding running_pace to the end of the
+# tuple silently turned it into a comparison between two different quantities.
+_POSS_CLOCK_IDX = gs.GAME_STATE_KEYS.index("poss_clock")
 
 
 def _ends(rows):
@@ -333,7 +343,7 @@ def test_the_incremental_scan_matches_the_batch_derivation():
         _row("shot", "H4", 31.0, type="top3", result="made"),
     ]
     scan = gs.GameStateScan()
-    incremental = [scan.step(r)[-1] for r in rows]
+    incremental = [scan.step(r)[_POSS_CLOCK_IDX] for r in rows]
     assert incremental == _clock(rows)
 
 
