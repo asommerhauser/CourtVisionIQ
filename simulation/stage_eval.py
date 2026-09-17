@@ -295,7 +295,7 @@ def evaluate_stage(stage_name: str, *, sim=None, df=None, run_label: str | None 
                    batch_size: int = ROLLOUT_BATCH_SIZE,
                    games_per_batch: int = EVAL_GAMES_PER_BATCH,
                    results_run_dir: str | Path | None = None,
-                   write_report: bool = True) -> dict:
+                   write_report: bool = True, window: int = 0) -> dict:
     """Predict a stage's holdout games (``n_sims`` each), write per-game folders + a stage report.
 
     ``holdout_ids`` defaults to the manifest the stage's preprocess wrote (``holdout_games.json``).
@@ -347,7 +347,7 @@ def evaluate_stage(stage_name: str, *, sim=None, df=None, run_label: str | None 
         aggregate = _aggregate(records)
         rep = build_report(records=records, aggregate=aggregate,
                            n_sims=reported_sims(records, default=n_sims),
-                           run_name=run_label or stage_name)
+                           run_name=run_label or stage_name, window=window)
         if not write_report:
             rd = results_run_dir if results_run_dir is not None else Path(reports_root)
         elif results_run_dir is not None:

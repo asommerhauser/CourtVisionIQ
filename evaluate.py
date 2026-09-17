@@ -85,6 +85,14 @@ def build_parser() -> argparse.ArgumentParser:
                          "if you hit OOM, raise it to use more of the card. Independent of --monte-carlo.")
     ap.add_argument("--games", type=int, default=None,
                     help="Cap NEW games simulated this call (batched / interrupt-friendly). Default: all.")
+    ap.add_argument("--window", type=int, default=0, metavar="K",
+                    help="Which rotating holdout window to score (0-based). The pool holds "
+                         "HOLDOUT_WINDOWS disjoint windows of HOLDOUT_WINDOW_GAMES games each, so "
+                         "successive runs cover DISTINCT games instead of re-scoring the same 100. "
+                         "Window 0 is the games immediately after the train cut -- what every run "
+                         "before 3.0 used. Applies BEFORE --holdout's stride and before --shard, "
+                         "and is pinned to the run dir: a later call with a different --window is "
+                         "an error, not a re-slice.")
     ap.add_argument("--holdout", type=int, default=None, metavar="N",
                     help="Evaluate an N-game SUBSET of the holdout: every (total//N)-th game, so "
                          "the sample spans the whole holdout window. Pinned to the run dir on "
@@ -158,6 +166,9 @@ def main() -> None:
     if args.holdout is not None and args.holdout < 1:
         ap.error(f"--holdout must be a positive game count, got {args.holdout}")
 
+    if args.window < 0:
+        ap.error(f"--window must be >= 0, got {args.window}")
+
     if args.procs and str(args.procs) != "1":
         from eval_pool import run_procs          # TF-free supervisor; children do the TF work
         return run_procs(args)
@@ -170,7 +181,7 @@ def main() -> None:
     else:
         run.eval(version=args.model, name=args.run, n_sims=args.monte_carlo,
                  concurrency=args.concurrency, max_new=args.games, shard=shard,
-                 seed=args.seed, subset=args.holdout)
+                 seed=args.seed, subset=args.holdout, window=args.window)
 
 
 if __name__ == "__main__":

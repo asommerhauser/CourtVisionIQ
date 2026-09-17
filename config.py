@@ -607,7 +607,18 @@ FINAL_SEASON_FRACTION = 0.5
 # Room to grow: the corpus holds 26,969 games against a boundary at 26,267, so 702 are available.
 # On an ALREADY-TRAINED model this constant is not read again (full_run.setup consumes it, and
 # re-running setup would reset status/trained_models) -- use `python train.py --extend-holdout`.
-FINAL_HOLDOUT_GAMES = 300
+# 3.0: this is the POOL, not one run's holdout. Runs rotate through HOLDOUT_WINDOWS disjoint
+# windows of HOLDOUT_WINDOW_GAMES games each, so six runs over a season cover 600 DISTINCT games
+# instead of re-scoring the same 100 six times (docs/v3_direction.md §4). 700 = 100 × 7 against the
+# 702 games available after the cut.
+#
+# Widening the pool passes `extend_holdout`'s prefix guard untouched, which is the point: the
+# existing 100 ids ARE the first 100 of the 700, so window 0 is byte-identical to the games
+# v2-run1..4 were scored on and no invariant is weakened to get there.
+FINAL_HOLDOUT_GAMES = 700
+# One run's holdout. Kept separate from the pool so raising one never silently changes the other.
+HOLDOUT_WINDOW_GAMES = 100
+HOLDOUT_WINDOWS = FINAL_HOLDOUT_GAMES // HOLDOUT_WINDOW_GAMES
 EVAL_BATCH = 10
 # Models live one-per-dir under ./artifacts/<name>/ (see models.artifacts.model_root).
 # Names are free-form slugs -- "v1.0", "endgame-feats" -- and a name IS the train identity:
