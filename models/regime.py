@@ -98,114 +98,15 @@ def sample_regime(rng, std) -> np.ndarray:
 
 
 def build_regime_model(inner, n_games: int):
-    """Wrap a functional head in the training-time embedding table.
+    """Deprecated shim. The single training wrapper lives in ``models/train_steps.py``.
 
-    Returns ``inner`` unchanged when the latent is switched off or there are no games to index, so
-    a caller never has to branch.
+    Kept so the reason is on the record: a second ``keras.Model`` wrapper could not compose with
+    scheduled sampling's -- the outer one's ``self.inner(x)`` would hand the inner wrapper a batch
+    it does not declare, and the ordering between the two would be implicit rather than chosen.
     """
-    from config import REGIME_ENABLED
+    from models.train_steps import build_trainer
 
-    if not REGIME_ENABLED or n_games < 2:
-        return inner
-    # _regime_model_class(), not a bare RegimeModel: the class is built lazily so importing this
-    # module stays TF-free, and PEP 562's module __getattr__ resolves attribute access from OUTSIDE
-    # the module -- it is not consulted for a global lookup inside it.
-    return _regime_model_class()(inner, n_games)
-
-
-def _regime_model_class():
-    """Defined lazily so importing this module does not import TensorFlow."""
-    import tensorflow as tf
-    from tensorflow import keras
-    from config import REGIME_L2
-
-    class RegimeModel(keras.Model):
-        """A functional head plus one trainable latent row per training game.
-
-        ``train_step`` pops the game index out of the batch, looks up its row, tiles it over the
-        sequence and writes it into the ``regime`` input before the forward pass. The inner model is
-        an ordinary functional model that simply takes ``regime`` as an input -- which is what makes
-        the persistence path unchanged: ``save_artifacts`` saves ``inner``, and nothing about the
-        table survives except the standard deviations written into norm_stats.
-
-        ``test_step`` deliberately does NOT look the row up. A validation game has no trained row,
-        and feeding it one would be measuring information a rollout can never have.
-        """
-
-        def __init__(self, inner, n_games, **kwargs):
-            super().__init__(**kwargs)
-            self.inner = inner
-            self.n_games = int(n_games)
-            self.table = keras.layers.Embedding(
-                self.n_games, REGIME_DIM,
-                embeddings_initializer=keras.initializers.RandomNormal(stddev=0.01),
-                embeddings_regularizer=keras.regularizers.l2(REGIME_L2),
-                name="regime_table")
-            # Built eagerly so the table's variables exist before the first batch -- otherwise
-            # train_step's first call creates them inside the GradientTape, and fitted_table()
-            # cannot be read at all until a fit has happened.
-            self.table.build((None,))
-
-        def call(self, inputs, training=False):
-            return self.inner(inputs, training=training)
-
-        def _with_regime(self, x):
-            """Replace the zeros plane with this batch's latent rows."""
-            idx = tf.reshape(tf.cast(x[GAME_INDEX_KEY], tf.int32), (-1,))
-            z = self.table(idx)                                   # (B, REGIME_DIM)
-            seq_len = tf.shape(x[REGIME_KEY])[1]
-            tiled = tf.tile(tf.expand_dims(z, 1), [1, seq_len, 1])
-            out = {k: v for k, v in x.items() if k != GAME_INDEX_KEY}
-            out[REGIME_KEY] = tf.cast(tiled, x[REGIME_KEY].dtype)
-            return out
-
-        def _track_loss(self, loss, x):
-            """Feed the reported-loss metric, the way Keras' own train_step does.
-
-            Not optional bookkeeping. Without it every epoch reports loss 0.0, and
-            ``EarlyStopping(monitor="val_loss", restore_best_weights=True)`` -- which is this
-            repo's only checkpoint selector -- sees a flat zero, never improves, and restores
-            epoch 1's weights at the end of a full train. Gradients flow the whole time, so
-            nothing looks wrong until the run is over.
-            """
-            tracker = getattr(self, "_loss_tracker", None)
-            if tracker is not None:
-                tracker.update_state(loss, sample_weight=tf.shape(tf.nest.flatten(x)[0])[0])
-
-        def train_step(self, data):
-            x, y, w = keras.utils.unpack_x_y_sample_weight(data)
-            with tf.GradientTape() as tape:
-                preds = self.inner(self._with_regime(x), training=True)
-                loss = self.compute_loss(x=x, y=y, y_pred=preds, sample_weight=w, training=True)
-                self._track_loss(loss, x)
-                # Mixed precision is on for every GPU train (configure_gpu sets mixed_float16), so
-                # the loss must be scaled before the tape or fp16 gradients underflow to zero.
-                scaled = self.optimizer.scale_loss(loss) if hasattr(self.optimizer, "scale_loss")                     else loss
-            trainable = self.inner.trainable_variables + self.table.trainable_variables
-            self.optimizer.apply_gradients(zip(tape.gradient(scaled, trainable), trainable))
-            return self.compute_metrics(x, y, preds, sample_weight=w)
-
-        def test_step(self, data):
-            x, y, w = keras.utils.unpack_x_y_sample_weight(data)
-            x = {k: v for k, v in x.items() if k != GAME_INDEX_KEY}
-            preds = self.inner(x, training=False)
-            loss = self.compute_loss(x=x, y=y, y_pred=preds, sample_weight=w, training=False)
-            self._track_loss(loss, x)
-            return self.compute_metrics(x, y, preds, sample_weight=w)
-
-        def fitted_table(self) -> np.ndarray:
-            """The latent rows as they stand. Empty if the layer somehow never built."""
-            if not self.table.built:
-                return np.zeros((0, REGIME_DIM), dtype=np.float32)
-            return np.asarray(self.table.embeddings.numpy())
-
-    return RegimeModel
-
-
-def __getattr__(name):
-    if name == "RegimeModel":
-        return _regime_model_class()
-    raise AttributeError(name)
+    return build_trainer(inner, n_games=n_games)
 
 
 __all__ = ["REGIME_KEY", "GAME_INDEX_KEY", "make_regime_input", "regime_projection",
