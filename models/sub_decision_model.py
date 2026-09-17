@@ -53,9 +53,9 @@ from models.rotation_features import (
     append_rotation_batches, append_sub_decision_batches, bench_scalars, make_bench_inputs,
     make_rotation_inputs, merge_rotation_features, merge_sub_decisions, side_scalars,
 )
+from models.train_steps import build_trainer
 from models.regime import (
     GAME_INDEX_KEY,
-    build_regime_model,
     REGIME_KEY,
     append_regime_batches,
     make_regime_input,
@@ -384,7 +384,8 @@ class SubDecisionModel(SubstitutionModel):
         # latent is off, so nothing below has to branch. See models/regime.py for why val_loss will
         # read worse than a run without it, and why that is the honest number.
         inner = model
-        model = build_regime_model(inner, int(train_split["pad_mask"].shape[0]))
+        model = build_trainer(inner, n_games=int(train_split["pad_mask"].shape[0]),
+                              scheduled_sampling=False)
 
         steps_per_epoch = int(np.ceil(train_split["pad_mask"].shape[0] / batch_size))
         total_steps = steps_per_epoch * epochs

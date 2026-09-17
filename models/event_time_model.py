@@ -49,9 +49,10 @@ from models.rotation_features import (
     make_rotation_inputs,
     side_scalars,
 )
+from models.scheduled_sampling import ScheduledSamplingSchedule
+from models.train_steps import build_trainer
 from models.regime import (
     GAME_INDEX_KEY,
-    build_regime_model,
     REGIME_KEY,
     append_regime_batches,
     make_regime_input,
@@ -758,7 +759,8 @@ class EventTimeModel:
         # latent is off, so nothing below has to branch. See models/regime.py for why val_loss will
         # read worse than a run without it, and why that is the honest number.
         inner = model
-        model = build_regime_model(inner, int(train_split["pad_mask"].shape[0]))
+        model = build_trainer(inner, n_games=int(train_split["pad_mask"].shape[0]),
+                              scheduled_sampling=True)
 
         # Warmup + cosine-decay LR schedule. The old ReduceLROnPlateau collapsed the
         # LR once loss flattened, stalling learning while the curve was still flat;
@@ -848,6 +850,11 @@ class EventTimeModel:
             )
             collector.capture_model(model)
             callbacks.append(collector.callback)
+
+        # W4 rung 1: sets p at each epoch and writes it into logs, so ReportingCallback lands it
+        # in epochs.parquet -- the only way an A/B can say what schedule actually ran.
+        if getattr(model, "scheduled_sampling", False):
+            callbacks.append(ScheduledSamplingSchedule(model))
 
         status = "completed"
         history = None

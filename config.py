@@ -50,6 +50,22 @@ ROSTER_SAB_LAYERS = 3      # Set-Attention blocks in the roster set-encoder (was
 # Four dimensions: enough for tempo, shooting and whistle to separate, small enough that the L2
 # keeps it from memorising a game outright. These are ARCHITECTURE, not rollout dials -- they
 # change weight shapes, so they belong in the manifest's arch snapshot and not in _TUNING_KEYS.
+# --- W4 rung 1: scheduled sampling (models/scheduled_sampling.py) ------------------------------
+# With probability p the previous event's token in a training sequence is the model's own sample
+# rather than the real one, so it learns to keep going after its own mistakes. Training-side knobs,
+# NOT rollout dials: they change no weight shapes and nothing at sim time reads them, so they belong
+# in neither _TUNING_KEYS nor the arch snapshot -- the same classification MASK_CONTINUATION_ROWS
+# already has, and for the same reason.
+#
+# p is capped low and ramped late. The model has to fit the next-step distribution before its own
+# samples are worth anything, and the mixed rows carry a real game state against a sampled token
+# (see the module docstring on why the derived columns cannot be re-derived in-graph), so a high p
+# would spend most of the run on contexts that cannot occur.
+SCHEDULED_SAMPLING = True
+SCHEDULED_SAMPLING_MAX_P = 0.25
+SCHEDULED_SAMPLING_WARMUP_EPOCHS = 3
+SCHEDULED_SAMPLING_RAMP_EPOCHS = 10
+
 REGIME_ENABLED = True
 REGIME_DIM = 4
 REGIME_L2 = 1e-3
