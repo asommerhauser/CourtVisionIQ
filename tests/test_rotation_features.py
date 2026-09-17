@@ -261,12 +261,36 @@ def test_the_incremental_path_matches_the_batch_path_bit_for_bit():
 
 def test_the_scalars_reach_the_encoder_with_rest_first():
     """Rest stays scalar 0, so the single-scalar ordering from before 2.0 is a prefix of this
-    one and the meaning of a slot does not move under a model that predates the others."""
+    one and the meaning of a slot does not move under a model that predates the others.
+
+    3.0 appends ten season-to-date priors after the rotation state, so the prefix is now four long
+    rather than the whole list -- appended, never inserted, for exactly this reason.
+    """
     rotation = {k: f"<{k}>" for k in ROSTER_STATE_KEYS}
     assert side_scalars("<rest_home>", rotation, "home") == [
         "<rest_home>", "<stint_seconds_home>", "<played_seconds_home>", "<court_fouls_home>",
     ]
-    assert len(side_scalars("<rest_away>", rotation, "away")) == NUM_ROSTER_SCALARS
+
+
+def test_the_priors_are_appended_after_the_rotation_state_never_before_it():
+    """The full list the roster encoder is built for. NUM_ROSTER_SCALARS is baked into
+    scalar_proj's kernel shape, so a graph built with a different count fails at load_weights
+    rather than loading quietly and meaning something else."""
+    import numpy as np
+
+    from models.prior_features import N_PLAYER_PRIORS
+
+    rotation = {k: f"<{k}>" for k in ROSTER_STATE_KEYS}
+    priors = {"prior_home": np.zeros((2, 3, 5, N_PLAYER_PRIORS), dtype="float32")}
+    scalars = side_scalars("<rest_home>", rotation, "home", priors)
+
+    assert len(scalars) == NUM_ROSTER_SCALARS == 4 + N_PLAYER_PRIORS
+    # The pre-3.0 four are untouched and still first, in order.
+    assert scalars[:4] == [
+        "<rest_home>", "<stint_seconds_home>", "<played_seconds_home>", "<court_fouls_home>",
+    ]
+    # And the rest are the unstacked prior planes, one per rate.
+    assert all(getattr(s, "shape", None) == (2, 3, 5) for s in scalars[4:])
 
 
 # ---------------------------------------------------------------------------
