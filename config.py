@@ -61,6 +61,34 @@ ROSTER_SAB_LAYERS = 3      # Set-Attention blocks in the roster set-encoder (was
 # samples are worth anything, and the mixed rows carry a real game state against a sampled token
 # (see the module docstring on why the derived columns cannot be re-derived in-graph), so a high p
 # would spend most of the run on contexts that cannot occur.
+# --- W4 rung 2: checkpoint selection on rollout metrics (models/rollout_selection.py) ---------
+# Every head early-stops on val_loss -- one-step NLL against the real history -- and is then judged
+# on a 600-step self-fed rollout. Whether the epoch that minimises NLL is the epoch that ROLLS OUT
+# best is an open question, and W1's probes make it pressing: the simulator benches a player in
+# foul trouble 24% of the time against a real 78%, with every input it needs already in the weights.
+# No next-step loss can see that, because each individual prediction is roughly right and it is the
+# composition over hundreds of steps that is wrong.
+#
+# OFF by default: rung 2 is a SECOND PASS. Scoring a rollout needs all twelve heads, and during a
+# from-scratch train the first head has no bundle to roll out. Finish the train, then retrain the
+# head under test warm-started off the finished bundle -- which also makes the A/B clean.
+#
+# Cost, from the run-4 logs: 20 games x 10 sims is 200 game-sims, ~7.5 GPU-minutes per evaluation;
+# every third epoch over a 30-epoch stage is ~1.3 GPU-hours on the train.
+ROLLOUT_SELECTION = False
+ROLLOUT_EVAL_EVERY = 3
+ROLLOUT_EVAL_GAMES = 20
+ROLLOUT_EVAL_SIMS = 10
+# Games before the train cut to sample the eval set from. NEVER a holdout window: selecting a
+# checkpoint against the holdout turns the report into a training metric, and nothing downstream
+# would look wrong.
+ROLLOUT_EVAL_TAIL = 500
+# Score weights. Dispersion is scaled into points so it is commensurable with box MAE; the
+# behaviour weight makes a fully-absent game-state behaviour cost about as much as a point of MAE,
+# so a checkpoint cannot win by fixing the box while still never benching anyone.
+ROLLOUT_SCORE_DISPERSION_WEIGHT = 2.0
+ROLLOUT_SCORE_BEHAVIOUR_WEIGHT = 1.0
+
 SCHEDULED_SAMPLING = True
 SCHEDULED_SAMPLING_MAX_P = 0.25
 SCHEDULED_SAMPLING_WARMUP_EPOCHS = 3
