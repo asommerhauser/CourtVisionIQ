@@ -429,3 +429,129 @@ Collected from the 2.0 cycle. Most of these cost a retrain or a misread result w
   real residual sd, and the W1 game-state behaviours. The chosen epoch and its rollout score
   are written to the run state next to the NLL-best epoch, so the rung-3 condition (§6, step
   6) is a number, not a judgement.
+
+---
+
+## 9. 3.0+ — what the build established, and what is open
+
+**Post-build addendum, added after §6 steps 1–4 shipped on `feature/version3`.** §1–§8 are the
+direction as written and are unchanged. This section records what the build answered, what it
+changed about the plan, and what is now open. State and numbers live in
+[`v3_progress.md`](v3_progress.md); this is the decisions half.
+
+### 9.1 The gates that already answered
+
+**§6 step 1's gate — "game-state behaviours present / absent" — answers ABSENT.** Measured on
+v2-run4's 5,357 sim play-by-plays against all 1,320 real 2022-23 games: a man on his 4th first-half
+foul comes off within 60 s **28%** of the time in the sim against **96%** in reality, and because
+the sim never sits anyone it *reaches* a 4th first-half foul **9.6× as often**. Starters' Q4 minutes
+fall 16% in a sim blowout against 47% in reality. `court_fouls_*`, `score_diff` and the period clock
+all reached the weights in 2.0 and produced no behaviour.
+
+**This reprioritises W4.** No next-step loss can see a failure of *composition* — each individual
+prediction is roughly right. Rung 2 is the only item in the programme that optimises composition
+directly, so it moves from fallback to the most interesting rung, and the probe gaps are a term in
+its score.
+
+**§1d reproduced and extended.** The sim's *total* sd is too small (16.7 vs 19.7) at the same time
+as its margin sd is too large (16.5 vs 13.7), with the per-side marginal right (11.7 vs 12.07). One
+missing covariance moves both, in opposite directions. Worth stating because it is a stronger
+argument than §1d's: it is not a mis-sized spread, so no dial can fix it.
+
+### 9.2 Two corrections to §8
+
+- **The Brier SE is 0.0178, not 0.013.** §8 estimates the per-game Brier sd at 0.133; measured on
+  run4 it is **0.174**. The "two runs are the same model" band is **±0.036**, not ±0.026.
+- **§1e is now demonstrated rather than argued.** Paired on the 64 games they share, run3's 0.2110
+  against run4's 0.2035 is **+0.0075 ± 0.0109 (z = 0.69)**.
+
+### 9.3 Departures from §3–§4, each forced by a measurement
+
+1. **The priors are a sidecar Parquet, not roster-parallel CSV columns** (§3 W2.1 says to follow the
+   `rest_home` precedent exactly). `rest_home` is one integer per player; these are ten floats.
+   Measured: ~1,600 characters a row, taking `data/` from 4.2 GB to ~30 GB. The (game, player) grain
+   is **559k rows / 56 MB** and rewrites no season file.
+2. **Season-to-date only, no last-10** — twenty planes would roughly double the training set's host
+   RAM, and 2.0 already lost a train to an OOM. Last-10 is what W2.2 replaces anyway.
+3. **Fixed `_NORM` constants, not fitted `norm_stats`** — the only new fitted key in the programme
+   is W3's `regime_std`.
+4. **The rotating-window POOL, not a relaxed guard.** `FINAL_HOLDOUT_GAMES` becomes the pool
+   (300 → 700 = 100 × 7); the existing 100 ids *are* its first 100, so `extend_holdout`'s prefix
+   invariant is untouched and window 0 is byte-identical to what v2-run1..4 scored.
+5. **The regime latent conditions every head, not the two §3 W3 names** — the seven conditional
+   heads share one `cond_*.npz`, so a `regime` input on some and not others desynchronises the
+   stored tensors from the graphs.
+6. **`running_pace`'s constants came from a measurement.** `poss_ends` is a game-level counter, not
+   per-side, so a real game runs ~4 poss/min, not the ~2.08 a 100 team-pace implies. The first
+   constants clipped every real row and the feature would have trained as a constant.
+
+### 9.4 Architecture decisions worth carrying forward
+
+- **The player priors enter the set encoder additively, before attention**:
+  `x = emb + scalar_proj(stacked)` (`models/roster_set_encoder.py:137`), where `stacked` is the
+  fourteen per-player scalars. They therefore participate in the SAB layers — the encoder can
+  condition how it attends to the other four slots on the fact that one of them is a 30-ppg scorer.
+  Concatenating onto the pooled vector instead would encode the lineup first and bolt the rates on
+  after, discarding that interaction. Player priors add **zero** fusion width; only the eight *team*
+  priors widen the backbone concat.
+- **One `train_step`, not two wrappers.** W3's latent and W4 rung 1 both alter the batch before the
+  forward pass, and two `keras.Model` wrappers cannot compose — the outer one's `self.inner(x)`
+  hands the inner one a batch it does not declare. `models/train_steps.build_trainer` owns both.
+- **The manifest records which inputs a model trained with**, and `ModelBundle.load` refuses a
+  mismatch by name. Most width changes already fail at `load_weights`; a same-width key swap did
+  not, and that is the case this exists for.
+
+### 9.5 Open, in the order the cost argues for
+
+**(a) Four prior stats that are not in the ten, and are free to add only until the retrain starts.**
+`pf`, `ftm`, `tpm`, `stl` and `blk` are in `BOX_STATS` and in every box score, but are not
+accumulated, which rules out:
+
+| candidate | why it belongs | head it serves |
+|---|---|---|
+| `ft_pct` (`ftm/fta`) | the model has an FT *attempt* rate and no *make* rate; FT% is the most stable player stat there is | free throws |
+| `tp_pct` (`tpm/tpa`) | `shot_type` emits `corner3_l` / `wing3_r` / `top3` as distinct tokens, and `shot_result` judges them without knowing whether the player can shoot one | `shot_result` |
+| `pf_36` | who actually fouls. Note it does **not** fix the 9.6× over-production of 4th fouls, which is a *benching* failure, not an attribution one | `foul_type` |
+| `stl_36` / `blk_36` | no defensive-activity prior at all | `turnover_type`, `shot_result` |
+
+Each is one accumulator line, one `_NORM` entry and a ~10-minute sidecar rebuild, taking
+`NUM_ROSTER_SCALARS` 14 → 18. **Before the retrain that is free; after it, it is a retrain.**
+Recommendation: `ft_pct`, `tp_pct`, `pf_36`; leave `stl` / `blk`, whose events are rare enough that
+a prior is mostly noise. Also noted: `fg_pct` mixes shot difficulty with shooting skill, being
+`fgm/fga` over all shots.
+
+**(b) `MIXABLE_FIELDS` overstates what rung 1 does.** It lists `event, type, result, player,
+secondary_player`; the implementation replaces only `event` (`models/train_steps.py:155`), and the
+constant is imported into `train_steps.py` unused. The code is right — within `event_time`'s graph
+the only sampleable output is `event_output`, and `type` / `result` / `player` come from other heads
+that are not in that graph. Either narrow the constant and the docstring to `("event",)`, or widen
+rung 1 to reach the other heads, which is a design change rather than a fix.
+
+**(c) The exposure-bias gap is only partly closed, and the A/B must be read that way.** Rung 1
+teaches the model to continue after a wrong *token*, against a true score, clock and lineup. It
+never trains on a context the model composed over hundreds of steps. Rung 2 *generates* whole games
+mid-train but only scores them — no gradient flows from a rollout. **Training on generated games is
+rung 3, and it is not built.** A null result at rung 1 is "token-only scheduled sampling does not
+help", not "scheduled sampling does not help".
+
+**(d) Conditional gates, unchanged from §6.** Rung 3 fires only if
+`checkpoint_selection.epochs_disagree` is true in the run state. W2.2 and W6 gate on the W2.1
+result.
+
+**(e) Two §3/§4 items deliberately not on the step 1–4 path.** The context-sensitivity probe
+(§3 W1's first bullet) needs the trained heads and belongs on the GPU box against 3.0 weights.
+Conditional evaluation from end-Q1 / half (§4's secondary scoreboard) needs a
+`GameController.resume_from(history)`; `start()` always builds a tip-off game and resets ~15 pieces
+of rules-side state.
+
+### 9.6 Test-suite state
+
+`pytest` has never run against this branch — the dev box has no GPU and `conftest.py` imports TF
+first. Every test function was executed directly instead (667 pass), which caught four real bugs,
+but it cannot reproduce pytest's fixtures or its `sys.path`. Two consequences:
+
+- **`test_model_persistence` and `test_backbone` did not run at all.** That is where
+  `num_scalars=14`, the `regime` input and the `SCHEMA 2` manifest meet real save/load. It is the
+  highest-risk untested surface in the change.
+- **Six `test_controller` failures on the offence-side foul path are pre-existing** — verified
+  against `main` in a throwaway worktree. They are not 3.0's.
