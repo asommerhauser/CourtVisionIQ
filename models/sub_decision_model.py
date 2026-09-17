@@ -53,6 +53,13 @@ from models.rotation_features import (
     append_rotation_batches, append_sub_decision_batches, bench_scalars, make_bench_inputs,
     make_rotation_inputs, merge_rotation_features, merge_sub_decisions, side_scalars,
 )
+from models.prior_features import (
+    PRIOR_INPUT_KEYS,
+    append_prior_batches,
+    make_prior_inputs,
+    merge_prior_features,
+    prior_team_projections,
+)
 from models.substitution_model import SubstitutionModel, _BASE_INPUT_KEYS
 from reporting import ReportCollector, RunConfig
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
@@ -155,6 +162,9 @@ class SubDecisionModel(SubstitutionModel):
         merge_rotation_features(
             df, cols,
             encode_bench=lambda names: self.encoder.encode_roster(names, BENCH_SIZE))
+        # Season-to-date per-player and per-team rates, joined from the causal sidecar
+        # (player_priors.py). Fixed-constant normalization, so no norm_stats keys.
+        merge_prior_features(df, cols, rosters, self.path)
         merge_sub_decisions(df, cols)
 
         train = self._build_split(cols, game_id, train_games)
@@ -193,7 +203,7 @@ class SubDecisionModel(SubstitutionModel):
 
         batches = {k: [] for k in (*CATEGORICAL_FIELDS, "home_roster", "away_roster",
                                    "time_abs", "delta_time", *SEASON_INPUT_KEYS,
-                                   *GAME_STATE_INPUT_KEYS, *ROSTER_STATE_KEYS, *BENCH_KEYS,
+                                   *GAME_STATE_INPUT_KEYS, *ROSTER_STATE_KEYS, *PRIOR_INPUT_KEYS, *BENCH_KEYS,
                                    *SUB_DECISION_KEYS, "pad_mask")}
 
         for g in [g for g in np.unique(game_id) if g in games]:
@@ -216,6 +226,7 @@ class SubDecisionModel(SubstitutionModel):
             append_season_batches(batches, cols, idx, n, SEQ)
             append_game_state_batches(batches, cols, idx, n, SEQ)
             append_rotation_batches(batches, cols, idx, n, SEQ, PAD_PLAYER)
+            append_prior_batches(batches, cols, idx, n, SEQ)
             append_sub_decision_batches(batches, cols, idx, n, SEQ)
 
             pad = np.zeros((SEQ,), dtype=np.float32)
@@ -250,6 +261,7 @@ class SubDecisionModel(SubstitutionModel):
         rest_home, rest_away, team_inputs = make_season_inputs(SEQ)
         game_state_inputs = make_game_state_inputs(SEQ)
         rotation_inputs = make_rotation_inputs(SEQ)
+        prior_inputs, team_prior_inputs = make_prior_inputs(SEQ)
         bench_inputs = make_bench_inputs(SEQ)
         pad_mask = layers.Input(shape=(SEQ,), dtype="float32", name="pad_mask")
 
@@ -264,9 +276,9 @@ class SubDecisionModel(SubstitutionModel):
                                              name=f"emb_{f}")(cat_inputs[f]))
 
         home_vec = self.roster_encoder(
-            [home_roster, *side_scalars(rest_home, rotation_inputs, "home")])
+            [home_roster, *side_scalars(rest_home, rotation_inputs, "home", prior_inputs)])
         away_vec = self.roster_encoder(
-            [away_roster, *side_scalars(rest_away, rotation_inputs, "away")])
+            [away_roster, *side_scalars(rest_away, rotation_inputs, "away", prior_inputs)])
         bench_home_vec = self.bench_encoder(
             [bench_inputs["bench_home"], *bench_scalars(bench_inputs, "home")])
         bench_away_vec = self.bench_encoder(
@@ -276,10 +288,11 @@ class SubDecisionModel(SubstitutionModel):
         t_delta = layers.Dense(16, name="delta_time_proj")(delta_time)
         t_team = season_team_projections(team_inputs)
         t_gs = game_state_projections(game_state_inputs)
+        t_prior = prior_team_projections(team_prior_inputs)  # season-to-date team rates
 
         x = build_backbone(
             [*embs, home_vec, away_vec, bench_home_vec, bench_away_vec,
-             t_abs, t_delta, *t_team, *t_gs],
+             t_abs, t_delta, *t_team, *t_gs, *t_prior],
             pad_mask, seq_len=SEQ, d_model=D,
             num_layers=num_layers, num_heads=num_heads, ff_dim=ff_dim, dropout=dropout,
         )
@@ -292,6 +305,7 @@ class SubDecisionModel(SubstitutionModel):
             "home_roster": home_roster, "away_roster": away_roster,
             "time_abs": time_abs, "delta_time": delta_time,
             "rest_home": rest_home, "rest_away": rest_away, **team_inputs,
+            **prior_inputs, **team_prior_inputs,
             **game_state_inputs, **rotation_inputs, **bench_inputs,
             "pad_mask": pad_mask,
         }

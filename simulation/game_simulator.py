@@ -53,6 +53,14 @@ from models.artifacts import DEFAULT_ARTIFACTS_ROOT
 from models.event_time_model import CATEGORICAL_FIELDS, EventTimeModel
 from models.model_bundle import ModelBundle
 from models.player_model import PlayerModel
+from models.prior_features import (
+    N_PLAYER_PRIORS,
+    TEAM_PRIOR_COLS,
+    _DEFAULT_PLAYER,
+    normalize_team,
+    pad_priors,
+)
+from player_priors import TEAM_DEFAULTS, TEAM_PRIOR_KEYS
 from models.season_features import (
     DEFAULT_REST_DAYS, REST_CLIP_DAYS, TEAM_SCALAR_COLS,
 )
@@ -180,6 +188,12 @@ class GameSimulator:
         self.away_days_rest: float = DEFAULT_REST_DAYS
         self.home_rest: dict[str, float] = {}
         self.away_rest: dict[str, float] = {}
+        # Season-to-date priors: player -> normalized vector, and the four team rates per side.
+        # Game-constant, like rest, which is what makes them safe inside the roster cache key.
+        self.home_priors: dict[str, list] = {}
+        self.away_priors: dict[str, list] = {}
+        self.home_team_priors: dict[str, float] = {}
+        self.away_team_priors: dict[str, float] = {}
         # Growing sequence of event rows; each carries its own post-update roster
         # snapshot + absolute time. This list IS the model's input context.
         self.history: list[dict] = []
@@ -233,6 +247,8 @@ class GameSimulator:
         self.home_days_rest = DEFAULT_REST_DAYS
         self.away_days_rest = DEFAULT_REST_DAYS
         self.home_rest, self.away_rest = {}, {}
+        self.home_priors, self.away_priors = {}, {}
+        self.home_team_priors, self.away_team_priors = {}, {}
         self.history = []
         self._cache.reset()
 
@@ -252,6 +268,10 @@ class GameSimulator:
         self.away_days_rest = float(ctx.get("away_days_rest", DEFAULT_REST_DAYS))
         self.home_rest = dict(ctx.get("home_rest", {}) or {})
         self.away_rest = dict(ctx.get("away_rest", {}) or {})
+        self.home_priors = dict(ctx.get("home_priors", {}) or {})
+        self.away_priors = dict(ctx.get("away_priors", {}) or {})
+        self.home_team_priors = dict(ctx.get("home_team_priors", {}) or {})
+        self.away_team_priors = dict(ctx.get("away_team_priors", {}) or {})
         # Rest / team-scalar columns are derived from this context, so anything already encoded
         # is stale. Free in practice (every start_* sets context before its first append).
         self._cache.on_context_change()
@@ -949,6 +969,23 @@ class GameSimulator:
                 buf[i] = (np.clip(raw, 0.0, REST_CLIP_DAYS) - rest_mean) / rest_std
         inputs["rest_home"] = rest_home
         inputs["rest_away"] = rest_away
+
+        # Season-to-date priors, the same way: the whole 5 slots per row, PAD slots carrying the
+        # league mean rather than zeros (models/prior_features._DEFAULT_PLAYER). Already normalized
+        # when the sidecar was read, so there is nothing to standardize here -- fixed constants,
+        # no norm_stats, which is exactly why this block is three lines and the rest block is ten.
+        for key, col, prior_map in (("prior_home", "roster_home", self.home_priors),
+                                    ("prior_away", "roster_away", self.away_priors)):
+            buf = np.repeat(_DEFAULT_PLAYER[None, None, :], SEQ * ROSTER_SIZE, axis=0)                 .reshape(SEQ, ROSTER_SIZE, N_PLAYER_PRIORS).astype(np.float32)
+            for i, row in enumerate(window):
+                buf[i] = pad_priors(row[col], prior_map)
+            inputs[key] = buf
+
+        for side, team_map in (("home", self.home_team_priors), ("away", self.away_team_priors)):
+            for key in TEAM_PRIOR_KEYS:
+                buf = np.zeros((SEQ, 1), dtype=np.float32)
+                buf[:n, 0] = team_map.get(key, normalize_team(key, TEAM_DEFAULTS[key]))
+                inputs[f"{side}_prior_{key}"] = buf
 
         team_values = {
             "home_games_played": self.home_games_played,

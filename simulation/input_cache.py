@@ -37,6 +37,15 @@ from models.game_state_features import (
 from models.rotation_features import (
     ROSTER_STATE_KEYS, LineupScan, normalize_lineup_state_row,
 )
+from models.prior_features import (
+    N_PLAYER_PRIORS,
+    PRIOR_LIST_COLS,
+    TEAM_PRIOR_COLS,
+    _DEFAULT_PLAYER,
+    normalize_team,
+    pad_priors,
+)
+from player_priors import TEAM_DEFAULTS, TEAM_PRIOR_KEYS
 from models.season_features import DEFAULT_REST_DAYS, REST_CLIP_DAYS, TEAM_SCALAR_COLS
 
 # Roster snapshots repeat for long stretches (a roster changes ~60-80 times in a ~900-row game), so
@@ -44,9 +53,14 @@ from models.season_features import DEFAULT_REST_DAYS, REST_CLIP_DAYS, TEAM_SCALA
 # clip/divide on >90% of rows. Cached arrays are only ever copied *into* a buffer, never handed out.
 #
 # The cache is keyed by the five names alone, which is sound ONLY for quantities that are constant
-# for the whole game. Rest is; stint seconds, minutes played and personal fouls change on every
-# row for the same five, so they are deliberately NOT cached -- a hit would serve a stale value
-# with no error anywhere. Keep that in mind before adding anything to the cached tuple.
+# for the whole game. Rest is, and so are 3.0's season-to-date priors -- both are fixed at tip-off
+# and looked up by name. Stint seconds, minutes played and personal fouls change on every row for
+# the same five, so they are deliberately NOT cached: a hit would serve a stale value with no error
+# anywhere. Keep that in mind before adding anything to the cached tuple.
+#
+# "Constant for the whole game" also means the memo has to die when the game does. It is rebuilt in
+# reset(), which _set_season_context reaches through on_context_change() -- so a second game with
+# the same five names cannot inherit the first game's priors.
 _ROSTER_CACHE_MAX = 64
 
 _REST_COL = {"home_roster": "rest_home", "away_roster": "rest_away"}
@@ -102,7 +116,14 @@ class HistoryEncoder:
         for name in ROSTER_STATE_KEYS:
             self._pads[name] = 0.0
             buf[name] = np.zeros((CAP, ROSTER_SIZE), dtype=np.float32)
-        for name in ("time_abs", "delta_time", *TEAM_SCALAR_COLS, *GAME_STATE_KEYS):
+        # The one column that does NOT pad with zero. A zero prior vector says "a player who does
+        # nothing", which is a strong and wrong claim about an empty slot; the league mean says
+        # "no information", and it is what the batch path pads with too (append_prior_batches).
+        for name in PRIOR_LIST_COLS:
+            self._pads[name] = _DEFAULT_PLAYER
+            buf[name] = np.repeat(_DEFAULT_PLAYER[None, None, :], CAP * ROSTER_SIZE, axis=0)                 .reshape(CAP, ROSTER_SIZE, N_PLAYER_PRIORS).astype(np.float32)
+        for name in ("time_abs", "delta_time", *TEAM_SCALAR_COLS, *TEAM_PRIOR_COLS,
+                     *GAME_STATE_KEYS):
             self._pads[name] = 0.0
             buf[name] = np.zeros((CAP, 1), dtype=np.float32)
         self._pads["pad_mask"] = 0.0
@@ -151,8 +172,9 @@ class HistoryEncoder:
         for field in CATEGORICAL_FIELDS:
             buf[field][k] = getattr(enc, f"encode_{field}")(norm_cat(row[field]))
 
-        for name, col, rest_map in (("home_roster", "roster_home", sim.home_rest),
-                                    ("away_roster", "roster_away", sim.away_rest)):
+        for name, col, rest_map, prior_map, prior_col in (
+                ("home_roster", "roster_home", sim.home_rest, sim.home_priors, "prior_home"),
+                ("away_roster", "roster_away", sim.away_rest, sim.away_priors, "prior_away")):
             names = tuple(row[col])
             key = (name, names)
             hit = self._roster_cache.get(key)
@@ -161,11 +183,15 @@ class HistoryEncoder:
                 raw = np.zeros((ROSTER_SIZE,), dtype=np.float32)
                 for j, p in enumerate(names[:ROSTER_SIZE]):
                     raw[j] = rest_map.get(p, DEFAULT_REST_DAYS)
-                hit = (ids, (np.clip(raw, 0.0, REST_CLIP_DAYS) - rest_mean) / rest_std)
+                # The priors ride in the same memo: they are game-constant and keyed by the five
+                # names, which is the exact condition the cache key already documents as sound.
+                hit = (ids, (np.clip(raw, 0.0, REST_CLIP_DAYS) - rest_mean) / rest_std,
+                       pad_priors(row[col], prior_map))
                 if len(self._roster_cache) < _ROSTER_CACHE_MAX:
                     self._roster_cache[key] = hit
             buf[name][k] = hit[0]
             buf[_REST_COL[name]][k] = hit[1]
+            buf[prior_col][k] = hit[2]
 
         # delta-t exactly as the batch path derives it: a per-game diff (first row = 0) clipped
         # backwards to zero in float64, then standardized. np.clip, not max(), so -0.0 matches too.
@@ -186,6 +212,11 @@ class HistoryEncoder:
         }
         for name in TEAM_SCALAR_COLS:
             buf[name][k, 0] = team_values[name]
+
+        for side, team_map in (("home", sim.home_team_priors), ("away", sim.away_team_priors)):
+            for pkey in TEAM_PRIOR_KEYS:
+                buf[f"{side}_prior_{pkey}"][k, 0] = team_map.get(
+                    pkey, normalize_team(pkey, TEAM_DEFAULTS[pkey]))
 
         for name, value in zip(GAME_STATE_KEYS, normalize_game_state_row(self._scan.step(row))):
             buf[name][k, 0] = value

@@ -91,6 +91,13 @@ from models.rotation_features import (
     make_rotation_inputs,
     side_scalars,
 )
+from models.prior_features import (
+    PRIOR_INPUT_KEYS,
+    append_prior_batches,
+    make_prior_inputs,
+    merge_prior_features,
+    prior_team_projections,
+)
 from reporting import ReportCollector, RunConfig
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
 
@@ -107,7 +114,8 @@ _PROCESSED = {"train": "sub_train.npz", "test": "sub_test.npz", "holdout": "sub_
 _BASE_INPUT_KEYS = (
     "event", "player", "type", "result", "season", "secondary_player",
     "home_roster", "away_roster", "time_abs", "delta_time",
-    *SEASON_INPUT_KEYS, *GAME_STATE_INPUT_KEYS, *ROSTER_STATE_KEYS, "pad_mask",
+    *SEASON_INPUT_KEYS, *GAME_STATE_INPUT_KEYS, *ROSTER_STATE_KEYS, *PRIOR_INPUT_KEYS,
+    "pad_mask",
 )
 
 
@@ -329,6 +337,9 @@ class SubstitutionModel:
         merge_rotation_features(
             df, cols,
             encode_bench=lambda names: self.encoder.encode_roster(names, BENCH_SIZE))
+        # Season-to-date per-player and per-team rates, joined from the causal sidecar
+        # (player_priors.py). Fixed-constant normalization, so no norm_stats keys.
+        merge_prior_features(df, cols, rosters, self.path)
         train = self._build_split(cols, game_id, train_games)
         test = self._build_split(cols, game_id, test_games)
         holdout = self._build_split(cols, game_id, holdout_games)
@@ -386,7 +397,7 @@ class SubstitutionModel:
         keys_next_cat = ["next_event", "next_player", "next_secondary_player"]
 
         batches = {k: [] for k in (*keys_1d, *keys_roster, *keys_cont, *SEASON_INPUT_KEYS,
-                                   *GAME_STATE_INPUT_KEYS, *ROSTER_STATE_KEYS,
+                                   *GAME_STATE_INPUT_KEYS, *ROSTER_STATE_KEYS, *PRIOR_INPUT_KEYS,
                                    *BENCH_KEYS,
                                    *keys_next_cat, "next_delta_time",
                                    "pad_mask", "loss_mask", "avail_mask")}
@@ -425,6 +436,7 @@ class SubstitutionModel:
             append_season_batches(batches, cols, idx, n, SEQ)
             append_game_state_batches(batches, cols, idx, n, SEQ)
             append_rotation_batches(batches, cols, idx, n, SEQ, PAD_PLAYER)
+            append_prior_batches(batches, cols, idx, n, SEQ)
 
             next_bufs = {}
             for k in keys_next_cat:
@@ -523,6 +535,7 @@ class SubstitutionModel:
         delta_time = Input(shape=(SEQ, 1), dtype="float32", name="delta_time")
         rest_home, rest_away, team_inputs = make_season_inputs(SEQ)
         rotation_inputs = make_rotation_inputs(SEQ)
+        prior_inputs, team_prior_inputs = make_prior_inputs(SEQ)
         bench_inputs = make_bench_inputs(SEQ)
         game_state_inputs = make_game_state_inputs(SEQ)
         next_event = Input(shape=(SEQ,), dtype="int32", name="next_event")
@@ -552,9 +565,9 @@ class SubstitutionModel:
 
         # ---- Roster encoding across the sequence (shared home/away, with per-player rest) ----
         home_vec = self.roster_encoder(
-            [home_roster, *side_scalars(rest_home, rotation_inputs, "home")])
+            [home_roster, *side_scalars(rest_home, rotation_inputs, "home", prior_inputs)])
         away_vec = self.roster_encoder(
-            [away_roster, *side_scalars(rest_away, rotation_inputs, "away")])
+            [away_roster, *side_scalars(rest_away, rotation_inputs, "away", prior_inputs)])
 
         # ---- Bench encoding ----
         # Who is available and not on the floor, with how long each has been sitting. One shared
@@ -569,11 +582,13 @@ class SubstitutionModel:
         t_delta = layers.Dense(16, name="delta_time_proj")(delta_time)
         t_next_delta = layers.Dense(16, name="next_delta_time_proj")(next_delta_time)
         t_team = season_team_projections(team_inputs)  # games-played + team rest per side
-        t_gs = game_state_projections(game_state_inputs)  # score / period-clock / team fouls
+        t_gs = game_state_projections(game_state_inputs)
+        t_prior = prior_team_projections(team_prior_inputs)  # season-to-date team rates  # score / period-clock / team fouls
 
         # ---- Fusion + the shared causal backbone (models/backbone.py) ----
         x = build_backbone(
-            [*embs, *cond_vecs, home_vec, away_vec, bench_home_vec, bench_away_vec, t_abs, t_delta, t_next_delta, *t_team, *t_gs],
+            [*embs, *cond_vecs, home_vec, away_vec, bench_home_vec, bench_away_vec, t_abs,
+             t_delta, t_next_delta, *t_team, *t_gs, *t_prior],
             pad_mask, seq_len=SEQ, d_model=D,
             num_layers=num_layers, num_heads=num_heads, ff_dim=ff_dim, dropout=dropout,
         )
@@ -591,6 +606,7 @@ class SubstitutionModel:
             "home_roster": home_roster, "away_roster": away_roster,
             "time_abs": time_abs, "delta_time": delta_time,
             "rest_home": rest_home, "rest_away": rest_away, **team_inputs,
+            **prior_inputs, **team_prior_inputs,
             **game_state_inputs,
             **rotation_inputs,
             **bench_inputs,

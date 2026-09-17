@@ -88,6 +88,13 @@ from models.rotation_features import (
     make_rotation_inputs,
     side_scalars,
 )
+from models.prior_features import (
+    PRIOR_INPUT_KEYS,
+    append_prior_batches,
+    make_prior_inputs,
+    merge_prior_features,
+    prior_team_projections,
+)
 from reporting import ReportCollector, RunConfig
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
 from zones import ZONE_TOKENS
@@ -140,7 +147,8 @@ _PROCESSED = {"train": "cond_train.npz", "test": "cond_test.npz", "holdout": "co
 _BASE_INPUT_KEYS = (
     "event", "player", "type", "result", "season", "secondary_player",
     "home_roster", "away_roster", "time_abs", "delta_time",
-    *SEASON_INPUT_KEYS, *GAME_STATE_INPUT_KEYS, *ROSTER_STATE_KEYS, "pad_mask",
+    *SEASON_INPUT_KEYS, *GAME_STATE_INPUT_KEYS, *ROSTER_STATE_KEYS, *PRIOR_INPUT_KEYS,
+    "pad_mask",
 )
 
 
@@ -279,7 +287,10 @@ class ConditionalTypeModel:
             refit=refit_norm_stats,
         )
         merge_game_state_features(df, cols)  # running score / period-clock / team fouls
-        merge_rotation_features(df, cols)  # per-player stint / minutes / fouls
+        merge_rotation_features(df, cols)
+        # Season-to-date per-player and per-team rates, joined from the causal sidecar
+        # (player_priors.py). Fixed-constant normalization, so no norm_stats keys.
+        merge_prior_features(df, cols, rosters, self.path)  # per-player stint / minutes / fouls
         train = self._build_split(cols, game_id, train_games)
         test = self._build_split(cols, game_id, test_games)
         holdout = self._build_split(cols, game_id, holdout_games)
@@ -343,7 +354,7 @@ class ConditionalTypeModel:
         keys_next_cat = ["next_event", "next_player", "next_type", "next_result"]
 
         batches = {k: [] for k in (*keys_1d, *keys_roster, *keys_cont, *SEASON_INPUT_KEYS,
-                                   *GAME_STATE_INPUT_KEYS, *ROSTER_STATE_KEYS,
+                                   *GAME_STATE_INPUT_KEYS, *ROSTER_STATE_KEYS, *PRIOR_INPUT_KEYS,
                                    *keys_next_cat, "next_delta_time",
                                    "pad_mask", "loss_mask")}
 
@@ -374,6 +385,7 @@ class ConditionalTypeModel:
             append_season_batches(batches, cols, idx, n, SEQ)
             append_game_state_batches(batches, cols, idx, n, SEQ)
             append_rotation_batches(batches, cols, idx, n, SEQ)
+            append_prior_batches(batches, cols, idx, n, SEQ)
 
             # Conditioning / target arrays: next-step shift within this game.
             for k in keys_next_cat:
@@ -444,6 +456,7 @@ class ConditionalTypeModel:
         delta_time = Input(shape=(SEQ, 1), dtype="float32", name="delta_time")
         rest_home, rest_away, team_inputs = make_season_inputs(SEQ)
         rotation_inputs = make_rotation_inputs(SEQ)
+        prior_inputs, team_prior_inputs = make_prior_inputs(SEQ)
         game_state_inputs = make_game_state_inputs(SEQ)
         next_event = Input(shape=(SEQ,), dtype="int32", name="next_event")
         next_delta_time = Input(shape=(SEQ, 1), dtype="float32", name="next_delta_time")
@@ -480,20 +493,22 @@ class ConditionalTypeModel:
 
         # ---- Roster encoding across the sequence (shared home/away, with per-player rest) ----
         home_vec = self.roster_encoder(
-            [home_roster, *side_scalars(rest_home, rotation_inputs, "home")])
+            [home_roster, *side_scalars(rest_home, rotation_inputs, "home", prior_inputs)])
         away_vec = self.roster_encoder(
-            [away_roster, *side_scalars(rest_away, rotation_inputs, "away")])
+            [away_roster, *side_scalars(rest_away, rotation_inputs, "away", prior_inputs)])
 
         # ---- Continuous projections ----
         t_abs = layers.Dense(16, name="time_abs_proj")(time_abs)
         t_delta = layers.Dense(16, name="delta_time_proj")(delta_time)
         t_next_delta = layers.Dense(16, name="next_delta_time_proj")(next_delta_time)
         t_team = season_team_projections(team_inputs)  # games-played + team rest per side
-        t_gs = game_state_projections(game_state_inputs)  # score / period-clock / team fouls
+        t_gs = game_state_projections(game_state_inputs)
+        t_prior = prior_team_projections(team_prior_inputs)  # season-to-date team rates  # score / period-clock / team fouls
 
         # ---- Fusion + the shared causal backbone (models/backbone.py) ----
         x = build_backbone(
-            [*embs, *cond_vecs, home_vec, away_vec, t_abs, t_delta, t_next_delta, *t_team, *t_gs],
+            [*embs, *cond_vecs, home_vec, away_vec, t_abs, t_delta, t_next_delta, *t_team,
+             *t_gs, *t_prior],
             pad_mask, seq_len=SEQ, d_model=D,
             num_layers=num_layers, num_heads=num_heads, ff_dim=ff_dim, dropout=dropout,
         )
@@ -506,6 +521,7 @@ class ConditionalTypeModel:
             "home_roster": home_roster, "away_roster": away_roster,
             "time_abs": time_abs, "delta_time": delta_time,
             "rest_home": rest_home, "rest_away": rest_away, **team_inputs,
+            **prior_inputs, **team_prior_inputs,
             **game_state_inputs,
             **rotation_inputs,
             "next_event": next_event, "next_delta_time": next_delta_time,
