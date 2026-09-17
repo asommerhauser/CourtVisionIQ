@@ -351,15 +351,19 @@ def build_game_record(game_df, boxes: list[BoxScore], *, n_sims: int,
     actual_home_win = actual_margin > 0
     actual_winner = "home" if actual_margin > 0 else "away" if actual_margin < 0 else "tie"
 
-    # Team totals (mean over sims) + actual, per side.
-    team_pred = {side: {f: float(np.mean(v)) for f, v in _team_series(boxes, side).items()}
+    # Team totals + advanced stats: one pass per side, reused for the mean, the std and the
+    # per-sim vectors below. These used to be four passes over every box per game.
+    team_series = {side: _team_series(boxes, side) for side in ("home", "away")}
+    adv_series = {side: _advanced_series(boxes, side) for side in ("home", "away")}
+
+    team_pred = {side: {f: float(np.mean(v)) for f, v in team_series[side].items()}
                  for side in ("home", "away")}
-    team_std = {side: {f: float(np.std(v)) for f, v in _team_series(boxes, side).items()}
+    team_std = {side: {f: float(np.std(v)) for f, v in team_series[side].items()}
                 for side in ("home", "away")}
     team_actual = {side: team_totals(_side_lines(actual_box, side)) for side in ("home", "away")}
 
     # Advanced stats (mean over per-sim ratios) + actual, per side.
-    adv_pred = {side: {k: float(np.mean(v)) for k, v in _advanced_series(boxes, side).items()}
+    adv_pred = {side: {k: float(np.mean(v)) for k, v in adv_series[side].items()}
                 for side in ("home", "away")}
     adv_actual = {
         "home": advanced_stats(team_actual["home"], team_actual["away"]),
@@ -392,6 +396,16 @@ def build_game_record(game_df, boxes: list[BoxScore], *, n_sims: int,
         "pick_correct": (pred_pick == actual_winner),
         "pred_margin_mean": mean_margin,
         "pred_margin_std": float(np.std(margins)),
+        # Per-sim vectors, not just their moments. The 2.0 evaluation could not answer "do the two
+        # teams in a sim share a game?" because everything here was already averaged by the time it
+        # was written -- corr(home, away) and pace sd are properties of the joint sample, and the
+        # sample was discarded. Four vectors of n_sims floats per game buys every joint diagnostic
+        # in eval_metrics.joint_metrics, and at 200 sims it is ~6 KB against a record that already
+        # carries a full per-player block. See simulation/eval_metrics.py PER_SIM_KEYS.
+        "per_sim_home_pts": [float(v) for v in team_series["home"]["pts"]],
+        "per_sim_away_pts": [float(v) for v in team_series["away"]["pts"]],
+        "per_sim_home_pace": [float(v) for v in adv_series["home"]["pace"]],
+        "per_sim_away_pace": [float(v) for v in adv_series["away"]["pace"]],
         "actual_margin": int(actual_margin),
         "pred_home_score": team_pred["home"]["pts"],
         "pred_away_score": team_pred["away"]["pts"],

@@ -333,8 +333,97 @@ def _cards(headline: dict) -> str:
     # Player minutes — the rotation prediction, headlined next to the scoring ones.
     if "player_minutes_mae" in headline:
         cards.append(card("Player MIN MAE", f"{headline['player_minutes_mae']:.1f} min"))
+    # The 3.0 gate numbers. corr(home, away) is the one metric that says whether the two teams
+    # in a sim share a game at all; the real-game value is +0.35, and the target is printed
+    # with it so the card is readable on its own.
+    if headline.get("corr_home_away") is not None:
+        cards.append(card("corr(home,away)",
+                          f"{headline['corr_home_away']:+.3f} / {REAL_CORR_HOME_AWAY:+.2f}"))
+    if headline.get("margin_dispersion_ratio"):
+        cards.append(card("Margin dispersion",
+                          f"{headline['margin_dispersion_ratio']:.2f}×"))
     return f"<div class='cards'>{''.join(cards)}</div>"
 
+
+
+# Real 2022-23 values, measured over all 1,320 games with the same generate_box_score tally the
+# report scores against (reporting/backfill_per_sim.py rebuilds the sim side the same way). These
+# are the targets in docs/v3_direction.md SS3 W3, shown next to every sim number so the gap is
+# legible without a second document.
+REAL_CORR_HOME_AWAY = 0.3517
+REAL_PACE_SD = 4.80
+REAL_MARGIN_SD = 13.66
+REAL_TOTAL_SD = 19.73
+REAL_SIDE_PTS_SD = 12.07
+
+
+def _joint_section(agg: dict) -> str:
+    """Does a sim's two teams share a game? The W3 gate, and the clearest single diagnostic."""
+    joint = agg.get("joint") or {}
+    if not joint.get("n_games"):
+        # A run evaluated before per-sim vectors were recorded. reporting/backfill_per_sim.py
+        # rebuilds them from the sim play-by-plays still on disk.
+        return ""
+    rows = [
+        ["corr(home pts, away pts)", f"{joint['corr_home_away']:+.4f} ± {joint['corr_se']:.4f}",
+         f"{REAL_CORR_HOME_AWAY:+.4f}",
+         "Do the two teams share a game? The whole joint structure in one number."],
+        ["Pace sd (poss/48)", f"{joint['pace_sd']:.2f}", f"{REAL_PACE_SD:.2f}",
+         "Within-game spread of tempo across sims, against the across-game spread in reality."],
+        ["Margin sd", f"{joint['margin_sd']:.2f}", f"{REAL_MARGIN_SD:.2f}",
+         "Too WIDE when the sides are independent: sqrt(2) × the per-side sd."],
+        ["Total sd", f"{joint['total_sd']:.2f}", f"{REAL_TOTAL_SD:.2f}",
+         "Too NARROW for the same reason — the other half of the same defect."],
+        ["Per-side points sd", f"{joint['side_pts_sd']:.2f}", f"{REAL_SIDE_PTS_SD:.2f}",
+         "The marginal. This one is right, which is what isolates the fault to the joint."],
+    ]
+    return (
+        "<h2>Joint structure — do the two teams share a game?</h2>"
+        "<p class='note'>Each quantity is computed <i>within</i> a game across its sims, then "
+        "averaged over games. With independent sides, Var(H−A) and Var(H+A) are both "
+        "VarH + VarA, so the margin comes out too wide and the total too narrow by the same "
+        "missing covariance — which is why no shrinkage dial is the right fix. The real column "
+        "is all 1,320 games of 2022-23, tallied the same way.</p>"
+        + _table(["Quantity", "This run", "Real", "What it means"],
+                 rows) +
+        f"<p class='note'>Computed over {joint['n_games']} games carrying per-sim vectors.</p>"
+    )
+
+
+def _coverage_section(agg: dict) -> str:
+    """Is the predicted spread the right size? Per player, per team total, and on the margin."""
+    cov = agg.get("coverage") or {}
+    if not cov.get("n_player_games"):
+        return ""
+    rows = []
+    for scope, label in (("player", "Per player"), ("team", "Team total")):
+        for stat, block in (cov.get(scope) or {}).items():
+            rows.append([f"{label} {stat}", f"{block.get('1', 0.0) * 100:.1f}%",
+                         f"{block.get('2', 0.0) * 100:.1f}%"])
+    margin = cov.get("margin") or {}
+    if margin.get("n"):
+        rows.append(["Game margin", f"{margin.get('1', 0.0) * 100:.1f}%",
+                     f"{margin.get('2', 0.0) * 100:.1f}%"])
+    body = _table(["Scope", "within ±1 sd (ideal 68.3%)", "within ±2 sd (ideal 95.4%)"], rows)
+    tail = ""
+    if margin.get("resid_sd"):
+        tail = (
+            "<p class='note'>Margin: predicted sd "
+            f"<b>{margin['pred_sd']:.2f}</b> against a realised residual sd of "
+            f"<b>{margin['resid_sd']:.2f}</b> — a dispersion ratio of "
+            f"<b>{margin['dispersion_ratio']:.2f}×</b>. This is the number a shrinkage dial would "
+            "be fitted to; the rule is that it reaches 1.00 by fixing the structure instead "
+            "(docs/v3_direction.md §3 W3).</p>"
+        )
+    return (
+        "<h2>Distribution coverage — is the spread the right size?</h2>"
+        "<p class='note'>How often the actual value landed inside k model standard deviations. "
+        "Players and stats the sims are unanimous about carry no distribution to test and are "
+        "excluded from the denominator rather than counted as hits.</p>"
+        + body + tail +
+        f"<p class='note'>{cov['n_player_games']} player-games, "
+        f"{cov['n_team_games']} team-games.</p>"
+    )
 
 def _table(headers: list[str], rows: list[list], cls: str = "data") -> str:
     head = "".join(f"<th>{_esc(h)}</th>" for h in headers)
@@ -685,6 +774,8 @@ def render_html(report: dict) -> str:
         _cards(agg["headline"]),
         _win_section(agg, records),
         _spread_section(agg, records),
+        _joint_section(agg),
+        _coverage_section(agg),
         _progression_section(agg),
         _accuracy_section("Team box-score accuracy", agg["team_accuracy"],
                           agg["team_reliability"],
@@ -764,6 +855,44 @@ def _summary_frame(agg: dict) -> pd.DataFrame:
         rows.append({"scope": "spread", "metric": m, "predicted": None, "actual": None,
                      "mae": agg["spread"]["mae"] if m == "mae" else None,
                      "bias": agg["spread"]["bias"] if m == "bias" else None})
+    # Brier standard error, beside the Brier it qualifies (docs/v3_direction.md §8: two runs
+    # within ±2 SE on the same games are the same model).
+    if agg["win"].get("brier_se") is not None:
+        rows.append({"scope": "win", "metric": "brier_se",
+                     "predicted": agg["win"]["brier_se"],
+                     "actual": None, "mae": None, "bias": None})
+    if (agg.get("win_score") or {}).get("brier_se") is not None:
+        rows.append({"scope": "win_score", "metric": "brier_se",
+                     "predicted": agg["win_score"]["brier_se"],
+                     "actual": None, "mae": None, "bias": None})
+    # Joint structure: predicted = this run, actual = the real 2022-23 value, so the long
+    # table reads the same way as every accuracy row above it.
+    joint = agg.get("joint") or {}
+    if joint.get("n_games"):
+        for metric, real in (("corr_home_away", REAL_CORR_HOME_AWAY),
+                             ("pace_sd", REAL_PACE_SD),
+                             ("margin_sd", REAL_MARGIN_SD),
+                             ("total_sd", REAL_TOTAL_SD),
+                             ("side_pts_sd", REAL_SIDE_PTS_SD)):
+            rows.append({"scope": "joint", "metric": metric, "predicted": joint[metric],
+                         "actual": real, "mae": None, "bias": joint[metric] - real})
+        rows.append({"scope": "joint", "metric": "corr_se", "predicted": joint["corr_se"],
+                     "actual": None, "mae": None, "bias": None})
+    cov = agg.get("coverage") or {}
+    if cov.get("n_player_games"):
+        for scope in ("player", "team"):
+            for stat, block in (cov.get(scope) or {}).items():
+                for k, rate in block.items():
+                    rows.append({"scope": f"coverage_{scope}", "metric": f"{stat}_within_{k}sd",
+                                 "predicted": rate,
+                                 "actual": 0.683 if k == "1" else 0.954,
+                                 "mae": None, "bias": rate - (0.683 if k == "1" else 0.954)})
+        margin = cov.get("margin") or {}
+        for metric in ("pred_sd", "resid_sd", "dispersion_ratio"):
+            rows.append({"scope": "coverage_margin", "metric": metric,
+                         "predicted": margin.get(metric),
+                         "actual": 1.0 if metric == "dispersion_ratio" else None,
+                         "mae": None, "bias": None})
     # Per-stat accuracy blocks (team, player, advanced).
     for scope, block in (("team", agg["team_accuracy"]),
                          ("player", agg["player_accuracy"]),
@@ -826,6 +955,19 @@ def _run_summary_frame(report: dict) -> pd.DataFrame:
         "points_mae": agg["headline"]["points_mae"],
         "player_minutes_mae": agg["headline"].get("player_minutes_mae"),
         "player_minutes_bias": _bias("player_accuracy", MINUTES),
+        # Brier standard error: the cross-run table is exactly where two Briers get compared,
+        # so the thing that says whether the difference is real belongs in the same row.
+        "brier_se": agg["headline"].get("brier_se"),
+        "score_brier_se": agg["headline"].get("score_brier_se"),
+        # Joint structure (the W3 gate) and the margin dispersion it produces.
+        "corr_home_away": (agg.get("joint") or {}).get("corr_home_away"),
+        "corr_se": (agg.get("joint") or {}).get("corr_se"),
+        "pace_sd": (agg.get("joint") or {}).get("pace_sd"),
+        "margin_sd": (agg.get("joint") or {}).get("margin_sd"),
+        "total_sd": (agg.get("joint") or {}).get("total_sd"),
+        "margin_dispersion_ratio": ((agg.get("coverage") or {}).get("margin") or {})
+                                   .get("dispersion_ratio"),
+        "margin_resid_sd": ((agg.get("coverage") or {}).get("margin") or {}).get("resid_sd"),
         # Key biases the tuning targets (predicted − actual, per team).
         "pace_bias": _bias("advanced", "pace"),
         "fga_bias": _bias("team_accuracy", "fga"),
