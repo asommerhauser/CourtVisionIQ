@@ -193,17 +193,51 @@ def merge_prior_features(df: pd.DataFrame, cols: dict, rosters: dict,
     Mirrors ``merge_season_features`` / ``merge_game_state_features`` / ``merge_rotation_features``
     so every head's preprocess reads the same way, and mutates-and-returns ``cols`` as they do.
     """
-    player_map, team_map = load_priors(data_dir)
+    if not priors_dir(data_dir).is_dir():
+        # No sidecar at all. Every player reads as the league mean, which is a legitimate state --
+        # a synthetic test fixture, or predicting a game on a machine that carries weights but no
+        # data. It is NOT a legitimate state for a real train, so it is loud, and full_run's
+        # pre-flight (require_priors) refuses it outright before a train starts.
+        print(f"[priors] WARNING: no sidecar at {priors_dir(data_dir)}; every player will read as "
+              f"the league mean. For a real train, build it first: "
+              f"python -m player_priors --data-dir {data_dir}")
+        player_map, team_map = {}, {}
+    else:
+        player_map, team_map = load_priors(data_dir)
+        covered = sum(1 for gid in df["game_id"].unique() if int(gid) in player_map)
+        total = df["game_id"].nunique()
+        if covered < total:
+            # A sidecar that exists but does not cover the corpus is the dangerous case: the data
+            # was re-cleaned and the priors were not rebuilt, so SOME games train on real rates and
+            # the rest silently on league means. That looks exactly like a model that learned
+            # nothing from the priors, so it raises rather than warning.
+            raise ValueError(
+                f"the priors sidecar at {priors_dir(data_dir)} covers {covered} of {total} games "
+                f"in this corpus -- it is stale. Rebuild it: "
+                f"python -m player_priors --data-dir {data_dir}")
     cols.update(build_raw_prior_cols(df, rosters, player_map, team_map))
-    covered = sum(1 for gid in df["game_id"].unique() if int(gid) in player_map)
-    total = df["game_id"].nunique()
-    if covered < total:
-        # Loud, because the quiet version of this is every uncovered game silently training on the
-        # league mean -- which looks exactly like a model that learned nothing from the priors.
-        raise ValueError(
-            f"the priors sidecar covers {covered} of {total} games in this corpus. Rebuild it: "
-            f"python -m player_priors --data-dir {data_dir}")
     return cols
+
+
+def require_priors(data_dir: str = "./data") -> int:
+    """Pre-flight for a real train: the sidecar must exist. Returns how many games it covers.
+
+    ``merge_prior_features`` only warns when the sidecar is missing, because a synthetic fixture and
+    a weights-only machine both legitimately have none. A train does not: starting one without the
+    priors produces a model whose whole W2.1 input is a constant, and the first sign of it would be
+    the eval, hours later.
+    """
+    root = priors_dir(data_dir)
+    if not root.is_dir():
+        raise SystemExit(
+            f"no priors sidecar at {root}. A train without it feeds every player the league mean." \
+            f"\nBuild it first (pure pandas, no GPU, ~10 min):  python -m player_priors")
+    games = set()
+    for path in sorted(root.glob("players_*.parquet")):
+        games.update(int(g) for g in pd.read_parquet(path, columns=["game_id"])["game_id"])
+    if not games:
+        raise SystemExit(f"the priors sidecar at {root} is empty. Rebuild:  python -m player_priors")
+    return len(games)
 
 
 def append_prior_batches(batches: dict, cols: dict, idx, n: int, seq_len: int) -> None:
@@ -256,7 +290,8 @@ def prior_team_projections(team_inputs: dict) -> list:
 __all__ = [
     "PRIOR_LIST_COLS", "TEAM_PRIOR_COLS", "PRIOR_INPUT_KEYS", "N_PLAYER_PRIORS",
     "normalize_player", "normalize_team", "load_priors", "priors_for_season", "pad_priors",
-    "build_raw_prior_cols", "merge_prior_features", "append_prior_batches",
+    "build_raw_prior_cols", "merge_prior_features", "require_priors",
+    "append_prior_batches",
     "make_prior_inputs",
     "side_prior_scalars", "prior_team_projections",
 ]

@@ -348,7 +348,7 @@ class SubstitutionModel:
             encode_bench=lambda names: self.encoder.encode_roster(names, BENCH_SIZE))
         # Season-to-date per-player and per-team rates, joined from the causal sidecar
         # (player_priors.py). Fixed-constant normalization, so no norm_stats keys.
-        merge_prior_features(df, cols, rosters, self.path)
+        merge_prior_features(df, cols, rosters, str(self.data_dir))
         train = self._build_split(cols, game_id, train_games)
         test = self._build_split(cols, game_id, test_games)
         holdout = self._build_split(cols, game_id, holdout_games)

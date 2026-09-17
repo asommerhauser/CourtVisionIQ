@@ -82,15 +82,24 @@ class FullRun:
             raise SystemExit(f"no regular-season games for the last season ({last_season}).")
         boundary = int(reg["pos"].min()) + int(FINAL_SEASON_FRACTION * len(reg))
 
-        if boundary + FINAL_HOLDOUT_GAMES > len(idx):
+        # FINAL_HOLDOUT_GAMES is a TARGET for the pool, not a requirement. Since 3.0 it is 700 --
+        # seven rotating 100-game windows -- against 702 games after the cut on the real corpus,
+        # which is two games of slack. A smaller corpus (a test fixture, an experiment on one
+        # season) should take the tail it has rather than refuse to set up at all; window_ids()
+        # already warns when a window comes out short. Only an EMPTY tail is fatal.
+        pool_size = min(FINAL_HOLDOUT_GAMES, len(idx) - boundary)
+        if pool_size <= 0:
             raise SystemExit(
-                f"not enough games after the cut for a {FINAL_HOLDOUT_GAMES}-game holdout "
-                f"(boundary {boundary}, corpus {len(idx)})."
-            )
-        _, _, holdout = sequential_partition(idx, boundary, n_holdout=FINAL_HOLDOUT_GAMES,
+                f"no games sit after the cut (boundary {boundary}, corpus {len(idx)}); "
+                f"there is nothing to hold out.")
+        if pool_size < FINAL_HOLDOUT_GAMES:
+            print(f"[setup] WARNING: only {pool_size} games after the cut, against a "
+                  f"FINAL_HOLDOUT_GAMES pool of {FINAL_HOLDOUT_GAMES}. That is "
+                  f"{pool_size // HOLDOUT_WINDOW_GAMES} full rotating window(s).")
+        _, _, holdout = sequential_partition(idx, boundary, n_holdout=pool_size,
                                              val_frac=TEST_FRAC, seed=SEED)
         ordered = idx["game_id"].to_numpy()
-        holdout_ids = [int(g) for g in ordered[boundary:boundary + FINAL_HOLDOUT_GAMES]]
+        holdout_ids = [int(g) for g in ordered[boundary:boundary + pool_size]]
 
         self.state = {
             "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -230,12 +239,19 @@ class FullRun:
     # --------------------------------------------------------------- train
     def train(self, *, rebuild_vocabs: bool = False) -> None:
         from models.pipeline import run_stage
+        from models.prior_features import require_priors
 
         self._require()
         if self.state["status"] == "trained":
             print("[train] already trained — run:  python evaluate.py --model "
                   f"{self.state.get('version', DEFAULT_MODEL)}")
             return
+        # W2.1's inputs come from a sidecar the cleaner does not build. merge_prior_features only
+        # WARNS when it is missing, because a synthetic fixture and a weights-only machine both
+        # legitimately have none -- but a train without it feeds every player the league mean, and
+        # the first sign of that would be the eval, hours later. Refuse here instead.
+        covered = require_priors(self.state["data_dir"])
+        print(f"[train] priors sidecar covers {covered:,} games")
         idx = game_index(self.state["data_dir"])
         partition = sequential_partition(idx, self.state["boundary_idx"],
                                          n_holdout=FINAL_HOLDOUT_GAMES, val_frac=TEST_FRAC, seed=SEED)

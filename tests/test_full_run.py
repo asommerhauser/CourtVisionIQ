@@ -3,7 +3,8 @@ import json
 
 import pandas as pd
 
-from config import FINAL_HOLDOUT_GAMES, FULL_ARTIFACTS_ROOT
+from config import FINAL_HOLDOUT_GAMES, HOLDOUT_WINDOW_GAMES, FULL_ARTIFACTS_ROOT
+from training.chronology import game_index
 from training.full_run import FullRun
 
 
@@ -41,12 +42,25 @@ def test_setup_cuts_mid_last_season(tmp_path):
     assert st["artifacts_root"] == FULL_ARTIFACTS_ROOT
     # Cut at 50% of 2005's 220 regular games: 2005 reg starts at pos 48 -> boundary 48 + 110 = 158.
     assert st["boundary_idx"] == 158
-    assert len(st["holdout_game_ids"]) == FINAL_HOLDOUT_GAMES
+    # The pool is a TARGET, clamped to the tail that actually exists. FINAL_HOLDOUT_GAMES is 700
+    # since 3.0 (seven rotating 100-game windows) against 702 games after the cut on the real
+    # corpus -- two games of slack. A small corpus like this fixture takes what it has rather than
+    # refusing to set up, and window_ids() warns when a window comes out short.
+    available = len(idx_all := game_index(str(data_dir))) - st["boundary_idx"]
+    assert len(st["holdout_game_ids"]) == min(FINAL_HOLDOUT_GAMES, available)
+    assert len(st["holdout_game_ids"]) == available < FINAL_HOLDOUT_GAMES
 
-    # Every holdout game is a 2005 regular-season game, contiguous right after the boundary.
-    from training.chronology import game_index
-    idx = game_index(str(data_dir)).set_index("game_id")
-    for g in st["holdout_game_ids"]:
+    # The pool is exactly the contiguous tail after the cut -- that is the invariant, and it is
+    # what makes the rotating windows disjoint slices of a known range.
+    ordered = [int(g) for g in idx_all["game_id"]]
+    assert st["holdout_game_ids"] == ordered[st["boundary_idx"]:]
+
+    # Window 0 -- the games every pre-3.0 run scored -- is all 2005 regular season. Later windows
+    # of a pool this small reach into the playoffs, which is correct: the pool is "every untrained
+    # game", and a window is reported with its k precisely so that is legible.
+    idx = idx_all.set_index("game_id")
+    window0 = st["holdout_game_ids"][:HOLDOUT_WINDOW_GAMES]
+    for g in window0:
         assert int(idx.loc[g, "season"]) == 2005 and int(idx.loc[g, "playoff"]) == 1
 
 
