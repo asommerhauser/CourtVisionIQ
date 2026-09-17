@@ -264,9 +264,13 @@ git status --porcelain encoder/vocabs/          # must be empty
 python -m pytest -q
 ```
 
-**Known state going in.** Six tests in `test_controller.py`, all on the offence-side foul path,
-fail on `main` as well — verified by running them against `main` in a throwaway worktree. They are
-not from 3.0. Everything else should pass; the 3.0 files are `test_standing_metrics`,
+**Known state going in.** The suite is green: 891 passed on 2026-09-16, after the eleven failures
+that first full run surfaced were fixed. None of the eleven was a live defect — all three groups
+were tests that had fallen behind the code (commit `3df60bf`): six offence-side foul tests in
+`test_controller.py` that predated the side-before-fouler reordering in `a68266e` and had been
+asserting against numpy's first draw ever since, four report tests whose `build_report` fakes
+lacked the new `window` argument, and one shell test holding a `DELTA_TIME_SCALE` default from
+before the 2.0 refit. Anything failing now is new. The 3.0 files are `test_standing_metrics`,
 `test_state_probes`, `test_rotating_windows`, `test_player_priors`, `test_regime`,
 `test_scheduled_sampling`, `test_rollout_selection`, `test_feature_manifest` and
 `test_tf_free_imports`.
