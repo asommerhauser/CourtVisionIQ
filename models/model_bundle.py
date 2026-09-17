@@ -14,6 +14,7 @@ new models come online.
 from __future__ import annotations
 
 from models.artifacts import ModelArtifacts, DEFAULT_ARTIFACTS_ROOT
+from models.manifest import feature_mismatch, read_manifest
 from models.registry import MODEL_REGISTRY
 
 
@@ -37,7 +38,24 @@ class ModelBundle:
         Reload every registered model that has artifacts under `root`. Shared
         `encoder`/constructor kwargs flow to each model's from_artifacts. Models
         with no saved weights are skipped.
+
+        Refuses up front when the bundle's manifest records a different INPUT SIGNATURE than this
+        build produces. Until 3.0 the manifest's arch snapshot was advisory -- nothing read it at
+        load, and ``from_artifacts`` rebuilt the graph from the live ``config.py`` and called
+        ``load_weights`` unconditionally. Most signature changes do fail there, because
+        ``fusion_projection``'s kernel is a function of the concatenated input width; but a change
+        that swaps one key for another of the same width loads silently and means something
+        different on every row. This turns that into the readable refusal the manifest's own
+        docstring promises, naming the keys that moved.
         """
+        problems = feature_mismatch((read_manifest(root) or {}).get("features"))
+        if problems:
+            raise ValueError(
+                f"the bundle at {root} was trained with different model inputs than this "
+                f"build produces:\n  " + "\n  ".join(problems) + "\n"
+                "Check out the commit that trained it, or retrain. Loading anyway would "
+                "rebuild the graph from the current config.py and reinterpret the weights.")
+
         models: dict = {}
         instances: dict = {}
         for key, model_cls in MODEL_REGISTRY.items():

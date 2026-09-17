@@ -32,7 +32,7 @@ from models.artifacts import ModelArtifacts, list_models, model_root
 
 MANIFEST_NAME = "manifest.json"
 VOCAB_SNAPSHOT_DIR = "vocabs"
-SCHEMA = 1
+SCHEMA = 2
 
 # Capacity dims the graph is rebuilt from; a mismatch means the weights will not load.
 #
@@ -42,7 +42,56 @@ SCHEMA = 1
 # that makes that mismatch visible.
 ARCH_KEYS = ("MODEL_DIM", "NUM_LAYERS", "NUM_HEADS", "FF_DIM", "ROSTER_SAB_LAYERS",
              "MAX_SEQUENCE_LENGTH", "ROSTER_SIZE", "BENCH_SIZE",
-             "LOCAL_ATTENTION_HEADS", "LOCAL_ATTENTION_WINDOW")
+             "LOCAL_ATTENTION_HEADS", "LOCAL_ATTENTION_WINDOW",
+             "REGIME_ENABLED", "REGIME_DIM")
+
+
+def feature_snapshot() -> dict:
+    """WHICH INPUTS a model was trained with -- not how big it is.
+
+    ARCH_KEYS records capacity; this records the input signature. 3.0 widened the fusion three
+    times in one retrain (the eight team priors, running_pace, the regime latent) and raised the
+    roster encoder's per-player scalar count from 4 to 14, and none of that is a capacity dim.
+
+    Most of these changes DO fail loudly at ``load_weights``, because ``fusion_projection``'s kernel
+    shape is a function of the concatenated width -- that is why ``build_backbone`` takes a list of
+    parts rather than a pre-fused tensor. But not all of them. A change that swaps one game-state
+    key for another of the same width reloads with no error at all and means something different on
+    every row, which is exactly the failure LOCAL_ATTENTION_* was added to ARCH_KEYS to prevent.
+    Recording the names is the only thing that makes it visible.
+    """
+    from models.game_state_features import GAME_STATE_KEYS
+    from models.prior_features import PRIOR_INPUT_KEYS
+    from models.regime import REGIME_KEY
+    from models.rotation_features import (
+        NUM_BENCH_SCALARS, NUM_ROSTER_SCALARS, ROSTER_STATE_KEYS)
+    from models.season_features import SEASON_INPUT_KEYS
+    from player_priors import PLAYER_PRIOR_KEYS, TEAM_PRIOR_KEYS
+
+    return {
+        "game_state_keys": list(GAME_STATE_KEYS),
+        "roster_state_keys": list(ROSTER_STATE_KEYS),
+        "season_input_keys": list(SEASON_INPUT_KEYS),
+        "prior_input_keys": list(PRIOR_INPUT_KEYS),
+        "player_prior_keys": list(PLAYER_PRIOR_KEYS),
+        "team_prior_keys": list(TEAM_PRIOR_KEYS),
+        "regime_key": REGIME_KEY,
+        "num_roster_scalars": NUM_ROSTER_SCALARS,
+        "num_bench_scalars": NUM_BENCH_SCALARS,
+    }
+
+
+def feature_mismatch(recorded: dict | None) -> list[str]:
+    """Which parts of a recorded feature signature disagree with this build. Empty means agree.
+
+    ``None`` or ``{}`` means a manifest written before 3.0, which carries no signature. That is not
+    a mismatch -- it is an absence, and it reads as one so a v1.0 or 2.0 bundle stays loadable.
+    """
+    if not recorded:
+        return []
+    current = feature_snapshot()
+    return [f"{key}: trained with {recorded.get(key)!r}, this build has {current[key]!r}"
+            for key in current if key in recorded and recorded[key] != current[key]]
 
 
 def _git(*args) -> str:
@@ -150,6 +199,8 @@ def new_manifest(name, *, epochs=None, batch_size=None, seed=None, data_dir=None
         "epochs": epochs,
         "batch_size": batch_size,
         "arch": arch_snapshot(),
+        # WHICH inputs, not how many parameters. See feature_snapshot.
+        "features": feature_snapshot(),
         "data": {
             "data_dir": data_dir,
             "processed_dir": processed_dir,
