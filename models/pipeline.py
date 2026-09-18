@@ -166,7 +166,8 @@ def run_stage(data_dir: str, game_partition, *, artifacts_root: str = DEFAULT_AR
               report: bool = True, run_name: str | None = None,
               done: list[str] | None = None, on_trained=None,
               subset_keys=None, subset_train_games=None,
-              rebuild_vocabs: bool = False) -> list[str]:
+              rebuild_vocabs: bool = False,
+              rollout_score_fn_factory=None) -> list[str]:
     """Train every model on ``game_partition`` (one stage / one full train) and return the keys
     trained this call.
 
@@ -220,9 +221,20 @@ def run_stage(data_dir: str, game_partition, *, artifacts_root: str = DEFAULT_AR
         bs = _batch_for(key, batch_size)
         origin = warm_start_root if warm_start_root else "fresh init"
         print(f"\n{'=' * 70}\n[stage] training '{key}' ({origin}, batch {bs})\n{'=' * 70}")
+        # W8: rung 2's channel. Only EventTimeModel.train takes rollout_score_fn -- the other five
+        # head classes have the identical signature without it -- so it goes to that head alone.
+        # Widening it to all twelve is a design change rather than a bridge, and is 3.3.
+        extra = {}
+        if key == EventTimeModel.KEY and rollout_score_fn_factory is not None:
+            # A factory rather than a ready callable, because the score function needs a handle on THIS
+            # head instance -- run_stage constructs the heads itself, so the caller has nothing to close
+            # over. ``model`` here is the head, not its Keras graph.
+            fn = rollout_score_fn_factory(model)
+            if fn is not None:
+                extra["rollout_score_fn"] = fn
         model.train(epochs=epochs, batch_size=bs, lr=lr, patience=patience,
                     dropout=dropout, warmup_epochs=warmup_epochs, artifacts_root=artifacts_root,
-                    report=report, run_name=run_name, init_weights_root=warm_start_root)
+                    report=report, run_name=run_name, init_weights_root=warm_start_root, **extra)
         trained.append(key)
         if on_trained is not None:
             on_trained(key)

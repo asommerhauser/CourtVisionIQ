@@ -783,6 +783,15 @@ class EventTimeModel:
         inner = model
         model = build_trainer(inner, n_games=int(train_split["pad_mask"].shape[0]),
                               scheduled_sampling=True)
+        # W8: rung 2's score function needs THIS epoch's weights, and the only handle on them is the
+        # graph above. Exposed on the instance because the score function is constructed before
+        # train() is called and so cannot close over a local.
+        #
+        # `inner`, deliberately, NOT `model`: `model` is now the trainer, whose weight list also holds
+        # the regime latent table, and the simulator's copy of the graph does not. Copying from the
+        # trainer would raise on length -- or worse, if the lengths ever matched, load silently
+        # misaligned weights.
+        self._live_model = inner
 
         # Warmup + cosine-decay LR schedule. The old ReduceLROnPlateau collapsed the
         # LR once loss flattened, stalling learning while the curve was still flat;
