@@ -46,6 +46,7 @@ Carried forward from [`v3_progress.md`](v3_progress.md), with **rule 1 amended**
 | `v3.2/test-tiers` | WT: `pytest.ini` markers, two conftest fixtures | no | **built**, 49-test subset green |
 | `v3.2/priors-join` | W1: one definition of the `game_id` numbering | yes (sidecar rebuild) | **built**, 153 tests green |
 | `v3.2/corpus-cut` | W2: `MIN_TRAIN_SEASON = 2008`, applied to rows | yes | **built**, 165 tests green |
+| `v3.2/subset-all-heads` | W3: all twelve heads on the subset; coverage retired | yes | **built**, 124 tests green |
 
 **W1 verified two ways.** `tests/test_player_priors.py` gains three tests that build a real sidecar
 over two season files carrying *the same raw ids* -- the case that used to collapse -- and assert the
@@ -178,7 +179,31 @@ reserved tokens assigned per game by sorted name cost 16 embedding rows and make
 and the embedding becomes an honest "generic bench slot" with all identity flowing through the
 seventeen prior scalars — which is a truer reading of §3.2's own argument than one shared id.
 
-### 3. The replay estimator keeps only positive advantages
+### 3. Coverage-completeness is retired, and the sampler gets its first tests
+
+§2.2 argues the guarantee is inert under a minimum-games floor: anyone it rescues with a single game
+falls below the floor anyway, and it drags old games into a deliberately modern-heavy sample to do it.
+Retiring it also removed the per-game recency weights, which only ever broke ties when choosing
+*which* game to add for a rare player — the per-season fill is uniform by construction, so the modern
+tilt now lives entirely in the rates.
+
+**The sampler had zero test coverage.** Nothing in the suite referenced `build_subset`,
+`season_sample_rates`, `load_subset_games`, `SUBSET_MODEL_KEYS` or `subset_train_games`, so retiring
+the guarantee would have produced no failure in either direction. `tests/test_subset.py` is new and
+starts from zero: per-season rates and their decay, per-season fill targets, seed determinism, the
+subset-⊆-train property, the empty pool, manifest round-tripping, and a test that pins the behaviour
+change itself — a player who appears only in a zero-rate season is now simply absent rather than
+rescued.
+
+It also pins the routing as a **membership** test against `STAGE_MODEL_KEYS` rather than a count. The
+list was wrong before in exactly the way a count would not catch: it named six of the seven
+conditional heads, which was true of nothing, because `timeout_team` already trained on subset rows.
+
+`build_subset` now emits `stats["players"]`, the per-player game count **inside the subset**, which is
+what W4's floor reads; and `extract` prints the distribution plus a kept/anonymous table at floors
+10-30, so the floor is chosen against the real histogram rather than the estimate in measurement 2.
+
+### 4. The replay estimator keeps only positive advantages
 
 §4.2: "the advantage is the sample weight. Positive advantage reinforces those choices, negative makes
 them less likely." A negative weight on cross-entropy is `-w·log p` with `w < 0`, which is **minimized
@@ -188,7 +213,7 @@ constants that cannot be tuned inside a single 3.2 GPU-hour pass. Filtering to t
 their nine siblings is bounded by construction, needs no hyper-parameters, and never pushes away from
 anything.
 
-### 4. Two §4 citations corrected rather than implemented
+### 5. Two §4 citations corrected rather than implemented
 
 - §4.4 rule 2 says to "drop `seconds` from the team aggregate entirely" and that "`eval_metrics`
   already says this in its headline block". **`_BOX_ACCURACY_STATS`
@@ -203,7 +228,7 @@ anything.
   The other ten heads' queried positions are event-token-gated (`next_event == <token>`) and much
   sparser, so the decision log is defined per head from its own sampling call.
 
-### 5. Rung 2 stays scoped to `event_time`
+### 6. Rung 2 stays scoped to `event_time`
 
 §4.6 prices the bridge at one day. `rollout_score_fn` exists only on `EventTimeModel.train`
 (`models/event_time_model.py:711`); the other five head classes have the identical signature without
