@@ -63,6 +63,8 @@ from models.event_time_model import (
 from models.roster_set_encoder import (
     RosterEncoderParams,
     SequenceRosterEncoder,
+    build_sequence_roster_encoder,
+    encode_both_rosters,
 )
 from models.season_features import (
     SEASON_INPUT_KEYS,
@@ -437,7 +439,7 @@ class ConditionalTypeModel:
             dropout=dropout,
             num_scalars=NUM_ROSTER_SCALARS,
         )
-        return SequenceRosterEncoder(params, name="roster_vec")
+        return build_sequence_roster_encoder(params, name="roster_vec")
 
     def model(self, num_layers=NUM_LAYERS, num_heads=NUM_HEADS, ff_dim=FF_DIM, dropout=0.2):
         """
@@ -512,9 +514,12 @@ class ConditionalTypeModel:
             )
 
         # ---- Roster encoding across the sequence (shared home/away, with per-player rest) ----
-        home_vec = self.roster_encoder(
-            [home_roster, *side_scalars(rest_home, rotation_inputs, "home", prior_inputs)])
-        away_vec = self.roster_encoder(
+        # W7: one call, because cross-roster attention needs both sides' slots live at the
+        # same moment. encode_both_rosters dispatches on which encoder this build uses, so
+        # the CROSS_ROSTER_ENABLED branch lives in one place rather than six.
+        home_vec, away_vec = encode_both_rosters(
+            self.roster_encoder,
+            [home_roster, *side_scalars(rest_home, rotation_inputs, "home", prior_inputs)],
             [away_roster, *side_scalars(rest_away, rotation_inputs, "away", prior_inputs)])
 
         # ---- Continuous projections ----
