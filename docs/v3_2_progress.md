@@ -47,6 +47,7 @@ Carried forward from [`v3_progress.md`](v3_progress.md), with **rule 1 amended**
 | `v3.2/priors-join` | W1: one definition of the `game_id` numbering | yes (sidecar rebuild) | **built**, 153 tests green |
 | `v3.2/corpus-cut` | W2: corpus floor, applied to rows | yes | **built**, 165 tests green |
 | `v3.2/corpus-cut-2011` | W2a: the floor moves 2008 -> 2011 | yes | **built** |
+| `v3.2/vocab-floor` | W4: the floor, and anonymous slots by graph colouring | yes | **built**, 20 new tests; verified on the real corpus |
 | `v3.2/subset-all-heads` | W3: all twelve heads on the subset; coverage retired | yes | **built**, 124 tests green |
 
 **W1 verified two ways.** `tests/test_player_priors.py` gains three tests that build a real sidecar
@@ -197,12 +198,50 @@ from 31 games to 34 and every floor keeps a smaller fraction anonymous. The cost
 is unchanged and still stands: rare tokens get rarer, and the rarest foul and rebound sub-types are
 where it would show.
 
-### 3. Below-floor players get per-game anonymous slots, not one `UNK`
+### 3. Below-floor players are aliased to anonymous slots — and the slots come from a graph colouring
 
-§3.2 maps them all to `UNK`. Measurement 2 shows that is ambiguous in a third of games. Sixteen
-reserved tokens assigned per game by sorted name cost 16 embedding rows and make the token resolvable,
-and the embedding becomes an honest "generic bench slot" with all identity flowing through the
-seventeen prior scalars — which is a truer reading of §3.2's own argument than one shared id.
+§3.2 maps them all to `UNK`. Measurement 2 shows that is ambiguous in 28.7% of games, up to twelve
+anonymous players in one, so a single shared id cannot stand for them.
+
+**The planned fix was a per-game map. It turned out not to be necessary, which is the useful finding.**
+Build the co-occurrence graph over below-floor players — an edge between any two who ever appear in the
+same game — and colour it greedily, highest degree first. Measured on the real corpus: **36 slots, zero
+collisions across all 16,535 games**, against a busiest game of twelve. A naive `rank mod slots`
+assignment collides in 7.4% of games at 16 slots and 2.2% at 64; the colouring collides in none.
+
+So one **global, stateless** `name -> token` map delivers exactly the guarantee a per-game map would,
+and avoids all of its cost: no grouping by `game_id` in six heads' preprocess, no second parse of every
+roster cell, and nothing threaded through `simulation/input_cache.py` or `simulation/game_input.py`. The
+slot count is therefore not a constant — it is whatever the colouring needs, with `ANON_SLOTS_MAX = 128`
+as a bound that raises rather than truncating.
+
+**Measured against the real corpus at the 2011 cut and a floor of 20:** 970 players keep their own
+embedding row, 644 are aliased into 36 slots, and the table goes from 2,152 rows to about 1,011 — a 53%
+cut in exactly the place §1f blames for the memorisation. Rebuilding the assignment twice gives an
+identical result, which matters because it is persisted and the whole vocabulary depends on it.
+
+**Applied inside `Encoder`**, because the alias map is part of *the language*: `encode_roster`,
+`encode_player` and `encode_secondary_player` all route names through `Encoder.alias`, so no call site
+changes, and the map is saved and loaded with the vocabs, snapshotted into `artifacts/<name>/vocabs/` by
+the existing `snapshot_vocabs`, and fingerprinted by the manifest. `secondary_player` shares the
+aliasing because it shares the vocab — otherwise a below-floor assister would be one id there and
+another on the floor.
+
+**`game_available_mask` needed no change at all**, which is a consequence of the design rather than
+luck: it marks the ids that actually appear in a game, so the anonymous tokens present are available
+and the rest are not. The `UNK`-is-samplable worry that motivated the whole design disappears, because
+no real player maps to `UNK` any more. Verified end to end — `PAD` and `UNK` both read 0, and two
+anonymous players sharing a game get distinct available ids.
+
+**Two silent failures made loud.** `Encoder.freeze_all` refuses a vocab that still holds a row for an
+aliased player: `Vocab` is append-only, so a rebuild over a pre-floor vocab would keep every below-floor
+name, the floor would do nothing, and the only symptom would be a table that did not shrink. And
+`require_player_floor`, called from `full_run.train` beside `require_priors`, refuses a configured floor
+with no alias map on disk.
+
+**A known limit, out of scope.** A name absent from the training corpus entirely still encodes as `UNK`,
+so two genuinely unseen players on the same floor remain ambiguous. That is pre-existing behaviour and
+only bites upcoming-season inference, where such a player has no priors either.
 
 ### 4. Coverage-completeness is retired, and the sampler gets its first tests
 

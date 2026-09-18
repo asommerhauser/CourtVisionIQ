@@ -137,6 +137,17 @@ def _check_vocabs(manifest, name, *, force, echo) -> None:
              f"{live.get(k, {}).get('size')}"
              for k, v in (manifest.get("vocabs") or {}).items()
              if k in live and live[k].get("size") != v.get("size")]
+    # The anonymous-slot map is compared by CONTENT, not only by slot count. It decides which player
+    # each ANON token stands for, so two maps of the same size mean entirely different things on every
+    # row -- a same-shape swap that reloads cleanly, which is the class of failure this check exists
+    # for. Only reachable on the fallback path: a per-model vocab snapshot pins the map with the
+    # weights, so drift is impossible there.
+    want, have = (manifest.get("vocabs") or {}).get("anon"), live.get("anon")
+    if want and have and want.get("sha256") and want["sha256"] != have.get("sha256"):
+        drift.append(
+            f"anon: the anonymous-slot map differs from the one these weights trained with "
+            f"({want.get('n_aliased')} players aliased at floor {want.get('floor')}, now "
+            f"{have.get('n_aliased')} at floor {have.get('floor')})")
     if not drift:
         return
     msg = (f"vocab drift for {name} -- its embedding tables are sized for the old vocab:\n    "

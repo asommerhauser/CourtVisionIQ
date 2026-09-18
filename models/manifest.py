@@ -28,6 +28,7 @@ import subprocess
 from pathlib import Path
 
 import config
+from player_floor import ANON_FILENAME
 from models.artifacts import ModelArtifacts, list_models, model_root
 
 MANIFEST_NAME = "manifest.json"
@@ -135,6 +136,18 @@ def vocab_fingerprint(encoder) -> dict:
             except (OSError, json.JSONDecodeError):
                 pass
         out[name] = entry
+    # The alias map decides WHICH NAME each below-floor player is encoded under, so swapping it
+    # changes the meaning of every anonymous slot without changing any vocab size. Fingerprinted for
+    # the same reason LOCAL_ATTENTION_* is in ARCH_KEYS: a same-shape change that reloads cleanly and
+    # means something different on every row.
+    anon = Path(encoder.vocab_dir) / ANON_FILENAME
+    if anon.is_file():
+        try:
+            data = json.loads(anon.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        out["anon"] = {"size": data.get("n_slots"), "n_aliased": data.get("n_aliased"),
+                       "floor": data.get("floor"), "sha256": _sha256(anon)}
     return out
 
 
