@@ -6,7 +6,8 @@ and ``read_manifest`` was advisory -- nothing consulted it at load, and ``from_a
 the graph from the live ``config.py`` and called ``load_weights`` unconditionally.
 
 3.0 widened the fusion three times in one retrain (eight team priors, running_pace, the regime
-latent) and took the roster encoder's per-player scalar count from 4 to 14. Most of that does fail
+latent) and took the roster encoder's per-player scalar count from 4 to 14, and 3.2 took it to
+21. Most of that does fail
 loudly at ``load_weights``, because ``fusion_projection``'s kernel is a function of the concatenated
 width. But a change that swaps one key for another of the same width loads with no error at all and
 means something different on every row -- the same class of failure ``LOCAL_ATTENTION_*`` was added
@@ -29,7 +30,7 @@ def test_the_signature_records_the_input_names_not_just_their_count():
     assert "running_pace" in snap["game_state_keys"]
     assert "prior_home" in snap["prior_input_keys"]
     assert snap["regime_key"] == "regime"
-    assert snap["num_roster_scalars"] == 14
+    assert snap["num_roster_scalars"] == 21
 
 
 def test_the_schema_was_bumped_so_an_old_manifest_is_identifiable():
@@ -56,7 +57,7 @@ def test_a_changed_scalar_count_is_named():
     problems = feature_mismatch(stale)
     assert len(problems) == 1
     assert "num_roster_scalars" in problems[0]
-    assert "trained with 4" in problems[0] and "this build has 14" in problems[0]
+    assert "trained with 4" in problems[0] and "this build has 21" in problems[0]
 
 
 def test_a_same_width_key_swap_is_caught():
@@ -79,3 +80,43 @@ def test_every_recorded_key_is_json_serialisable():
     import json
 
     json.dumps(feature_snapshot())
+
+
+# ------------------------------------------------- the refusal, now that something actually calls it
+
+def test_the_shell_refuses_a_bundle_whose_input_signature_moved():
+    """``feature_mismatch`` had no caller until 3.2, so this is the half that was missing.
+
+    Most input changes fail at ``load_weights`` because ``fusion_projection``'s kernel width depends on
+    the concat, but a same-width key swap reloads silently. The point of the function is to name the
+    key; the point of this test is that something asks it.
+    """
+    from shell.actions import ShellError, _check_features
+
+    stale = dict(feature_snapshot())
+    stale["num_roster_scalars"] = 14
+    with pytest.raises(ShellError, match="input signature mismatch"):
+        _check_features({"features": stale}, "v3.2", force=False, echo=lambda *_: None)
+
+
+def test_forcing_turns_the_refusal_into_a_warning():
+    from shell.actions import _check_features
+    said = []
+    stale = dict(feature_snapshot())
+    stale["num_roster_scalars"] = 14
+    _check_features({"features": stale}, "v3.2", force=True, echo=said.append)
+    assert said and "warning (forced)" in said[0]
+
+
+def test_a_manifest_with_no_signature_is_an_absence_not_a_mismatch():
+    """A v1.0 or 2.0 bundle carries no signature and must stay loadable."""
+    from shell.actions import _check_features
+    _check_features({}, "v1.0", force=False, echo=lambda *_: None)
+    _check_features({"features": {}}, "v2.0", force=False, echo=lambda *_: None)
+
+
+def test_a_matching_signature_passes_quietly():
+    from shell.actions import _check_features
+    said = []
+    _check_features({"features": feature_snapshot()}, "v3.2", force=False, echo=said.append)
+    assert said == []

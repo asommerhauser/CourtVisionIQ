@@ -259,25 +259,27 @@ class FullRun:
         # the first sign of that would be the eval, hours later. Refuse here instead.
         covered = require_priors(self.state["data_dir"])
         print(f"[train] priors sidecar covers {covered:,} games")
-        # W4's floor has the same shape of silent failure: configured but never materialised, every
-        # player keeps his own embedding row and nothing looks wrong. The subset extract below writes
-        # the map, so this only fires when the extract predates the floor.
-        import config as _config
-        from player_floor import require_player_floor
-        n_aliased = require_player_floor(VOCAB_DIR, getattr(_config, "MIN_PLAYER_SUBSET_GAMES", None))
-        if n_aliased:
-            print(f"[train] vocabulary floor {_config.MIN_PLAYER_SUBSET_GAMES}: "
-                  f"{n_aliased:,} players aliased to anonymous slots")
         idx = game_index(self.state["data_dir"])
         partition = sequential_partition(idx, self.state["boundary_idx"],
                                          n_holdout=FINAL_HOLDOUT_GAMES, val_frac=TEST_FRAC, seed=SEED)
         print(f"[train] one fresh full train on {self.state['boundary_idx']} games "
               f"(recency-weighted) -> {self.state['artifacts_root']}")
 
-        # Small heads (config.SUBSET_MODEL_KEYS) train on the compact, modern-heavy per-season
-        # subset; the big player-vocab heads keep the full corpus. Extracted here when absent, so
-        # there is no "no subset file" branch left to fall into.
+        # Every head (config.SUBSET_MODEL_KEYS is all twelve as of 3.2) trains on the compact,
+        # modern-heavy per-season subset. Extracted here when absent, so there is no "no subset file"
+        # branch left to fall into.
         subset_train = self._subset_games(tag="train")
+
+        # W4's floor has the same shape of silent failure as the priors sidecar: configured but never
+        # materialised, every player keeps his own embedding row and nothing looks wrong. Checked HERE,
+        # after the extract, because the extract is what writes the map -- checking before it would
+        # refuse every first-ever train on a fresh box, which is precisely the case that is fine.
+        import config as _config
+        from player_floor import require_player_floor
+        n_aliased = require_player_floor(VOCAB_DIR, getattr(_config, "MIN_PLAYER_SUBSET_GAMES", None))
+        if n_aliased:
+            print(f"[train] vocabulary floor {_config.MIN_PLAYER_SUBSET_GAMES}: "
+                  f"{n_aliased:,} players aliased to anonymous slots")
 
         self.state["status"] = "training"
         self._save()

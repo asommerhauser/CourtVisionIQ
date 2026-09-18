@@ -57,10 +57,34 @@ from simulation.stats import advanced_stats, team_totals
 # The rates, in the order the model reads them. Per-36 rather than per-game wherever the stat is a
 # volume, so the rate is role-independent and ``min_pg`` carries the role -- a sixth man who scores
 # efficiently and a starter who scores the same way look alike here, and the minutes tell them apart.
-PLAYER_PRIOR_KEYS = (
+# The thirteen SHRUNK rates. Each is an estimate of a player's true rate, so each is blended toward
+# his seed by ``shrink`` in proportion to how many games it rests on.
+PLAYER_RATE_KEYS = (
     "min_pg", "pts_36", "fga_36", "fg_pct", "tpa_rate",
     "fta_rate", "ast_36", "oreb_36", "dreb_36", "tov_36",
+    # 3.2 W5. The model had a free-throw ATTEMPT rate and no MAKE rate, and FT% is the most stable
+    # player stat there is. shot_type emits corner3_l / wing3_r / top3 as distinct tokens and
+    # shot_result judged them without knowing whether the player can shoot one. And nothing said who
+    # actually fouls -- though note pf_36 does NOT fix the 9.6x over-production of fourth fouls,
+    # which is a benching failure rather than an attribution one.
+    "ft_pct", "tp_pct", "pf_36",
 )
+
+# The four DERIVED scalars. Not estimates of a rate, so they are not shrunk: career stage is a fact
+# about the calendar, and each delta is already a difference of two shrunk quantities.
+#
+# docs/v3_direction.md 1b's failure axis IS career games and role shift -- rookies 10.9% worse than
+# their own season average, role-shifters 24% -- and these index it directly rather than hoping the
+# rates imply it.
+PLAYER_DERIVED_KEYS = ("career_stage", "d_pts_36", "d_min_pg", "d_fga_36")
+
+# Order is load-bearing three ways: the parquet column order, models.prior_features._NORM's index
+# loop, and ops.unstack on the last axis. tests/test_player_priors.py pins it.
+PLAYER_PRIOR_KEYS = PLAYER_RATE_KEYS + PLAYER_DERIVED_KEYS
+
+# Which rate each season-over-season delta is taken on. Volume rates only: a role change shows up as
+# more minutes and more shots, not as a different true FG%.
+DELTA_SOURCES = {"d_pts_36": "pts_36", "d_min_pg": "min_pg", "d_fga_36": "fga_36"}
 TEAM_PRIOR_KEYS = ("net_rating", "pace", "off_rating", "def_rating")
 
 # Shrinkage: a rate from n games is worth n/(n+k) of itself, the rest coming from the seed. A
@@ -77,6 +101,15 @@ SHRINK_K = 10.0
 LEAGUE_DEFAULTS = {
     "min_pg": 20.0, "pts_36": 16.0, "fga_36": 13.5, "fg_pct": 0.455, "tpa_rate": 0.28,
     "fta_rate": 0.26, "ast_36": 3.6, "oreb_36": 1.6, "dreb_36": 5.2, "tov_36": 2.2,
+    # Measured on 2022-23 via generate_box_score: ft_pct 0.7825, tp_pct 0.3600, pf_36 2.9689.
+    # The modern value is the right one -- the training corpus starts at MIN_TRAIN_SEASON.
+    "ft_pct": 0.78, "tp_pct": 0.36, "pf_36": 2.95,
+    # Measured over 2011+ player-games: mean 4.84 seasons since first appearance, median 4.
+    "career_stage": 4.5,
+    # A delta's neutral value is genuinely zero: "no evidence he has changed". A player with no
+    # previous season gets exactly this rather than a delta against the league mean, which is what a
+    # naive implementation emits for every rookie.
+    "d_pts_36": 0.0, "d_min_pg": 0.0, "d_fga_36": 0.0,
 }
 TEAM_DEFAULTS = {"net_rating": 0.0, "pace": 98.0, "off_rating": 108.0, "def_rating": 108.0}
 
@@ -106,13 +139,16 @@ class PlayerTotals:
     figures over-weights the night a player took four minutes and hit a three.
     """
 
-    __slots__ = ("games", "seconds", "pts", "fga", "fgm", "tpa", "fta", "ast",
-                 "oreb", "dreb", "tov")
+    # PriorCarry.roll sums the league aggregate by iterating __slots__, so a stat added here joins
+    # the league seed automatically.
+    __slots__ = ("games", "seconds", "pts", "fga", "fgm", "tpa", "tpm", "fta", "ftm", "ast",
+                 "oreb", "dreb", "tov", "pf")
 
     def __init__(self) -> None:
         self.games = 0
         self.seconds = self.pts = self.fga = self.fgm = 0.0
-        self.tpa = self.fta = self.ast = self.oreb = self.dreb = self.tov = 0.0
+        self.tpa = self.tpm = self.fta = self.ftm = 0.0
+        self.ast = self.oreb = self.dreb = self.tov = self.pf = 0.0
 
     def add(self, line) -> None:
         self.games += 1
@@ -121,7 +157,10 @@ class PlayerTotals:
         self.fga += line.fga
         self.fgm += line.fgm
         self.tpa += line.tpa
+        self.tpm += line.tpm
         self.fta += line.fta
+        self.ftm += line.ftm
+        self.pf += line.pf
         self.ast += line.ast
         self.oreb += line.oreb
         self.dreb += line.dreb
@@ -142,6 +181,9 @@ class PlayerTotals:
             "oreb_36": self.oreb * per36,
             "dreb_36": self.dreb * per36,
             "tov_36": self.tov * per36,
+            "ft_pct": _safe(self.ftm, self.fta, LEAGUE_DEFAULTS["ft_pct"]),
+            "tp_pct": _safe(self.tpm, self.tpa, LEAGUE_DEFAULTS["tp_pct"]),
+            "pf_36": self.pf * per36,
         }
 
 
@@ -176,7 +218,7 @@ class TeamTotals:
 
 
 def shrink(observed: dict[str, float], seed: dict[str, float], games: int,
-           keys=PLAYER_PRIOR_KEYS, k: float = SHRINK_K) -> dict[str, float]:
+           keys=PLAYER_RATE_KEYS, k: float = SHRINK_K) -> dict[str, float]:
     """``games/(games+k)`` of the observed rate, the rest from ``seed``.
 
     On game 1 with no previous season this is the league default outright, which is the point: a
@@ -200,9 +242,31 @@ class PriorCarry:
         self.player_seed: dict[str, dict[str, float]] = {}
         self.team_seed: dict[str, dict[str, float]] = {}
         self.league_seed: dict[str, float] = dict(LEAGUE_DEFAULTS)
+        # 3.2 W5: the season a name is first seen in, for career_stage. Left-censored at the first
+        # season of the walk -- a player already active in 2003 reads as stage 0 that year -- which is
+        # why the walk covers all 21 seasons and is never cut with the training corpus.
+        self.first_season: dict[str, int] = {}
 
     def seed_for(self, name: str) -> dict[str, float]:
         return self.player_seed.get(name) or self.league_seed
+
+    def has_history(self, name: str) -> bool:
+        """Whether ``seed_for`` returns this player's OWN previous season rather than the league mean.
+
+        The deltas depend on the distinction. Without it a rookie's "season-over-season change" is a
+        comparison against the league average, which is a statement about how good he is, not about
+        how he has changed -- and it would be indistinguishable from a real role shift.
+        """
+        return name in self.player_seed
+
+    def note_appearance(self, name: str, season: int) -> None:
+        """Record the first season a name is seen in. Idempotent, so the walk order does the work."""
+        self.first_season.setdefault(name, int(season))
+
+    def career_stage(self, name: str, season: int) -> float:
+        """Seasons since first appearance. Zero in a player's first season."""
+        first = self.first_season.get(name)
+        return 0.0 if first is None else float(max(0, int(season) - first))
 
     def team_seed_for(self, team: str) -> dict[str, float]:
         return self.team_seed.get(team) or dict(TEAM_DEFAULTS)
@@ -242,6 +306,7 @@ def priors_for_season(frame: pd.DataFrame, carry: PriorCarry) -> tuple[pd.DataFr
     teams: dict[str, TeamTotals] = {}
     player_rows: list[dict] = []
     team_rows: list[dict] = []
+    season = int(frame["season"].dropna().iloc[0]) if "season" in frame else 0
 
     for gid in _game_order(frame):
         rows = groups[gid]
@@ -250,13 +315,27 @@ def priors_for_season(frame: pd.DataFrame, carry: PriorCarry) -> tuple[pd.DataFr
             for cell in rows[col]:
                 roster.update(_parse_roster(cell))
         roster.discard("")
+        # Seen now, so a debutant reads career_stage 0 in his first game rather than through the
+        # ``first is None`` branch. Idempotent, so it is the earliest season that sticks.
+        for name in roster:
+            carry.note_appearance(name, season)
 
         # --- WRITE: every prior here comes from games already folded in. ---
         for name in sorted(roster):
             totals = players.get(name)
             observed = totals.rates() if totals else {}
             games = totals.games if totals else 0
-            row = shrink(observed, carry.seed_for(name), games)
+            seed = carry.seed_for(name)
+            row = shrink(observed, seed, games)
+            # The derived four are NOT shrunk. career_stage is a fact about the calendar, and each
+            # delta is already a difference of two shrunk quantities: it is taken against the seed, so
+            # early in a season -- when the shrunk rate still IS mostly the seed -- it reads near zero
+            # and grows as evidence accumulates. That is the honest shape for "has his role changed":
+            # we do not yet know.
+            row["career_stage"] = carry.career_stage(name, season)
+            has_history = carry.has_history(name)
+            for key, source in DELTA_SOURCES.items():
+                row[key] = (row[source] - seed[source]) if has_history else 0.0
             player_rows.append({"game_id": gid, "player": name, "prior_games": games, **row})
 
         home = str(rows["home_team"].dropna().iloc[0]) if rows["home_team"].notna().any() else ""

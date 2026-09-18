@@ -72,6 +72,24 @@ _NORM = {
     "oreb_36":   (0.0, 8.0, 2.0),
     "dreb_36":   (0.0, 16.0, 5.0),
     "tov_36":    (0.0, 10.0, 2.5),
+    # 3.2 W5. Divisors are the MEASURED league means (2022-23, via generate_box_score: ft_pct 0.7825,
+    # tp_pct 0.3600, pf_36 2.9689), so an average player reads 1.0 -- the property
+    # test_normalization_puts_an_average_player_near_one pins.
+    "ft_pct":    (0.0, 1.0, 0.78),
+    "tp_pct":    (0.0, 1.0, 0.36),
+    "pf_36":     (0.0, 10.0, 2.95),
+    # Seasons since first appearance. Divisor is the measured mean over 2011+ player-games (4.84,
+    # median 4), clipped at 20 -- the longest career in the corpus is 19 seasons.
+    "career_stage": (0.0, 20.0, 4.5),
+    # The three deltas are DIFFERENCES, so their neutral value is 0.0 and they are the only prior
+    # inputs that do not read near 1.0 for an average player. Clipped symmetrically at roughly the
+    # largest real season-over-season move, and divided by the clip so the feature lands in [-1, 1].
+    # That is deliberate, not an oversight: shifting them to centre on 1.0 would make "no change"
+    # indistinguishable from "no information" for a player with no previous season, which is exactly
+    # the distinction career_stage and these three exist to draw.
+    "d_pts_36":  (-15.0, 15.0, 15.0),
+    "d_min_pg":  (-20.0, 20.0, 20.0),
+    "d_fga_36":  (-12.0, 12.0, 12.0),
     "net_rating": (-20.0, 20.0, 8.0),
     "pace":       (85.0, 115.0, 100.0),
     "off_rating": (90.0, 130.0, 112.0),

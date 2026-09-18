@@ -348,21 +348,36 @@ not a literal.
 - `PriorCarry` gains a `first_season` map and exposes the previous season's final rates.
   **A player with no previous season emits deltas of exactly 0.0 and career stage 0** — not a delta
   against the league mean, which is what `seed_for`'s fallback would otherwise hand every rookie.
-- `PLAYER_PRIOR_KEYS` 10 → 17, appended in this order: `ft_pct, tp_pct, pf_36, career_stage,
-  d_pts_36, d_min_pg, d_fga_36`. The order is load-bearing three ways — parquet column order, the
-  `_NORM` index loop, and `ops.unstack` — and is pinned by `tests/test_player_priors.py:225`.
-- `models/prior_features._NORM` gains seven entries, and `LEAGUE_DEFAULTS` seven (`pf_36`'s must be
-  > 0, per `tests/test_player_priors.py:134`). The three rate priors are sized so their league
-  default normalizes into [0.4, 1.6]. **The four delta and stage keys legitimately centre on 0.0 and
-  cannot satisfy that band** — `test_normalization_puts_an_average_player_near_one` gains a
-  `DELTA_KEYS` exclusion plus a companion assertion that a no-history delta reads exactly 0.0. The
-  assertion's rationale is about *rate* priors, so this is a narrowing, not a weakening.
+- **The key list splits in two, because the seven are not all the same kind of thing.**
+  `PLAYER_RATE_KEYS` is the thirteen shrunk rates; `PLAYER_DERIVED_KEYS` is `career_stage` plus the
+  three deltas, which are **not shrunk** — career stage is a fact about the calendar, and a delta is
+  already a difference of two shrunk quantities. `shrink`'s default `keys` therefore becomes
+  `PLAYER_RATE_KEYS`, or it would blend a career year toward a seed.
+  `PLAYER_PRIOR_KEYS = PLAYER_RATE_KEYS + PLAYER_DERIVED_KEYS`, so the order stays load-bearing three
+  ways — parquet column order, the `_NORM` index loop, and `ops.unstack` — and stays pinned.
+- **Each delta is taken against the seed**, i.e. last season's final rate, from the *shrunk* current
+  rate. So on opening night the shrunk rate still *is* the seed and the delta reads zero, growing as
+  the season accumulates evidence. That is the honest shape for "has his role changed": not yet known.
+- `models/prior_features._NORM` gains seven entries whose divisors are **measured, not guessed** —
+  `ft_pct` 0.78, `tp_pct` 0.36, `pf_36` 2.95 from 2022-23 via `generate_box_score` (0.7825 / 0.3600 /
+  2.9689), and `career_stage` 4.5 from the mean over 2011+ player-games (4.84, median 4). All four read
+  exactly 1.0 for an average player.
+- **The three deltas centre on 0.0 and cannot satisfy the [0.4, 1.6] band**, so
+  `test_normalization_puts_an_average_player_near_one` is narrowed to the rate priors, with a companion
+  assertion that the deltas read exactly 0.0. Shifting them to centre on 1.0 was considered and
+  rejected: it would make "no change" indistinguishable from "no information", which is the one
+  distinction these inputs exist to draw.
+- **`career_stage` is 0.0 for a debutant, and that is not the league default.** A player in his first
+  season *is* at stage 0; `LEAGUE_DEFAULTS["career_stage"] = 4.5` is what an **unknown name** reads
+  through `_DEFAULT_PLAYER`, which is a different situation — no record at all, rather than a record
+  saying "season one". The cold-start test was widened to say both, after it caught the distinction.
 
-**A readable refusal instead of a shape error.** `models/manifest.feature_mismatch` is written and
-tested but **has no caller** — `shell/actions.py` checks `ARCH_KEYS` and vocab sizes only. So today
-the 14 → 21 change surfaces as a raw Keras kernel-shape error from `scalar_proj`. Wiring
-`feature_mismatch` in beside `_check_arch` (`shell/actions.py:117-129`) is what that function exists
-for.
+**A readable refusal instead of a shape error.** `models/manifest.feature_mismatch` was written and
+tested but **had no caller** — `shell/actions.py` checked `ARCH_KEYS` and vocab sizes only — so the
+14 → 21 change would have surfaced as a raw Keras kernel-shape error from `scalar_proj`.
+`_check_features` now runs beside `_check_arch` on every load and names the key that moved. Four tests
+cover it: the refusal, `--force` turning it into a warning, a pre-3.0 manifest reading as an absence
+rather than a mismatch, and a matching signature passing quietly.
 
 **Next steps.** `player_priors.py`, `models/prior_features.py:58-79`, `shell/actions.py`,
 `tests/test_player_priors.py` (including the fake box line at `:112-114`, which needs the three new

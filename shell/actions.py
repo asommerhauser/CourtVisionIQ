@@ -59,6 +59,7 @@ def load_model(session, name, *, dial_file=None, force=False, echo=print) -> Non
              f"vocab checks. Run 'adopt {name}' to record one.")
     else:
         _check_arch(manifest, name, force=force, echo=echo)
+        _check_features(manifest, name, force=force, echo=echo)
 
     missing = [k for k in REQUIRED_HEADS if not ModelArtifacts.for_key(k, root).exists()]
     if missing and not force:
@@ -123,6 +124,32 @@ def _check_arch(manifest, name, *, force, echo) -> None:
     msg = (f"architecture mismatch for {name} -- loading would fail on weight shapes:\n    "
            + "\n    ".join(diffs)
            + "\n  The graph is rebuilt from config.py, so these must match the trained weights.")
+    if force:
+        echo(f"  warning (forced): {msg}")
+    else:
+        raise ShellError(msg)
+
+
+def _check_features(manifest, name, *, force, echo) -> None:
+    """Refuse a bundle whose recorded INPUT signature disagrees with this build.
+
+    ``_check_arch`` covers capacity; this covers which inputs a model trained with. Most input changes
+    do fail loudly at ``load_weights``, because ``fusion_projection``'s kernel shape is a function of
+    the concatenated width -- but not all of them. A change that swaps one game-state key for another
+    of the same width reloads with no error at all and means something different on every row.
+
+    ``models.manifest.feature_mismatch`` was written for exactly this and **had no caller**, so until
+    now the only signal was whatever Keras happened to say. 3.2 takes the roster encoder's per-player
+    scalar count from 14 to 21, which surfaces as a raw kernel-shape error from ``scalar_proj``; this
+    turns it into a sentence naming the key that moved.
+    """
+    from models.manifest import feature_mismatch
+    diffs = feature_mismatch(manifest.get("features"))
+    if not diffs:
+        return
+    msg = (f"input signature mismatch for {name} -- it trained with different inputs:\n    "
+           + "\n    ".join(diffs)
+           + "\n  Rebuild the inputs to match, or load a model trained with these.")
     if force:
         echo(f"  warning (forced): {msg}")
     else:

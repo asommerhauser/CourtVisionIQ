@@ -22,7 +22,9 @@ import pytest
 
 from data_loading import load_all_cleaned, season_offsets
 from player_priors import (
+    DELTA_SOURCES,
     LEAGUE_DEFAULTS,
+    PLAYER_RATE_KEYS,
     PLAYER_PRIOR_KEYS,
     SHRINK_K,
     TEAM_PRIOR_KEYS,
@@ -113,8 +115,8 @@ def test_seasons_must_be_walked_in_order_for_the_seed_chain_to_be_causal():
         totals = PlayerTotals()
         for _ in range(n):
             totals.add(type("L", (), {"seconds": 1800.0, "pts": pts, "fga": 15, "fgm": 8,
-                                      "tpa": 5, "fta": 4, "ast": 5, "oreb": 1, "dreb": 4,
-                                      "tov": 2})())
+                                      "tpa": 5, "tpm": 2, "fta": 4, "ftm": 3, "ast": 5,
+                                      "oreb": 1, "dreb": 4, "tov": 2, "pf": 3})())
         return totals
 
     carry = PriorCarry()
@@ -140,9 +142,28 @@ def test_a_player_with_no_history_gets_the_league_mean_not_zero():
     players, _ = priors_for_season(frame, PriorCarry())
     rookie = players[players.prior_games == 0]
     assert len(rookie) == 10
-    for key in PLAYER_PRIOR_KEYS:
+
+    # The RATES read the league mean. A zero rate claims a player does nothing, which is a strong and
+    # wrong thing to say about someone we simply have not seen yet.
+    for key in PLAYER_RATE_KEYS:
         assert rookie[key].iloc[0] == pytest.approx(LEAGUE_DEFAULTS[key])
-    assert (rookie[list(PLAYER_PRIOR_KEYS)].to_numpy() > 0).all()
+    assert (rookie[list(PLAYER_RATE_KEYS)].to_numpy() > 0).all()
+
+    # The DERIVED four do not, and the reason differs between them -- which is why 3.2 split the key
+    # list rather than widening this loop.
+    #
+    # career_stage is a FACT, not an estimate: a player in his first season is at stage 0, and saying
+    # 4.5 would claim we do not know something we do know. LEAGUE_DEFAULTS["career_stage"] is the
+    # value an UNKNOWN NAME reads through _DEFAULT_PLAYER -- no record at all -- which is a different
+    # situation from a debutant with a record that says "season one".
+    assert rookie["career_stage"].iloc[0] == 0.0
+    assert LEAGUE_DEFAULTS["career_stage"] > 0.0, "the unknown-name fallback is still the league mean"
+
+    # The deltas are zero because there is no previous season to differ from. The alternative -- a
+    # delta against the league mean -- would be a statement about how good he is wearing the clothes
+    # of a statement about how he has changed, and would be indistinguishable from a real role shift.
+    for key in DELTA_SOURCES:
+        assert rookie[key].iloc[0] == 0.0
 
 
 def test_a_player_on_the_roster_who_never_touches_the_ball_still_accrues_minutes():
@@ -213,7 +234,14 @@ def test_normalization_puts_an_average_player_near_one():
     the same scale on the day the sidecar is rebuilt as it was on the day the model trained."""
     from models.prior_features import _DEFAULT_PLAYER
 
-    assert (_DEFAULT_PLAYER > 0.4).all() and (_DEFAULT_PLAYER < 1.6).all()
+    # The band is a claim about RATE priors: an average player reads near 1.0, so the model never has
+    # to learn a scale. The three deltas are differences and centre on 0.0 by design -- shifting them
+    # to 1.0 would make "no change" indistinguishable from "no information".
+    rate_idx = [i for i, k in enumerate(PLAYER_PRIOR_KEYS) if k not in DELTA_SOURCES]
+    rates = _DEFAULT_PLAYER[rate_idx]
+    assert (rates > 0.4).all() and (rates < 1.6).all()
+    delta_idx = [i for i, k in enumerate(PLAYER_PRIOR_KEYS) if k in DELTA_SOURCES]
+    np.testing.assert_array_equal(_DEFAULT_PLAYER[delta_idx], np.zeros(len(delta_idx), dtype="float32"))
 
 
 def test_the_roster_encoder_is_built_for_rest_plus_rotation_plus_the_priors():
@@ -239,9 +267,16 @@ def test_a_prior_vector_is_ordered_the_way_the_model_unstacks_it():
 # ------------------------------------------------------------------- the sidecar/corpus join
 
 def _write_season(tmp_path, label, games):
-    """One cleaned season CSV, written the way data_cleaner leaves it."""
+    """One cleaned season CSV, written the way data_cleaner leaves it.
+
+    ``_game`` stamps every row ``season=2023``; the season column is what ``priors_for_season`` reads
+    for ``career_stage``, so it has to agree with the file label or every season looks like the same
+    one and the stage counter never advances.
+    """
     path = tmp_path / f"season{label}.csv"
-    _season(games).to_csv(path, index=False)
+    frame = _season(games)
+    frame["season"] = int(label)
+    frame.to_csv(path, index=False)
     return path
 
 
@@ -309,3 +344,89 @@ def test_a_partial_rebuild_still_lands_on_corpus_ids(tmp_path):
 
     assert set(int(g) for g in only["game_id"]) == {expected}
     assert expected != 500, "the second file's offset is not zero, so the id must have moved"
+
+
+# ----------------------------------------------------------- career stage and the season deltas
+
+def test_career_stage_counts_seasons_since_a_players_first_appearance(tmp_path):
+    """Zero in his first season, one in his second. It is a fact, so it is not shrunk."""
+    _write_season(tmp_path, "2003", [_game(500, "2003-01-01")])
+    _write_season(tmp_path, "2004", [_game(500, "2004-01-01")])
+    _write_season(tmp_path, "2005", [_game(500, "2005-01-01")])
+    build(str(tmp_path), echo=None)
+
+    stage = {}
+    for label in ("2003", "2004", "2005"):
+        frame = pd.read_parquet(priors_dir(str(tmp_path)) / f"players_{label}.parquet")
+        stage[label] = frame[frame["player"] == "H1"]["career_stage"].iloc[0]
+    assert stage == {"2003": 0.0, "2004": 1.0, "2005": 2.0}
+
+
+def test_a_debutant_in_a_later_season_starts_at_zero_again(tmp_path):
+    """The counter is per player, not per corpus -- otherwise it would just be the season index."""
+    _write_season(tmp_path, "2003", [_game(500, "2003-01-01")])
+    _write_season(tmp_path, "2004", [_game(500, "2004-01-01", home=["NEW", "H2", "H3", "H4", "H5"],
+                                           scorer="NEW")])
+    build(str(tmp_path), echo=None)
+    frame = pd.read_parquet(priors_dir(str(tmp_path)) / "players_2004.parquet")
+    assert frame[frame["player"] == "NEW"]["career_stage"].iloc[0] == 0.0
+    assert frame[frame["player"] == "H2"]["career_stage"].iloc[0] == 1.0
+
+
+def test_a_delta_is_zero_until_there_is_a_previous_season_to_differ_from(tmp_path):
+    """Otherwise every rookie reads as a role-shifter, measured against the league mean."""
+    _write_season(tmp_path, "2003", [_game(500, "2003-01-01", baskets=9)])
+    build(str(tmp_path), echo=None)
+    first = pd.read_parquet(priors_dir(str(tmp_path)) / "players_2003.parquet")
+    for key in DELTA_SOURCES:
+        assert (first[key] == 0.0).all(), f"{key} must be flat in a player's first season"
+
+
+def test_a_step_up_in_production_shows_as_a_positive_delta(tmp_path):
+    """The named failure axis: a role-shifter whose rates have moved since last season.
+
+    Season one is a low-volume role, season two a high-volume one. The delta is taken against the seed
+    -- last season's final rate -- so it starts near zero on opening night and grows as the new season
+    accumulates evidence, which is the honest shape for "has his role changed": not yet known.
+    """
+    _write_season(tmp_path, "2003", [_game(500 + i, f"2003-01-{i + 1:02d}", baskets=1)
+                                     for i in range(10)])
+    _write_season(tmp_path, "2004", [_game(500 + i, f"2004-01-{i + 1:02d}", baskets=12)
+                                     for i in range(10)])
+    build(str(tmp_path), echo=None)
+
+    second = pd.read_parquet(priors_dir(str(tmp_path)) / "players_2004.parquet")
+    scorer = second[second["player"] == "H1"].sort_values("game_id")
+    opener, later = scorer.iloc[0], scorer.iloc[-1]
+
+    assert opener["d_pts_36"] == pytest.approx(0.0, abs=1e-6), (
+        "with no games yet this season the shrunk rate IS the seed, so the delta is zero")
+    assert later["d_pts_36"] > opener["d_pts_36"], "evidence of the step up accumulates"
+    assert later["d_pts_36"] > 0.0
+
+
+def test_the_three_new_rates_come_from_the_box_score(tmp_path):
+    """``ft_pct``, ``tp_pct`` and ``pf_36`` need ftm / tpm / pf, which PlayerTotals did not track."""
+    rows = _game(500, "2003-01-01", baskets=4)
+    # A made free throw and a made three for H1, plus a foul on him.
+    base = dict(rows[1])
+    # A free throw is a SHOT whose type says so -- there is no free-throw event token -- and a three is
+    # a shot from a named zone. Getting this wrong is silent: generate_box_score simply counts nothing.
+    rows.append({**base, "time": 500, "event": "shot", "player": "H1",
+                 "type": "free throw", "result": "made"})
+    rows.append({**base, "time": 510, "event": "shot", "player": "H1",
+                 "type": "top3", "result": "made"})
+    rows.append({**base, "time": 520, "event": "foul", "player": "H1",
+                 "type": "personal", "result": "none"})
+    frame = _season([rows])
+    players, _ = priors_for_season(frame, PriorCarry())
+    # The first (and only) game's row is a PRIOR, so it is still the seed -- the accumulator is what
+    # this checks, via a second game that sees the first folded in.
+    frame2 = _season([rows, _game(501, "2003-01-02", baskets=1)])
+    players2, _ = priors_for_season(frame2, PriorCarry())
+    second = players2[(players2.player == "H1") & (players2.game_id == 501)].iloc[0]
+
+    assert second["prior_games"] == 1
+    for key in ("ft_pct", "tp_pct", "pf_36"):
+        assert second[key] != pytest.approx(LEAGUE_DEFAULTS[key]), (
+            f"{key} must have moved off the seed once a game is folded in")
