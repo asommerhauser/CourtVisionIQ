@@ -12,7 +12,7 @@ from config import (
     SEED, TEST_FRAC, HOLDOUT_FRAC, HOLDOUT_MANIFEST_NAME,
     MODEL_DIM, NUM_LAYERS, NUM_HEADS, FF_DIM, ROSTER_SAB_LAYERS,
 )
-from data_loading import load_all_cleaned, resolve_partition
+from data_loading import load_all_cleaned, load_training_corpus, resolve_partition
 from encoder.encoder import Encoder
 from models.artifacts import ModelArtifacts, DEFAULT_ARTIFACTS_ROOT, warm_start_weights
 from models.backbone import build_backbone
@@ -309,7 +309,7 @@ class EventTimeModel:
         Delegates to the shared loader so the box-score validation and every model see the
         same games under the same numbering.
         """
-        return load_all_cleaned(self.data_dir)
+        return load_training_corpus(self.data_dir)
 
     # =====================
     # --- Preprocessing ---

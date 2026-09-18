@@ -36,6 +36,7 @@ from config import (
 # model_name is re-exported: it lives in models.artifacts (TF-free, so eval_pool can reach
 # it), but train.py and the tests have always imported it from here.
 from models.artifacts import model_name, model_root  # noqa: F401
+from data_loading import training_min_season
 from models.manifest import (new_manifest, record_head, snapshot_vocabs, vocab_fingerprint,
                              write_manifest)
 from models.registry import STAGE_MODEL_KEYS
@@ -107,6 +108,10 @@ class FullRun:
             "artifacts_root": artifacts_root, "reports_root": DEFAULT_REPORTS_ROOT,
             "epochs": epochs, "batch_size": batch_size, "run_name": run_name,
             "n_games": int(len(idx)), "boundary_idx": boundary,
+            # The corpus this state describes. boundary_idx is a POSITION, so it moves when the
+            # floor moves even though the games it points at do not -- recording the floor is what
+            # makes a stale state file diagnosable instead of merely wrong.
+            "min_train_season": training_min_season(),
             "holdout_game_ids": holdout_ids, "eval_batch": EVAL_BATCH,
             "status": "setup", "trained_models": [],
         }

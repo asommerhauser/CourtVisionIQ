@@ -206,6 +206,11 @@ def new_manifest(name, *, epochs=None, batch_size=None, seed=None, data_dir=None
             "processed_dir": processed_dir,
             "n_games": n_games,
             "boundary_idx": boundary_idx,
+            # WHICH corpus, not just how much of it. Before 3.2 the only corpus provenance was
+            # n_games and boundary_idx, so two models trained on different season ranges were
+            # indistinguishable from their manifests -- and n_games alone cannot tell "the corpus
+            # grew" from "the floor moved".
+            "min_train_season": getattr(config, "MIN_TRAIN_SEASON", None),
             "test_frac": getattr(config, "TEST_FRAC", None),
             "holdout_frac": getattr(config, "HOLDOUT_FRAC", None),
             "recency": {

@@ -40,7 +40,7 @@ from config import (
     FINAL_HOLDOUT_GAMES, SUBSET_GAMES_PATH, SUBSET_RECENCY_HALFLIFE_SEASONS,
     SUBSET_RECENT_SEASON_RATES, SUBSET_SEED, TEST_FRAC,
 )
-from data_loading import ROSTER_STR_COLS, load_all_cleaned
+from data_loading import ROSTER_STR_COLS, load_training_corpus
 from training.chronology import game_index, sequential_partition
 
 
@@ -51,7 +51,7 @@ def _game_players_and_season(data_dir: str) -> tuple[dict[int, set], dict[int, i
     was on the floor at any point, which is exactly the coverage target. Season comes from the
     chronological game index.
     """
-    df = load_all_cleaned(data_dir, parse_rosters=True)
+    df = load_training_corpus(data_dir, parse_rosters=True)
     seasons = {int(g): int(s) for g, s in df.groupby("game_id")["season"].first().items()} \
         if "season" in df.columns else {}
 

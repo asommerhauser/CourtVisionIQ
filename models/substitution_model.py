@@ -42,7 +42,7 @@ from config import (
     SEED, TEST_FRAC, HOLDOUT_FRAC, HOLDOUT_MANIFEST_NAME,
     MODEL_DIM, NUM_LAYERS, NUM_HEADS, FF_DIM, ROSTER_SAB_LAYERS,
 )
-from data_loading import load_all_cleaned, resolve_partition
+from data_loading import load_all_cleaned, load_training_corpus, resolve_partition
 from models.norm_stats_io import load_norm_stats, save_norm_stats
 from encoder.encoder import Encoder
 from models.artifacts import ModelArtifacts, DEFAULT_ARTIFACTS_ROOT, warm_start_weights
@@ -169,7 +169,7 @@ class SubstitutionModel:
 
     def _load_all(self) -> pd.DataFrame:
         """Cleaned season files concatenated with globally-unique game_id (shared loader)."""
-        return load_all_cleaned(self.data_dir)
+        return load_training_corpus(self.data_dir)
 
     # ==========================================
     # --- Opening-lineup synthesis (in-memory) ---

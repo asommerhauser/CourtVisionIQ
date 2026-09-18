@@ -45,6 +45,7 @@ Carried forward from [`v3_progress.md`](v3_progress.md), with **rule 1 amended**
 | `v3.2/w0-spec` | direction, build guide, this tracker | no | **built** |
 | `v3.2/test-tiers` | WT: `pytest.ini` markers, two conftest fixtures | no | **built**, 49-test subset green |
 | `v3.2/priors-join` | W1: one definition of the `game_id` numbering | yes (sidecar rebuild) | **built**, 153 tests green |
+| `v3.2/corpus-cut` | W2: `MIN_TRAIN_SEASON = 2008`, applied to rows | yes | **built**, 165 tests green |
 
 **W1 verified two ways.** `tests/test_player_priors.py` gains three tests that build a real sidecar
 over two season files carrying *the same raw ids* -- the case that used to collapse -- and assert the
@@ -152,6 +153,23 @@ renumber.
 It also makes §3.1's own warning — "cut the training games, never the sidecar", which the document
 calls "the single easiest thing in 3.2 to get wrong" — true **by construction**, since
 `player_priors` and `season_context` walk `cleaned_csvs` directly and are therefore untouched.
+
+**How it is expressed.** `load_all_cleaned` gains an opt-in `min_season=`, and
+`data_loading.load_training_corpus` is the one caller that opts in. The four heads' `_load_all`,
+`training.chronology.game_index` and `training.subset` all go through it; everything that genuinely
+wants 21 seasons — the box-score validator, the shell, the report stack, the priors sidecar, season
+context — keeps calling `load_all_cleaned` and says so by doing it. One name, so the floor cannot
+apply in some training paths and not others.
+
+`data_loading.training_min_season()` reads `config` **at call time**, not via a module-scope
+`from config import`. That is 3.0's bug 4 (`from config import X` froze three knobs at import, so
+switching one off in a test did nothing and the disabled path was silently untested), and there is a
+test pinning it.
+
+**Four invariants are tested, not assumed:** ids survive the cut unchanged while `pos` renumbers; the
+holdout lands on the *same games* across a cut (the real content of §7.2's window-0 claim); a floor
+past the whole corpus raises rather than yielding an empty frame downstream; and `load_all_cleaned`
+still sees every season.
 
 ### 2. Below-floor players get per-game anonymous slots, not one `UNK`
 
