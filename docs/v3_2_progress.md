@@ -24,11 +24,15 @@ Carried forward from [`v3_progress.md`](v3_progress.md), with **rule 1 amended**
 3. **Commit at each meaningful step**, with the message saying what changed *and why*, including what
    was measured and what was rejected.
 4. **No large evals mid-programme.** The full 3.2 eval happens after the train.
-5. **Superseded by W-T's fixture.** `v3_progress.md` rule 5 said to check
-   `encoder/vocabs/norm_stats.json` against git before any train, because the suite rewrites the
-   committed vocabs. W-T makes that structural — a session fixture snapshots and restores
-   `encoder/vocabs/` — so it stops being a thing to remember. The `git status --porcelain
-   encoder/vocabs/` check stays in the handover as a belt-and-braces assertion, not as the mechanism.
+5. **Still check `encoder/vocabs/` against git before any train.** W-T adds a session fixture that
+   snapshots and restores the directory, but that is a net rather than a fix, and a session teardown
+   does not survive a kill. **Measured: the suite does not currently write the committed vocabs at
+   all** — every test passes `Encoder(vocab_dir=tmp_path)`, and the shared `norm_stats.json` path is
+   keyed off `encoder.vocab_dir`, not `config.NORM_STATS_PATH`
+   (`models/event_time_model.py:259-266`). So `v3_progress.md` rule 5 describes a hazard that was
+   already fixed test by test; what was missing was anything making it an invariant rather than a
+   convention. The fixture is that, and it matters most in W4, which deletes and rebuilds the vocabs
+   on purpose.
 6. **Line endings are mixed CRLF/LF per file.** Edit lines; never round-trip a whole file.
 7. **Non-ASCII in a Bash heredoc reaches Python mangled.** Use a dedicated write, or `chr(0x2014)`.
 
@@ -108,9 +112,18 @@ A single shared `UNK` id cannot tell them apart, and `game_available_mask`
 substitution heads can spend probability mass on an unresolvable token. Hence W4's per-game anonymous
 slots (`ANON_SLOTS = 16`, covering the measured maximum of 13, with `UNK` as overflow).
 
-### 3. The suite runs here
+### 3. The suite runs here, but some modules are slow on CPU rather than instant
 
-See standing rule 2. 891 tests collect in 10.7 s on Windows with CPU-only TensorFlow.
+891 tests collect in 10.7 s on Windows with CPU-only TensorFlow, and a full run reached **562 tests
+with zero failures** before it was stopped at ~29 minutes of CPU time and a 2.9 GB working set. It was
+progressing throughout — sampled twice, it held ~100% of one core — so the older note that local runs
+"stall" is really "the modules that build real Keras graphs cost minutes per test on CPU, not
+seconds". `tests/test_game_simulator.py` is where the cost becomes obvious.
+
+**Consequence for how the suite is used.** The per-workstream gate is the *relevant* modules, run
+targeted and fast; the full local sweep is a milestone check. A per-module duration sweep is still
+**pending**, so no module carries the `slow` marker yet — marking them is a measurement, and an
+unmeasured guess in `pytest.ini` would be worse than an empty marker list.
 
 ---
 
