@@ -731,6 +731,30 @@ FULL_ARTIFACTS_ROOT = f"./artifacts/{DEFAULT_MODEL}"
 # name ("v1.0"), not the bare "1.0" this constant used to hold.
 DEFAULT_VERSION = DEFAULT_MODEL
 
+# --- Context modulation, FiLM (3.2 W6) ---
+# Season, the team priors and the regime latent all enter ONCE today, as columns in a wide concat
+# projected to MODEL_DIM, and then have to survive six residual blocks on their own
+# (models/backbone.py fusion_concat -> fusion_projection). Season is not under-weighted, it is
+# UNDER-PLUMBED: nothing downstream can condition its computation on which season or which night it
+# is, only on a few of the 384 dimensions it was compressed into.
+#
+# FiLM fixes the plumbing rather than the weighting. One game-context vector drives a per-block scale
+# and shift on the residual stream, so every layer's computation is modulated by the context instead
+# of the context being one column at the bottom.
+#
+# Deliberately NOT extra width. docs/v3_direction.md 5.4: heads reach the base rate in ~5 epochs and
+# then memorise, so the inputs do not contain the answer and capacity is not the binding limit --
+# widening MODEL_DIM in the same cycle the corpus shrinks fivefold would make it worse. FILM_DIM is a
+# bottleneck for exactly that reason: the per-block projections read a 64-wide summary, not the raw
+# ~160-wide context, which keeps this at roughly 600k parameters a head against the backbone's ~10.6M.
+#
+# The scale and shift are ZERO-INITIALISED and applied as h * (1 + gamma) + beta, so at initialisation
+# the modulation is the identity and the graph starts out numerically the same as one built without it.
+# That is what makes the A/B honest: FiLM has to earn its effect from zero rather than perturbing the
+# stream before training begins.
+FILM_ENABLED = True
+FILM_DIM = 64
+
 # --- Player vocabulary floor (3.2 W4) ---
 # A player needs this many games INSIDE the subset to get his own embedding row. Everyone below the
 # floor is aliased to an anonymous slot token, keeping his season-to-date priors and losing his

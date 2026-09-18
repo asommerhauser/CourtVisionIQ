@@ -576,6 +576,7 @@ class EventTimeModel:
         player_vocab_size = self.encoder.player_vocab.next_token
         player_emb_layer = layers.Embedding(player_vocab_size, EMBED_DIMS["player"], name="emb_player")
         embs = []
+        emb_season = None
         for f in CATEGORICAL_FIELDS:
             if f in ("player", "secondary_player"):
                 embs.append(player_emb_layer(cat_inputs[f]))
@@ -584,6 +585,11 @@ class EventTimeModel:
                 embs.append(
                     layers.Embedding(v.next_token, EMBED_DIMS[f], name=f"emb_{f}")(cat_inputs[f])
                 )
+                # Captured by NAME, not by position in CATEGORICAL_FIELDS: the FiLM context needs the
+                # season embedding specifically, and indexing a list would break silently if the field
+                # order ever moved.
+                if f == "season":
+                    emb_season = embs[-1]
 
         # ---- Roster encoding across the sequence ----
         # One shared SequenceRosterEncoder applied to both rosters (with per-player rest):
@@ -606,6 +612,11 @@ class EventTimeModel:
             [*embs, home_vec, away_vec, t_abs, t_delta, *t_team, *t_gs, *t_prior, t_regime],
             pad_mask, seq_len=SEQ, d_model=D,
             num_layers=num_layers, num_heads=num_heads, ff_dim=ff_dim, dropout=dropout,
+            # W6: what the game IS, as opposed to what is happening in it -- the season, the two teams'
+            # season-to-date rates, and the per-game regime latent. All three are constant (or nearly)
+            # within a game, which is exactly the kind of signal that was being asked to survive six
+            # residual blocks as a few columns of a wide concat.
+            film_context=[emb_season, *t_prior, t_regime],
         )
 
         # ---- Output heads (names must not collide with input field names) ----

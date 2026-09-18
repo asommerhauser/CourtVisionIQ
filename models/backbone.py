@@ -147,8 +147,43 @@ def _attention_mask(pad_mask, num_heads):
     )(pad_mask)
 
 
+def _film_context(parts, *, name="film"):
+    """One game-context vector for FiLM, or ``None`` when the feature is off.
+
+    ``parts`` are per-timestep tensors -- the season embedding, the team priors, the regime latent --
+    already ``(B, SEQ, ...)``, so the modulation is per row with no broadcasting to arrange. They are
+    summarised through a bottleneck so the per-block projections stay small; see ``config.FILM_DIM``.
+    """
+    if not parts or not getattr(config, "FILM_ENABLED", False):
+        return None
+    ctx = parts[0] if len(parts) == 1 else layers.Concatenate(axis=-1, name=f"{name}_concat")(parts)
+    dim = int(getattr(config, "FILM_DIM", 64))
+    return layers.Dense(dim, activation="gelu", name=f"{name}_ctx")(ctx)
+
+
+def _film(h, ctx, block: int, slot: int, d_model: int):
+    """``h * (1 + gamma) + beta``, with ``gamma`` and ``beta`` predicted from the game context.
+
+    Zero-initialised on purpose, kernel AND bias: at initialisation gamma and beta are exactly zero, so
+    this is the identity and a FiLM graph starts numerically identical to one built without it. The
+    alternative -- predicting the scale directly -- perturbs the residual stream before training begins
+    and makes the A/B a comparison of two different initialisations.
+
+    Applied to the NORMALISED branch, never to ``x`` itself. Modulating ``x`` would scale the residual
+    identity path, which is the thing that makes a deep stack trainable.
+    """
+    if ctx is None:
+        return h
+    zeros = dict(kernel_initializer="zeros", bias_initializer="zeros")
+    gamma = layers.Dense(d_model, name=f"block{block}_film{slot}_scale", **zeros)(ctx)
+    beta = layers.Dense(d_model, name=f"block{block}_film{slot}_shift", **zeros)(ctx)
+    scaled = layers.Multiply(name=f"block{block}_film{slot}_mul")([h, gamma])
+    return layers.Add(name=f"block{block}_film{slot}")([h, scaled, beta])
+
+
 def build_backbone(parts, pad_mask, *, seq_len, d_model,
-                   num_layers=NUM_LAYERS, num_heads=NUM_HEADS, ff_dim=FF_DIM, dropout=0.2):
+                   num_layers=NUM_LAYERS, num_heads=NUM_HEADS, ff_dim=FF_DIM, dropout=0.2,
+                   film_context=None):
     """Fuse ``parts``, add position, and run the causal transformer stack.
 
     ``parts`` is the head's own list of per-timestep tensors to concatenate -- token
@@ -175,9 +210,13 @@ def build_backbone(parts, pad_mask, *, seq_len, d_model,
     # ---- Attention mask: key padding, plus the per-head band when local heads are on ----
     attn_mask = _attention_mask(pad_mask, num_heads)
 
+    # ---- Context modulation (3.2 W6): one vector, a scale and shift per block ----
+    ctx = _film_context(film_context)
+
     # ---- Causal transformer encoder ----
     for i in range(num_layers):
         h = layers.LayerNormalization(epsilon=1e-6, name=f"block{i}_ln1")(x)
+        h = _film(h, ctx, i, 1, d_model)
         attn = layers.MultiHeadAttention(
             num_heads=num_heads, key_dim=d_model // num_heads, dropout=dropout,
             name=f"block{i}_mha",
@@ -185,6 +224,7 @@ def build_backbone(parts, pad_mask, *, seq_len, d_model,
         x = layers.Add(name=f"block{i}_res1")([x, attn])
 
         h = layers.LayerNormalization(epsilon=1e-6, name=f"block{i}_ln2")(x)
+        h = _film(h, ctx, i, 2, d_model)
         f1 = layers.Dense(ff_dim, activation="gelu", name=f"block{i}_ff1")(h)
         f1 = layers.Dropout(dropout, name=f"block{i}_ffdrop")(f1)
         f2 = layers.Dense(d_model, name=f"block{i}_ff2")(f1)

@@ -279,12 +279,17 @@ class SubDecisionModel(SubstitutionModel):
         player_emb_layer = layers.Embedding(
             self.encoder.player_vocab.next_token, EMBED_DIMS["player"], name="emb_player")
         embs = []
+        emb_season = None
         for f in CATEGORICAL_FIELDS:
             if f in ("player", "secondary_player"):
                 embs.append(player_emb_layer(cat_inputs[f]))
             else:
                 embs.append(layers.Embedding(vocab[f].next_token, EMBED_DIMS[f],
                                              name=f"emb_{f}")(cat_inputs[f]))
+                # Captured by NAME for the FiLM context, so a change to CATEGORICAL_FIELDS order
+                # cannot silently hand it the wrong embedding.
+                if f == "season":
+                    emb_season = embs[-1]
 
         home_vec = self.roster_encoder(
             [home_roster, *side_scalars(rest_home, rotation_inputs, "home", prior_inputs)])
@@ -307,6 +312,8 @@ class SubDecisionModel(SubstitutionModel):
              t_abs, t_delta, *t_team, *t_gs, *t_prior, t_regime],
             pad_mask, seq_len=SEQ, d_model=D,
             num_layers=num_layers, num_heads=num_heads, ff_dim=ff_dim, dropout=dropout,
+            # W6: the game's identity -- season, both teams' season-to-date rates, the regime latent.
+            film_context=[emb_season, *t_prior, t_regime],
         )
 
         home_logits = layers.Dense(SUB_COUNT_CLASSES, dtype="float32", name=HOME_OUTPUT)(x)

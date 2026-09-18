@@ -44,7 +44,11 @@ SCHEMA = 2
 ARCH_KEYS = ("MODEL_DIM", "NUM_LAYERS", "NUM_HEADS", "FF_DIM", "ROSTER_SAB_LAYERS",
              "MAX_SEQUENCE_LENGTH", "ROSTER_SIZE", "BENCH_SIZE",
              "LOCAL_ATTENTION_HEADS", "LOCAL_ATTENTION_WINDOW",
-             "REGIME_ENABLED", "REGIME_DIM")
+             "REGIME_ENABLED", "REGIME_DIM",
+             # 3.2 W6. FILM_ENABLED off produces a graph MISSING layers rather than a graph with
+             # differently-shaped ones, which is the LOCAL_ATTENTION_* failure class this list exists
+             # for: load_weights matches by name, so the absent ones are skipped in silence.
+             "FILM_ENABLED", "FILM_DIM")
 
 
 def feature_snapshot() -> dict:

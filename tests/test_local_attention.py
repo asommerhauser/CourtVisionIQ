@@ -21,6 +21,13 @@ import config
 from models import manifest
 from models.backbone import BandedAttentionMask, KeyPaddingMask, build_backbone
 
+# Measured on the Windows dev box (CPU-only TensorFlow): this module and test_local_attention together
+# take 1,533 s -- 25.5 minutes -- because each test builds a real head's graph and trains it for an
+# epoch. It still runs locally and it still runs by default; the marker is what lets the
+# per-workstream gate be `pytest -m "not slow"` while the full local sweep stays `pytest`.
+pytestmark = pytest.mark.slow
+
+
 SEQ = 12
 D = 16
 FF = 24

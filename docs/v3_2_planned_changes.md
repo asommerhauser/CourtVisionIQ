@@ -404,18 +404,36 @@ not contain the answer. Widening now would add capacity to a model that already 
 cycle the corpus shrinks roughly fivefold. FiLM is two vectors of 384 per block — negligible
 parameters, no memorisation surface — and W4 removes parameters from precisely the table §1f blames.
 
-**How it works.** `build_backbone` (`models/backbone.py:150`) gains a keyword-only
-`film_context=None`. The context is a concat of the season embedding, the eight team priors and the
-regime latent — all already `(B, SEQ, ·)`, so modulation is per-row with no broadcasting. One
-`Dense(2·d_model)` per block emits scale and shift, applied to the **normalized branch** (after
-`block{i}_ln1` and after `block{i}_ln2`), never to `x` itself — modulating `x` destroys the residual
-identity path.
+**How it works.** `build_backbone` gains a keyword-only `film_context=None`. The context is a concat of
+the season embedding, the eight team priors and the regime latent — all already `(B, SEQ, ·)`, so the
+modulation is per row with no broadcasting to arrange. It is summarised once through a **`FILM_DIM = 64`
+bottleneck** shared across blocks, and each block's two hooks read that summary. Measured: the bottleneck
+costs **609,344 parameters, 5.7% of the backbone's 10.76M**, against **1.48M** for projecting from the raw
+160-wide context.
+
+Applied to the **normalized branch** — after `block{i}_ln1` and after `block{i}_ln2` — never to `x`
+itself, because modulating `x` scales the residual identity path, which is what makes a deep stack
+trainable.
+
+**Zero-initialised in kernel and bias, and applied as `h * (1 + gamma) + beta`.** At initialisation the
+modulation is therefore exactly the identity, and a FiLM graph is numerically the same as one built
+without it — **verified, maximum observed difference 0.0**. That is what makes the A/B honest: predicting
+the scale directly would perturb the residual stream before training begins, so the comparison would be
+between two initialisations rather than between FiLM and no FiLM. A companion test confirms it does not
+stay inert — setting one gamma to 0.5 changes the output.
+
+Scale and shift come from two separate `Dense(d_model)` layers rather than one `Dense(2·d_model)` that is
+then sliced, and the combination is `Add([h, Multiply([h, gamma]), beta])`. Both avoid a `Lambda`, which
+is a serialization hazard in a graph that has to reload by name.
 
 - `None` must reproduce today's graph byte-for-byte, the way `_attention_mask` already handles
   `LOCAL_ATTENTION_HEADS <= 0` (`models/backbone.py:142-147`). Assert it.
-- `tests/test_backbone.py`'s `backbone_chain_names` / `SIDE_BRANCH_LAYERS` must list the new layers
-  in graph order — the layer names are a persistence contract, and
-  `test_head_carries_the_backbone_layer_names` runs the assertion against all eight heads.
+- `tests/test_backbone.py`'s helpers take a `film=` flag. The `Multiply` and `Add` sit on the main path
+  and belong in `backbone_chain_names`; the two `Dense` projections hang off the *context* tensor and
+  join `attn_pad_mask` as side branches with no ordering guarantee.
+  `test_head_carries_the_backbone_layer_names` passes `film=config.FILM_ENABLED` — with `film=False` the
+  non-FiLM names are still present and still ordered, so the assertion would pass while saying nothing
+  at all about W6.
 - `FILM_ENABLED` goes into `models/manifest.ARCH_KEYS`: a flag that is off produces a graph missing
   layers, which is the `LOCAL_ATTENTION_*` failure class that list exists for.
 

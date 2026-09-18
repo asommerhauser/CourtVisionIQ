@@ -49,6 +49,7 @@ Carried forward from [`v3_progress.md`](v3_progress.md), with **rule 1 amended**
 | `v3.2/corpus-cut-2011` | W2a: the floor moves 2008 -> 2011 | yes | **built** |
 | `v3.2/vocab-floor` | W4: the floor, and anonymous slots by graph colouring | yes | **built**, 20 new tests; verified on the real corpus |
 | `v3.2/prior-scalars` | W5: three rates, career stage, deltas; 14 -> 21 scalars | yes | **built**, sidecar rebuilt |
+| `v3.2/film-context` | W6: per-block scale and shift from a game-context vector | yes | **built**, identity at init verified |
 | `v3.2/subset-all-heads` | W3: all twelve heads on the subset; coverage retired | yes | **built**, 124 tests green |
 
 **W1 verified two ways.** `tests/test_player_priors.py` gains three tests that build a real sidecar
@@ -290,7 +291,34 @@ from "no information".
 the 14 -> 21 change would have surfaced as a raw Keras kernel-shape error from `scalar_proj`.
 `shell/actions._check_features` now runs beside `_check_arch` on every load.
 
-### 5. Coverage-completeness is retired, and the sampler gets its first tests
+### 5. FiLM is zero-initialised, so the A/B starts from an exact identity
+
+§5.2 asks for "a small network emits a per-block scale and shift". The implementation adds two things the
+section does not specify, and both are load-bearing.
+
+**Zero-initialised kernel *and* bias, applied as `h * (1 + gamma) + beta`.** At initialisation gamma and
+beta are exactly zero, so the modulation is the identity and a FiLM graph is numerically the same as one
+built without it — verified with a **maximum observed difference of 0.0**. Predicting the scale directly
+would perturb the residual stream before training begins, and the W6 gate ("must not worsen any probe")
+would then be comparing two different initialisations rather than FiLM against no FiLM. A companion test
+pins that it does not stay inert: one gamma set to 0.5 changes the output.
+
+**A shared `FILM_DIM = 64` bottleneck**, because "negligible parameters" is not automatic. Projecting the
+raw 160-wide context straight to a scale and shift in every block would cost **1.48M parameters a head**;
+through the bottleneck it is **609,344, or 5.7% of the backbone's 10.76M**. That matters in a cycle whose
+whole argument is that capacity is not the binding limit — W4 removes about 1,100 embedding rows, and it
+would be odd to hand most of that back as modulation width.
+
+Two smaller choices worth recording. The scale and shift are separate `Dense(d_model)` layers rather than
+one `Dense(2·d_model)` that is sliced, and the combination is `Add([h, Multiply([h, gamma]), beta])`,
+because both avoid a `Lambda` in a graph that has to reload by name. And the season embedding is captured
+**by name** inside each head's embedding loop rather than indexed out of `embs`, so a change to
+`CATEGORICAL_FIELDS` order cannot silently hand FiLM the wrong tensor.
+
+The per-head name test now passes `film=config.FILM_ENABLED`. With `film=False` the non-FiLM names are
+still present and still in order, so the assertion would have passed while checking nothing about W6.
+
+### 6. Coverage-completeness is retired, and the sampler gets its first tests
 
 §2.2 argues the guarantee is inert under a minimum-games floor: anyone it rescues with a single game
 falls below the floor anyway, and it drags old games into a deliberately modern-heavy sample to do it.
@@ -314,7 +342,7 @@ conditional heads, which was true of nothing, because `timeout_team` already tra
 what W4's floor reads; and `extract` prints the distribution plus a kept/anonymous table at floors
 10-30, so the floor is chosen against the real histogram rather than the estimate in measurement 2.
 
-### 6. The replay estimator keeps only positive advantages
+### 7. The replay estimator keeps only positive advantages
 
 §4.2: "the advantage is the sample weight. Positive advantage reinforces those choices, negative makes
 them less likely." A negative weight on cross-entropy is `-w·log p` with `w < 0`, which is **minimized
@@ -324,7 +352,7 @@ constants that cannot be tuned inside a single 3.2 GPU-hour pass. Filtering to t
 their nine siblings is bounded by construction, needs no hyper-parameters, and never pushes away from
 anything.
 
-### 7. Two §4 citations corrected rather than implemented
+### 8. Two §4 citations corrected rather than implemented
 
 - §4.4 rule 2 says to "drop `seconds` from the team aggregate entirely" and that "`eval_metrics`
   already says this in its headline block". **`_BOX_ACCURACY_STATS`
@@ -339,7 +367,7 @@ anything.
   The other ten heads' queried positions are event-token-gated (`next_event == <token>`) and much
   sparser, so the decision log is defined per head from its own sampling call.
 
-### 8. Rung 2 stays scoped to `event_time`
+### 9. Rung 2 stays scoped to `event_time`
 
 §4.6 prices the bridge at one day. `rollout_score_fn` exists only on `EventTimeModel.train`
 (`models/event_time_model.py:711`); the other five head classes have the identical signature without
