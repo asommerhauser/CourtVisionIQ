@@ -50,7 +50,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from data_loading import cleaned_csvs
+from data_loading import cleaned_csvs, season_offsets
 from simulation.box_score import generate_box_score
 from simulation.stats import advanced_stats, team_totals
 
@@ -301,11 +301,18 @@ def build(data_dir: str = "./data", *, seasons=None, echo=print) -> Path:
 
     out = priors_dir(data_dir)
     out.mkdir(parents=True, exist_ok=True)
+    # The sidecar is joined to training rows by game_id, so it must use the SAME numbering
+    # load_all_cleaned does -- per-file ids collide across seasons and are shifted past every
+    # earlier file's maximum. Reading each CSV directly and keeping its raw id is what made the
+    # sidecar cover 1,277 of 26,969 games (season 2003, the only file whose offset is zero) and
+    # what made merge_prior_features refuse the whole thing as stale. See data_loading.season_offsets.
+    offsets = season_offsets(data_dir)
     carry = PriorCarry()
     written = []
     for path in paths:
         label = season_label(path)
         frame = pd.read_csv(path)
+        frame["game_id"] = frame["game_id"].astype(int) + offsets[path]
         player_frame, team_frame = priors_for_season(frame, carry)
         player_frame.to_parquet(out / f"players_{label}.parquet", index=False)
         team_frame.to_parquet(out / f"teams_{label}.parquet", index=False)
