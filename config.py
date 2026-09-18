@@ -604,7 +604,7 @@ SEASONS_PER_STAGE = 3
 BOUNDARY_CYCLE = ("frac:0.25", "frac:0.50", "pre_playoffs")
 
 # --- Training corpus floor (3.2 W2: seasons before this leave the TRAINING pool) ---
-# Seasons 2003-2007 are dropped from training. Not as a fix for the static-identity problem --
+# Seasons 2003-2010 are dropped from training (moved 2008 -> 2011 by decision, 2026-09-17). Not as a fix for the static-identity problem --
 # docs/v3_direction.md 1f is right that it is not one -- but as the simplification that makes the
 # vocabulary floor below possible: the vocabulary is built from what clears a games threshold inside
 # the subset, and old-era players are exactly the rows that would otherwise sit in the embedding
@@ -612,9 +612,17 @@ BOUNDARY_CYCLE = ("frac:0.25", "frac:0.50", "pre_playoffs")
 #
 # Expect it to be NEUTRAL on every metric. Old seasons are already discounted twice, once by
 # SUBSET_RECENCY_HALFLIFE_SEASONS in sampling and once by RECENCY_HALFLIFE_SEASONS / RECENCY_FLOOR in
-# the loss, so a 2006 game contributes roughly three thousandths of what a current game does and
-# 2003-2007 together are on the order of one percent of the gradient. The cost the direction names
-# still stands: rare tokens get rarer, and the rarest foul and rebound sub-types are where it shows.
+# the loss. Every season this removes is already pinned at the RECENCY_FLOOR of 0.05 -- the halflife
+# of 3.0 reaches the floor at about seven seasons back, so 2016 and older are all there -- and their
+# subset sampling rates run 0.11 (2010) down to 0.0021 (2003). Multiplying the two, a 2010 game
+# carries about 0.5% of the gradient a current game does, and 2003-2010 together come to roughly 37
+# current-game equivalents: one to two percent of the total.
+#
+# The cost the direction names still stands: rare tokens get rarer, and the rarest foul and rebound
+# sub-types are where it would show. Note also that 2011 removes three more seasons than the 2008 the
+# direction proposed, and MEASURED it is the *milder* cut for the vocabulary floor -- it drops 183
+# players (1,797 -> 1,614) who were almost all low-exposure old-era names, so the median player's
+# subset exposure RISES from 31 games to 34. See docs/v3_2_progress.md measurement 2.
 #
 # WHERE this is applied is load-bearing. game_id is POSITIONAL -- data_loading.season_offsets shifts
 # each season file's ids past every earlier file's maximum, and the raw per-season ranges are not
@@ -631,7 +639,7 @@ BOUNDARY_CYCLE = ("frac:0.25", "frac:0.50", "pre_playoffs")
 # still seeds 2008 from real 2007 production.
 #
 # None means no floor. The test suite sets None, because 18 test modules build 2003 fixtures.
-MIN_TRAIN_SEASON = 2008
+MIN_TRAIN_SEASON = 2011
 
 # --- Recency weighting (single full train: older seasons contribute less to the loss) ---
 # Every game still trains, but its loss weight decays with age so the modern game dominates the

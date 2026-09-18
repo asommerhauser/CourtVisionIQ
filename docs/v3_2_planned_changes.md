@@ -59,7 +59,7 @@ one retrain, so it cannot be A/B'd separately afterwards.
 | [WT](#wt--the-test-tiers) | The test tiers | no | — | — | — |
 | [W0](#w0--spec-and-tracker) | Spec and tracker | no | — | — | — |
 | [W1](#w1--the-priors-join) | The priors join — **blocking** | yes | Light | — | — |
-| [W2](#w2--corpus-cut-at-2008) | Corpus cut at 2008 | yes | Moderate | — | — |
+| [W2](#w2--corpus-cut-at-2011) | Corpus cut at 2011 | yes | Moderate | — | — |
 | [W3](#w3--all-twelve-heads-on-the-subset) | All twelve heads on the subset | yes | Light | — | — |
 | [W4](#w4--vocabulary-floor-and-per-game-anonymous-slots) | Vocabulary floor, anonymous slots | yes | Moderate | Moderate | Moderate |
 | [W5](#w5--three-prior-stats-career-stage-season-deltas) | Three prior stats, career stage, deltas | yes | Moderate | Light | Light |
@@ -150,9 +150,13 @@ sidecar built over a multi-season fixture covers every id `load_all_cleaned` emi
 
 ---
 
-## W2 — corpus cut at 2008
+## W2 — corpus cut at 2011
 
-**What it is.** `MIN_TRAIN_SEASON = 2008`. Seasons 2003–2007 leave the training pool.
+**What it is.** `MIN_TRAIN_SEASON = 2011`. Seasons 2003–2010 leave the training pool.
+
+**Moved from 2008 to 2011 by decision (2026-09-17)**, after the floor arithmetic was measured
+both ways. It is the deeper corpus cut and the *milder* vocabulary cut — see §W4 and
+`v3_2_progress.md` measurement 2.
 
 **Why.** Not as a fix for identity — `v3_direction.md` §1f is right that it is not one — but as the
 simplification that makes W4's vocabulary surgery possible. Old seasons are already discounted twice,
@@ -169,7 +173,7 @@ v2-run1..4 scored.
 **The floor is therefore applied inside `load_all_cleaned`, after the offset walk.** Every id
 survives; only `pos` and `boundary_idx` renumber. `cleaned_csvs` stays unfiltered, which also makes
 §3.1's "cut the training games, never the sidecar" true **by construction** — `player_priors` and
-`season_context` walk `cleaned_csvs` directly, so the priors chain still seeds 2008 from real 2007
+`season_context` walk `cleaned_csvs` directly, so the priors chain still seeds 2011 from real 2010
 production. That is the highest-consequence mistake in the direction document, and this removes the
 opportunity to make it.
 
@@ -236,22 +240,22 @@ guarantee being retired in either direction.
 This shrinks it by removing long-retired players outright and the thin rows the floor catches — the
 one capacity change in 3.2, and it goes *downward*.
 
-**What the floor actually costs, measured.** Over the 2008+ priors at the live sampling rates:
+**What the floor actually costs, measured.** Over the 2011+ priors at the live sampling rates:
 
-| floor | vocab kept | minutes anonymous (all) | minutes anonymous (2021+) | games with ≥2 anonymous |
-|---|---|---|---|---|
-| 10 | 1,253 | 1.86% | 0.91% | 13.5% |
-| **20** | **1,050** | **4.64%** | **2.02%** | **32.7%** |
-| 30 | 911 | 8.15% | 3.30% | 49.0% |
+| floor | vocab kept | minutes anonymous (all) | minutes anonymous (2021+) | games with ≥2 anonymous | max in one game |
+|---|---|---|---|---|---|
+| 10 | 1,151 | 1.60% | 0.91% | 11.6% | 8 |
+| **20** | **959** | **4.03%** | **2.02%** | **28.7%** | **12** |
+| 30 | 843 | 6.68% | 3.30% | 43.9% | 15 |
 
-The median player has ~31 expected subset games, so the document's "start at 20–30" sits at the
+The median player has ~34 expected subset games, so the document's "start at 20–30" sits at the
 median — a far deeper cut than §3.2 implies. Two things follow.
 
 **Order of operations, which matters.** Cut the corpus (W2) → carve the subset (W3) → count games per
 player **within the subset** → build the vocabulary from those clearing the floor.
 
 **Anonymous slots, not one `UNK`.** At a floor of 20, two or more below-floor players are rostered in
-a third of games, up to a maximum of 13. One shared id cannot tell them apart, and the player and
+28.7% of games, up to a maximum of 12. One shared id cannot tell them apart, and the player and
 substitution heads would spend probability on an unresolvable token. So `ANON_SLOTS = 16` tokens are
 reserved and assigned **per game, by sorted name within that game**, so preprocess and inference
 agree; `UNK` stays as the overflow. The embedding then becomes an honest "generic bench slot" and all
