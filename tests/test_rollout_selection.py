@@ -187,8 +187,13 @@ def test_the_selector_only_scores_every_nth_epoch(monkeypatch):
     assert seen == [2, 5, 8]
 
 
-def test_with_rung_two_off_there_is_no_selector_and_nothing_is_restored():
-    """The default. Weights are exactly what EarlyStopping chose, and the run is unchanged."""
+def test_with_rung_two_off_there_is_no_selector_and_nothing_is_restored(monkeypatch):
+    """Selection off: weights are exactly what EarlyStopping chose and the run is unchanged.
+
+    3.2 W8 turned ROLLOUT_SELECTION on, so this sets it explicitly rather than leaning on the default
+    -- which is what a test of the OFF path should have done from the start.
+    """
+    monkeypatch.setattr(config, "ROLLOUT_SELECTION", False)
     assert build_selector(_Model(), score_fn=lambda e: 1.0) is None
     model = _Model()
     model.set_weights([np.full(3, 7.0)])
@@ -216,3 +221,148 @@ def test_the_record_merges_into_the_run_state_without_disturbing_it(tmp_path):
     state = json.loads(path.read_text())
     assert state["trained_models"] == ["event_time"]
     assert state[STATE_KEY]["event_time"]["rollout_best_epoch"] == 4
+
+
+# --------------------------------------------------------------------------- #
+# --- W8: the bridge that makes any of the above run                        -- #
+# --------------------------------------------------------------------------- #
+
+def _probe_report(sim_bench=0.238, real_bench=0.776):
+    """A ``compare()``-shaped report, with every row ``_rows_for_frame`` reads."""
+    def side(bench):
+        return {
+            "foul_trouble_3": {"p_benched": bench, "events_per_game": 1.4, "n_events": 1570},
+            "foul_trouble_4": {"p_benched": bench, "events_per_game": 0.37, "n_events": 51},
+            "blowout_q4": {"starter_seconds_blowout": 3321.0, "starter_seconds_close": 3963.0,
+                           "ratio": 0.838, "blowout_frequency": 0.22,
+                           "blowout_games": 20, "close_games": 80},
+            "late_foul": {"rate_per_100s": 1.62, "state_seconds_per_game": 30.1, "fouls": 100},
+        }
+    return {"sim": side(sim_bench), "real": side(real_bench)}
+
+
+def test_the_scored_rows_are_the_deliberate_subset():
+    """``_rows_for_frame`` emits eight rows; three describe one behaviour and one is a denominator.
+
+    ``rollout_score`` averages relative gaps, so units cancel -- but weighting the Q4 rotation three
+    times over (blowout seconds, close seconds, and their ratio) would make it three fifths of the
+    behaviour term on its own.
+    """
+    from models.rollout_bridge import SCORED_PROBES, scored_probe_rows
+    rows = scored_probe_rows(_probe_report())["rows"]
+    assert {(r["probe"], r["metric"]) for r in rows} == set(SCORED_PROBES)
+    assert len(rows) == 5
+
+    from reporting.state_probes import _rows_for_frame
+    assert len(_rows_for_frame(_probe_report())) == 10, "the full set is wider than what is scored"
+
+
+def test_the_excluded_rows_really_are_excluded():
+    from models.rollout_bridge import scored_probe_rows
+    scored = {(r["probe"], r["metric"]) for r in scored_probe_rows(_probe_report())["rows"]}
+    for excluded in (("blowout_q4", "starter_seconds_blowout"),
+                     ("blowout_q4", "starter_seconds_close"),
+                     ("blowout_q4", "blowout_frequency"),
+                     ("foul_trouble_3", "events_per_game"),
+                     ("late_foul", "state_seconds_per_game")):
+        assert excluded not in scored
+
+
+def test_the_selected_rows_feed_the_behaviour_term():
+    """The end the bridge exists for: a probe gap has to cost something in the score."""
+    from models.rollout_bridge import scored_probe_rows
+    agg = _agg(7.0, 1.0) if "_agg" in globals() else {"headline": {"points_mae": 7.0}}
+    matched = rollout_score(agg, scored_probe_rows(_probe_report(0.776, 0.776)))
+    missed = rollout_score(agg, scored_probe_rows(_probe_report(0.238, 0.776)))
+    assert missed > matched
+
+
+def test_a_run_state_without_the_train_tail_abstains_rather_than_scoring_nothing():
+    """The 3.0 gap: ``eval_game_ids`` read a key nothing wrote, so it returned an empty list.
+
+    Building a score function over no games would have selected a checkpoint on a constant, and
+    nothing downstream would have looked wrong.
+    """
+    from models.rollout_bridge import build_rollout_score_fn
+    said = []
+    fn = build_rollout_score_fn({"boundary_idx": 100}, make_sim=lambda: None, echo=said.append)
+    assert fn is None
+    assert said and "train_tail_game_ids" in said[0]
+
+
+def test_setup_records_the_train_tail(tmp_path):
+    """The other half: ``FullRun.setup`` has to write the key ``eval_game_ids`` reads."""
+    import json
+    import config
+    from training.full_run import FullRun
+    from test_chronology import _build_corpus
+
+    data_dir = _build_corpus(tmp_path)
+    state = tmp_path / "state.json"
+    run = FullRun(str(state))
+    run.setup(name="probe", data_dir=str(data_dir), processed_dir=str(tmp_path / "processed"))
+
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    tail = saved["train_tail_game_ids"]
+    assert tail, "setup must record the training-era tail"
+    assert len(tail) <= config.ROLLOUT_EVAL_TAIL
+    assert eval_game_ids(saved, n_games=2), "and eval_game_ids must be able to sample from it"
+
+
+def test_the_tail_never_reaches_into_the_holdout(tmp_path):
+    """Selecting against holdout games turns the report into a training metric."""
+    import json
+    from training.full_run import FullRun
+    from test_chronology import _build_corpus
+
+    data_dir = _build_corpus(tmp_path)
+    state = tmp_path / "state.json"
+    FullRun(str(state)).setup(name="probe", data_dir=str(data_dir),
+                             processed_dir=str(tmp_path / "processed"))
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert not (set(saved["train_tail_game_ids"]) & set(saved["holdout_game_ids"]))
+
+
+def test_the_pipeline_asks_the_factory_for_the_head_it_built():
+    """``run_stage`` constructs the heads, so a ready callable could not reach this epoch's weights.
+
+    The factory is handed the head instance, whose ``_live_model`` the score function reads.
+    """
+    import inspect
+    from models.pipeline import run_stage
+    assert "rollout_score_fn_factory" in inspect.signature(run_stage).parameters
+    src = inspect.getsource(run_stage)
+    assert "rollout_score_fn_factory(model)" in src
+    assert 'extra["rollout_score_fn"]' in src
+
+
+def test_only_the_event_time_head_is_offered_the_score_function():
+    """The other five head classes have the identical signature WITHOUT the parameter."""
+    import inspect
+    from models.event_time_model import EventTimeModel
+    from models.player_model import PlayerModel
+    from models.substitution_model import SubstitutionModel
+
+    assert "rollout_score_fn" in inspect.signature(EventTimeModel.train).parameters
+    for cls in (PlayerModel, SubstitutionModel):
+        assert "rollout_score_fn" not in inspect.signature(cls.train).parameters
+
+
+def test_the_head_exposes_the_inner_model_not_the_trainer():
+    """``build_trainer`` may add a regime table, so the wrapper's weight list is longer than the
+    simulator's graph. Copying from the wrapper would raise on length."""
+    import inspect
+    from models.event_time_model import EventTimeModel
+    src = inspect.getsource(EventTimeModel.train)
+    assert "self._live_model = inner" in src, (
+        "_live_model must be the inner functional model; `model` is rebound to the trainer, whose "
+        "weight list also holds the regime latent table the simulator's graph does not have")
+    assert "self._live_model = model" not in src
+
+
+def test_the_sim_side_of_the_probes_is_pooled_from_histories():
+    """Computed in memory: writing thousands of play-by-play CSVs per scored epoch to read them
+    straight back would cost more than the rollouts."""
+    from models.rollout_bridge import sim_probe_summary
+    summary = sim_probe_summary([])
+    assert set(summary) >= {"foul_trouble_3", "foul_trouble_4", "blowout_q4", "late_foul"}

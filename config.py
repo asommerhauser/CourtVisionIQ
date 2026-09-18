@@ -75,7 +75,11 @@ ROSTER_SAB_LAYERS = 3      # Set-Attention blocks in the roster set-encoder (was
 #
 # Cost, from the run-4 logs: 20 games x 10 sims is 200 game-sims, ~7.5 GPU-minutes per evaluation;
 # every third epoch over a 30-epoch stage is ~1.3 GPU-hours on the train.
-ROLLOUT_SELECTION = False
+# 3.2 W8: on. The bridge that constructs the score function now exists (models/rollout_bridge.py),
+# setup() records the train-tail games eval_game_ids samples from, and models.pipeline has a channel to
+# pass the callable to the event/time head. Before all three, turning this on would have selected on a
+# score computed over an empty game set.
+ROLLOUT_SELECTION = True
 ROLLOUT_EVAL_EVERY = 3
 ROLLOUT_EVAL_GAMES = 20
 ROLLOUT_EVAL_SIMS = 10

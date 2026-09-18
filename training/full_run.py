@@ -30,7 +30,8 @@ from pathlib import Path
 from config import (
     DEFAULT_MODEL, EVAL_BATCH, EVAL_GAMES_PER_BATCH, FINAL_HOLDOUT_GAMES, FINAL_SEASON_FRACTION,
     HOLDOUT_WINDOW_GAMES,
-    FULL_RUN_STATE_PATH, ROLLOUT_BATCH_SIZE, SEED, STAGE_SIMS, SUBSET_GAMES_PATH,
+    FULL_RUN_STATE_PATH, ROLLOUT_BATCH_SIZE, ROLLOUT_EVAL_TAIL, SEED, STAGE_SIMS,
+    SUBSET_GAMES_PATH,
     SUBSET_MODEL_KEYS, TEST_FRAC, VOCAB_DIR,
 )
 # model_name is re-exported: it lives in models.artifacts (TF-free, so eval_pool can reach
@@ -42,6 +43,7 @@ from models.manifest import (new_manifest, record_head, snapshot_vocabs, vocab_f
 from models.registry import STAGE_MODEL_KEYS
 from reporting.report_artifacts import DEFAULT_REPORTS_ROOT
 from training.chronology import game_index, sequential_partition
+from models.rollout_selection import record_selection
 from training.subset import extract as extract_subset, load_subset_games
 
 DEFAULT_STATE_PATH = FULL_RUN_STATE_PATH   # re-exported: train.py imports it from here
@@ -112,6 +114,12 @@ class FullRun:
             # floor moves even though the games it points at do not -- recording the floor is what
             # makes a stale state file diagnosable instead of merely wrong.
             "min_train_season": training_min_season(),
+            # W8: the last games before the cut, which rollout_selection.eval_game_ids samples from.
+            # It read this key and NOTHING wrote it, so the selector's game set was unreachable from a
+            # real run state and checkpoint selection would have scored nothing at all. Capped at
+            # ROLLOUT_EVAL_TAIL so the state file stays small; they are trained-on games on purpose --
+            # this measures whether a checkpoint BEHAVES, and generalisation is what the holdout is for.
+            "train_tail_game_ids": [int(g) for g in ordered[:boundary][-ROLLOUT_EVAL_TAIL:]],
             "holdout_game_ids": holdout_ids, "eval_batch": EVAL_BATCH,
             "status": "setup", "trained_models": [],
         }
@@ -243,6 +251,43 @@ class FullRun:
               f"[{tag}]   -> {len(games)} games, every head\n{bar}")
         return games
 
+    # ----------------------------------------------------------- rung 2
+    def _rollout_score_factory(self):
+        """``(factory, holder)`` for W4 rung 2, or ``(None, None)`` when selection is off.
+
+        ``factory(head)`` returns the ``score_fn(epoch)`` the Keras callback calls. It is a factory
+        because ``run_stage`` constructs the heads itself, so there is nothing for this to close over
+        until the head exists -- and the score function must read the weights of *this* epoch, which
+        live only on that instance.
+
+        The simulator it rolls out with is loaded once, with every head from the finished bundle. That
+        is why the handover runs rung 2 as a SECOND pass: mid-first-train the other eleven heads have no
+        weights of their own, so a scored rollout would be scoring a bundle that does not exist.
+        """
+        import config as _config
+        if not getattr(_config, "ROLLOUT_SELECTION", False):
+            return None, None
+        from models.rollout_bridge import build_rollout_score_fn
+
+        root = self.state["artifacts_root"]
+        data_dir = self.state["data_dir"]
+        holder: dict = {}
+
+        def make_sim():
+            if "sim" not in holder:
+                from simulation.game_simulator import GameSimulator
+                holder["sim"] = GameSimulator.load(artifacts_root=root)
+            return holder["sim"]
+
+        def factory(head):
+            holder["head"] = head
+            return build_rollout_score_fn(
+                self.state, make_sim=make_sim,
+                live_model=lambda: getattr(head, "_live_model", None),
+                data_dir=data_dir, seed=SEED)
+
+        return factory, holder
+
     # --------------------------------------------------------------- train
     def train(self, *, rebuild_vocabs: bool = False) -> None:
         from models.pipeline import run_stage
@@ -281,6 +326,10 @@ class FullRun:
             print(f"[train] vocabulary floor {_config.MIN_PLAYER_SUBSET_GAMES}: "
                   f"{n_aliased:,} players aliased to anonymous slots")
 
+        # Rung 2's score function, and the holder the pipeline fills with the live head so the
+        # function can read this epoch's weights rather than the bundle on disk.
+        score_factory, holder = self._rollout_score_factory()
+
         self.state["status"] = "training"
         self._save()
 
@@ -308,7 +357,19 @@ class FullRun:
             done=sdict["trained_models"], on_trained=on_trained,
             subset_keys=SUBSET_MODEL_KEYS, subset_train_games=subset_train,
             rebuild_vocabs=rebuild_vocabs,
+            rollout_score_fn_factory=score_factory,
         )
+
+        # W8: the record rung 3's condition is a number rather than a judgement. It was written to
+        # EventTimeModel._checkpoint_selection and never read by anything.
+        head = holder.get("head") if holder else None
+        selection = getattr(head, "_checkpoint_selection", None) if head is not None else None
+        if selection is not None:
+            record_selection(self.state_path, "event_time", selection)
+            print(f"[train] checkpoint selection recorded: rollout-best epoch "
+                  f"{selection.get('rollout_best_epoch')}, NLL-best "
+                  f"{selection.get('nll_best_epoch')}"
+                  f"{' -- THEY DISAGREE' if selection.get('epochs_disagree') else ''}")
 
         write_manifest(self.state["artifacts_root"],
                        finished_at=datetime.now().isoformat(timespec="seconds"))
