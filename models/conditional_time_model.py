@@ -39,6 +39,7 @@ from data_loading import resolve_partition
 from models.norm_stats_io import load_norm_stats, save_norm_stats
 from models.artifacts import DEFAULT_ARTIFACTS_ROOT, warm_start_weights
 from models.backbone import build_backbone
+from models.roster_set_encoder import encode_both_rosters
 from models.event_time_model import (
     _norm_stats_path,
     DeltaSecondsMAE,
@@ -354,9 +355,12 @@ class ConditionalTimeModel(SubstitutionModel):
         ]
 
         # ---- Roster encoding across the sequence (shared home/away, with per-player rest) ----
-        home_vec = self.roster_encoder(
-            [home_roster, *side_scalars(rest_home, rotation_inputs, "home", prior_inputs)])
-        away_vec = self.roster_encoder(
+        # W7: one call, because cross-roster attention needs both sides' slots live at the
+        # same moment. encode_both_rosters dispatches on which encoder this build uses, so
+        # the CROSS_ROSTER_ENABLED branch lives in one place rather than six.
+        home_vec, away_vec = encode_both_rosters(
+            self.roster_encoder,
+            [home_roster, *side_scalars(rest_home, rotation_inputs, "home", prior_inputs)],
             [away_roster, *side_scalars(rest_away, rotation_inputs, "away", prior_inputs)])
 
         # ---- Continuous projections ----

@@ -731,6 +731,19 @@ FULL_ARTIFACTS_ROOT = f"./artifacts/{DEFAULT_MODEL}"
 # name ("v1.0"), not the bare "1.0" this constant used to hold.
 DEFAULT_VERSION = DEFAULT_MODEL
 
+# --- Cross-roster attention (3.2 W7) ---
+# The two rosters pass through ONE weight-tied encoder independently and meet only at the fusion concat
+# (docs/v3_2_direction.md 5.1), so nothing in the graph can represent one lineup AGAINST another: a
+# switch-heavy defence and a rim-protecting one are the same input to the offence's representation.
+#
+# With this on, each roster's per-slot representations attend over the other's before pooling, through
+# ONE shared attention block used in both directions -- so it learns "how a lineup reads an opponent"
+# rather than which side of the ledger a team sits on.
+#
+# ARCHITECTURE, not a dial: off produces a graph with different layers, which load_weights would match
+# by name and silently skip. It is in models.manifest.ARCH_KEYS for that reason.
+CROSS_ROSTER_ENABLED = True
+
 # --- Context modulation, FiLM (3.2 W6) ---
 # Season, the team priors and the regime latent all enter ONCE today, as columns in a wide concat
 # projected to MODEL_DIM, and then have to survive six residual blocks on their own

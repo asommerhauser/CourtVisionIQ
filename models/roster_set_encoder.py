@@ -6,6 +6,7 @@ import tensorflow as tf
 import keras
 from keras import layers
 
+from layers.cross_roster import CrossRosterBlock
 from layers.sab import SAB
 from layers.pma import PMA
 
@@ -119,8 +120,14 @@ class RosterSetEncoder(keras.layers.Layer):
         self.out_ln(v)
         super().build(input_shape)
 
-    def call(self, inputs, training: bool = False):
-        # inputs: [ids (B, N) int32, then num_scalars per-player (B, N) float tensors]
+    def encode_slots(self, inputs, training: bool = False):
+        """Per-slot representations, before pooling: ``(x, attn_mask, slot_valid)``.
+
+        Split out of ``call`` for 3.2 W7's cross-roster attention, which needs both rosters' slots at
+        the same time and therefore cannot use a layer that only returns a pooled vector. ``call`` is
+        this followed by ``pool_slots``, so the computation is unchanged and so is the graph a
+        single-side encode produces.
+        """
         ids, scalars = inputs[0], inputs[1:]
         if len(scalars) != self.params.num_scalars:
             raise ValueError(
@@ -137,8 +144,17 @@ class RosterSetEncoder(keras.layers.Layer):
         x = emb + self.scalar_proj(stacked)                            # (B, N, D)
         for sab in self.sabs:
             x = sab(x, training=training, attention_mask=attn_mask)    # (B, N, D)
+        return x, attn_mask, slot_valid
+
+    def pool_slots(self, x, attn_mask, training: bool = False):
+        """Pool per-slot representations to one roster vector. The second half of ``call``."""
         v = self.pma(x, training=training, attention_mask=attn_mask)   # (B, D)
         return self.out_ln(v)
+
+    def call(self, inputs, training: bool = False):
+        # inputs: [ids (B, N) int32, then num_scalars per-player (B, N) float tensors]
+        x, attn_mask, _ = self.encode_slots(inputs, training=training)
+        return self.pool_slots(x, attn_mask, training=training)
 
     def compute_output_shape(self, input_shape):
         # [ (B, N) ids, (B, N) x num_scalars ] -> (B, roster_dim).
@@ -169,6 +185,105 @@ class RosterSetEncoder(keras.layers.Layer):
         name = config.get("name", "roster_encoder")
         params = _config_to_params(config)
         return cls(params, name=name)
+
+
+@keras.saving.register_keras_serializable(package="cviq")
+class CrossSequenceRosterEncoder(keras.layers.Layer):
+    """Both rosters at once, each attending over the other before pooling (3.2 W7).
+
+    Input:  ``[home_ids, *home_scalars, away_ids, *away_scalars]``, every tensor ``(B, SEQ, N)``
+    Output: ``[home_vec, away_vec]``, each ``(B, SEQ, roster_dim)``
+
+    A drop-in alternative to ``SequenceRosterEncoder``: same inner encoder, same weight-tying across
+    home and away, same reshape-once strategy (``TimeDistributed`` explodes the graph at SEQ=600). The
+    difference is that the two sides' per-slot representations meet, through one shared
+    ``CrossRosterBlock`` applied in both directions, and only then pool.
+
+    Why it has to be one layer rather than two calls: cross-attention needs both sides' slots live at
+    the same moment, and a layer that returns a pooled vector has already thrown them away. That is why
+    ``RosterSetEncoder`` grew ``encode_slots`` / ``pool_slots``.
+    """
+
+    def __init__(self, params: RosterEncoderParams, name: str = "roster_vec", **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.params = params
+        self.encoder = RosterSetEncoder(params)
+        self.cross = CrossRosterBlock(
+            d_model=params.roster_dim, num_heads=params.num_heads, d_ff=params.d_ff,
+            dropout=params.dropout, name="cross_roster")
+
+    def build(self, input_shape):
+        n = self.params.roster_size
+        self.encoder.build([(None, n)] * (1 + self.params.num_scalars))
+        self.cross.build((None, n, self.params.roster_dim))
+        super().build(input_shape)
+
+    def _split(self, inputs):
+        """``inputs`` is the two sides' lists concatenated; each is ``1 + num_scalars`` tensors."""
+        per_side = 1 + self.params.num_scalars
+        if len(inputs) != 2 * per_side:
+            raise ValueError(
+                f"{self.name} expects {2 * per_side} tensors (home then away, each one roster plus "
+                f"{self.params.num_scalars} scalars), got {len(inputs)}")
+        return inputs[:per_side], inputs[per_side:]
+
+    def call(self, inputs, training: bool = False):
+        home, away = self._split(inputs)
+        n = self.params.roster_size
+        shape = tf.shape(home[0])                                   # (B, SEQ, N)
+
+        def flatten(side):
+            return [tf.reshape(t, (-1, n)) for t in side]           # (B*SEQ, N) each
+
+        hx, h_mask, h_valid = self.encoder.encode_slots(flatten(home), training=training)
+        ax, a_mask, a_valid = self.encoder.encode_slots(flatten(away), training=training)
+
+        # One block, both directions. Each side reads the other's slots as they were BEFORE this step,
+        # so neither direction sees the other's cross-attended output and the two are symmetric.
+        hx_cross = self.cross(hx, ax, a_valid, training=training)
+        ax_cross = self.cross(ax, hx, h_valid, training=training)
+
+        hv = self.encoder.pool_slots(hx_cross, h_mask, training=training)
+        av = self.encoder.pool_slots(ax_cross, a_mask, training=training)
+
+        d = self.params.roster_dim
+        return [tf.reshape(hv, (shape[0], shape[1], d)),
+                tf.reshape(av, (shape[0], shape[1], d))]
+
+    def compute_output_shape(self, input_shape):
+        b, seq = input_shape[0][0], input_shape[0][1]
+        return [(b, seq, self.params.roster_dim), (b, seq, self.params.roster_dim)]
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update(_params_to_config(self.params))
+        return cfg
+
+    @classmethod
+    def from_config(cls, config):
+        name = config.get("name", "roster_vec")
+        return cls(_config_to_params(config), name=name)
+
+
+def encode_both_rosters(encoder, home_inputs, away_inputs, training=None):
+    """Apply a roster encoder to both sides, whichever kind it is. Returns ``(home_vec, away_vec)``.
+
+    One helper because all six heads do exactly this, and the alternative is six copies of the same
+    ``if CROSS_ROSTER_ENABLED`` branch -- the shape of duplication that let ``SUBSET_MODEL_KEYS`` drift
+    out of step with the heads it named.
+    """
+    if isinstance(encoder, CrossSequenceRosterEncoder):
+        home_vec, away_vec = encoder([*home_inputs, *away_inputs])
+        return home_vec, away_vec
+    return encoder(home_inputs), encoder(away_inputs)
+
+
+def build_sequence_roster_encoder(params: RosterEncoderParams, name: str = "roster_vec"):
+    """The roster encoder this build is configured for. One place, so the heads cannot disagree."""
+    import config
+    if getattr(config, "CROSS_ROSTER_ENABLED", False):
+        return CrossSequenceRosterEncoder(params, name=name)
+    return SequenceRosterEncoder(params, name=name)
 
 
 def _params_to_config(params: RosterEncoderParams) -> dict:
