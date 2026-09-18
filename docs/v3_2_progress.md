@@ -45,7 +45,8 @@ Carried forward from [`v3_progress.md`](v3_progress.md), with **rule 1 amended**
 | `v3.2/w0-spec` | direction, build guide, this tracker | no | **built** |
 | `v3.2/test-tiers` | WT: `pytest.ini` markers, two conftest fixtures | no | **built**, 49-test subset green |
 | `v3.2/priors-join` | W1: one definition of the `game_id` numbering | yes (sidecar rebuild) | **built**, 153 tests green |
-| `v3.2/corpus-cut` | W2: `MIN_TRAIN_SEASON = 2008`, applied to rows | yes | **built**, 165 tests green |
+| `v3.2/corpus-cut` | W2: corpus floor, applied to rows | yes | **built**, 165 tests green |
+| `v3.2/corpus-cut-2011` | W2a: the floor moves 2008 -> 2011 | yes | **built** |
 | `v3.2/subset-all-heads` | W3: all twelve heads on the subset; coverage retired | yes | **built**, 124 tests green |
 
 **W1 verified two ways.** `tests/test_player_priors.py` gains three tests that build a real sidecar
@@ -91,39 +92,44 @@ Raw per-season id ranges are also **not ordered by season** — 2016 holds 1313�
 1–1312, 2003 holds 15556–16832 — so the offset walk is order-dependent and ids are positional
 artifacts, not intrinsic. That is what forces W2's placement.
 
-### 2. What the vocabulary floor actually costs
+### 2. What the vocabulary floor actually costs — measured at both candidate cuts
 
-Computed from the 559k-row priors sidecar for seasons 2008+, weighting each season by the live subset
-sampling rate (`SUBSET_RECENT_SEASON_RATES = (1.0, 0.70, 0.50)`,
-`SUBSET_RECENCY_HALFLIFE_SEASONS = 5.0`) and halving the newest season for the `FINAL_SEASON_FRACTION`
-cut. These are expected exposures, not a real extraction — the real histogram comes from
-`training/subset_games.json` after W3.
+Computed from the 559k-row priors sidecar, weighting each season by the live subset sampling rate
+(`SUBSET_RECENT_SEASON_RATES = (1.0, 0.70, 0.50)`, `SUBSET_RECENCY_HALFLIFE_SEASONS = 5.0`) and halving
+the newest season for the `FINAL_SEASON_FRACTION` cut. These are **expected exposures**, not a real
+extraction — the real histogram comes from `training/subset_games.json` after W3, and
+`training.subset extract` now prints it.
 
-| | |
-|---|---|
-| train pool, 2008+ | ~19,800 games |
-| expected subset size | ~5,750 games (against ~6,110 uncut — so ~360 games leave, not §3.1's ~300) |
-| players with any subset exposure | 1,797 |
-| **median expected subset games per player** | **~31** |
+| | cut at 2008 | **cut at 2011 (chosen)** |
+|---|---|---|
+| seasons kept | 16 | **13** |
+| train pool | ~19,800 games | **~15,875 games** |
+| expected subset | ~5,750 games | **~5,374 games** |
+| players with any exposure | 1,797 | **1,614** |
+| median expected subset games | 31 | **34** |
 
-So §3.2's "start at 20–30" sits **at the median**, which is a far deeper cut than the document
-implies.
+So §3.2's "start at 20–30" sits **at the median** either way, which is a far deeper cut than the
+document implies.
 
-| floor | vocab kept | → anonymous | minutes anonymous (all) | minutes anonymous (2021+) | games with ≥2 anonymous |
-|---|---|---|---|---|---|
-| 5 | 1,435 | 362 | 0.72% | 0.29% | — |
-| 10 | 1,253 | 544 | 1.86% | 0.91% | 13.5% |
-| 15 | 1,152 | 645 | 3.00% | 1.30% | — |
-| **20** | **1,050** | **747** | **4.64%** | **2.02%** | **32.7%** |
-| 25 | 981 | 816 | 6.21% | 2.57% | — |
-| 30 | 911 | 886 | 8.15% | 3.30% | 49.0% |
+| floor | vocab kept | → anonymous | minutes anon (all) | minutes anon (2021+) | games with ≥2 | max in one game |
+|---|---|---|---|---|---|---|
+| 10 | 1,151 | 463 | 1.60% | 0.91% | 11.6% | 8 |
+| 15 | 1,056 | 558 | 2.63% | 1.30% | 19.6% | 10 |
+| **20** | **959** | **655** | **4.03%** | **2.02%** | **28.7%** | **12** |
+| 25 | 905 | 709 | 5.11% | 2.57% | 34.8% | 13 |
+| 30 | 843 | 771 | 6.68% | 3.30% | 43.9% | 15 |
 
 **The minutes cost is affordable; the collision count is what forced a design change.** At a floor of
-20, two or more below-floor players are rostered in **32.7% of games** (mean 1.39, p90 4, max 13).
-A single shared `UNK` id cannot tell them apart, and `game_available_mask`
+20, two or more below-floor players are rostered in **28.7% of games** (mean 1.23, max 12). A single
+shared `UNK` id cannot tell them apart, and `game_available_mask`
 (`models/event_time_model.py:219-239`) zeroes `PAD` at `:238` but **not** `UNK`, so the player and
 substitution heads can spend probability mass on an unresolvable token. Hence W4's per-game anonymous
-slots (`ANON_SLOTS = 16`, covering the measured maximum of 13, with `UNK` as overflow).
+slots (`ANON_SLOTS = 16`, comfortably above the measured maximum, with `UNK` as overflow).
+
+**One cross-check worth recording:** the 2021+ minute shares are *identical* at both cuts
+(0.91 / 1.30 / 2.02 / 2.57 / 3.30). Removing 2008–2010 barely changes which *recent* players clear the
+floor, which is what the scored holdout is actually made of — so the choice between the two cuts is
+about the old tail, not about the games being predicted.
 
 ### 3. The suite runs here, but some modules are slow on CPU rather than instant
 
@@ -172,14 +178,33 @@ holdout lands on the *same games* across a cut (the real content of §7.2's wind
 past the whole corpus raises rather than yielding an empty frame downstream; and `load_all_cleaned`
 still sees every season.
 
-### 2. Below-floor players get per-game anonymous slots, not one `UNK`
+### 2. The corpus is cut at 2011, not the 2008 the direction proposed
+
+**User decision, 2026-09-17**, taken after the floor arithmetic was measured both ways (measurement
+2). Three more seasons leave the training pool: ~19,800 games becomes ~15,875, and the expected subset
+~5,750 becomes ~5,374.
+
+Two things make it a comfortable decision rather than a trade. Every season it removes is **already
+pinned at `RECENCY_FLOOR = 0.05`** in the loss — a halflife of 3.0 reaches the floor about seven
+seasons back, so 2016 and older are all there — and their subset sampling rates run 0.11 (2010) down
+to 0.0021 (2003). Multiplying the two, a 2010 game carries about **0.5% of the gradient a current game
+does**, and 2003–2010 together come to roughly **37 current-game equivalents**: one to two percent of
+the total. So the expectation of neutrality is, if anything, better supported than at 2008.
+
+And it is the deeper corpus cut but the **milder vocabulary cut**. It removes 183 players outright
+(1,797 → 1,614), almost all low-exposure old-era names, so the median player's subset exposure *rises*
+from 31 games to 34 and every floor keeps a smaller fraction anonymous. The cost the direction names
+is unchanged and still stands: rare tokens get rarer, and the rarest foul and rebound sub-types are
+where it would show.
+
+### 3. Below-floor players get per-game anonymous slots, not one `UNK`
 
 §3.2 maps them all to `UNK`. Measurement 2 shows that is ambiguous in a third of games. Sixteen
 reserved tokens assigned per game by sorted name cost 16 embedding rows and make the token resolvable,
 and the embedding becomes an honest "generic bench slot" with all identity flowing through the
 seventeen prior scalars — which is a truer reading of §3.2's own argument than one shared id.
 
-### 3. Coverage-completeness is retired, and the sampler gets its first tests
+### 4. Coverage-completeness is retired, and the sampler gets its first tests
 
 §2.2 argues the guarantee is inert under a minimum-games floor: anyone it rescues with a single game
 falls below the floor anyway, and it drags old games into a deliberately modern-heavy sample to do it.
@@ -203,7 +228,7 @@ conditional heads, which was true of nothing, because `timeout_team` already tra
 what W4's floor reads; and `extract` prints the distribution plus a kept/anonymous table at floors
 10-30, so the floor is chosen against the real histogram rather than the estimate in measurement 2.
 
-### 4. The replay estimator keeps only positive advantages
+### 5. The replay estimator keeps only positive advantages
 
 §4.2: "the advantage is the sample weight. Positive advantage reinforces those choices, negative makes
 them less likely." A negative weight on cross-entropy is `-w·log p` with `w < 0`, which is **minimized
@@ -213,7 +238,7 @@ constants that cannot be tuned inside a single 3.2 GPU-hour pass. Filtering to t
 their nine siblings is bounded by construction, needs no hyper-parameters, and never pushes away from
 anything.
 
-### 5. Two §4 citations corrected rather than implemented
+### 6. Two §4 citations corrected rather than implemented
 
 - §4.4 rule 2 says to "drop `seconds` from the team aggregate entirely" and that "`eval_metrics`
   already says this in its headline block". **`_BOX_ACCURACY_STATS`
@@ -228,7 +253,7 @@ anything.
   The other ten heads' queried positions are event-token-gated (`next_event == <token>`) and much
   sparser, so the decision log is defined per head from its own sampling call.
 
-### 6. Rung 2 stays scoped to `event_time`
+### 7. Rung 2 stays scoped to `event_time`
 
 §4.6 prices the bridge at one day. `rollout_score_fn` exists only on `EventTimeModel.train`
 (`models/event_time_model.py:711`); the other five head classes have the identical signature without
