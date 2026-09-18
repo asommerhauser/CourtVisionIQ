@@ -153,7 +153,31 @@ slots (`ANON_SLOTS = 16`, comfortably above the measured maximum, with `UNK` as 
 floor, which is what the scored holdout is actually made of — so the choice between the two cuts is
 about the old tail, not about the games being predicted.
 
-### 3. The suite runs here, but some modules are slow on CPU rather than instant
+### 3. The suite, at the end of the build
+
+**1,054 tests, all green**, against 891 when 3.2 started — so the build added **163**. Measured on the dev
+box with CPU-only TensorFlow:
+
+| tier | tests | wall time |
+|---|---|---|
+| fast (`pytest -m "not slow"`) | **1,005 passed** | 9 min 55 s |
+| slow (the graph-heavy modules) | **49** | part of a 29-min, 87-test run |
+
+The `slow` marker is a measurement, not a guess: `test_model_persistence` and `test_local_attention` run
+`preprocess` plus a one-epoch train per test. A separate 87-test run covering those plus `test_backbone`,
+`test_substitution_model` and `test_oncourt_mask` took 29 minutes and is what verified W7's save/load
+across every head.
+
+*One earlier claim withdrawn.* Mid-build I inferred from counting progress dots that FiLM and
+cross-attention had roughly doubled the tiny-model test time. The full numbers do not support it — 87 tests
+in 1,739 s is ~20 s a test against ~31 s for the 49-test run before, and the difference is module mix, not
+a slowdown.
+
+New test files: `test_subset.py`, `test_player_floor.py`, `test_cross_roster.py`, `test_head_metrics.py`,
+`test_decision_log.py`, `test_replay.py`, `test_ab_harness.py` — five of which cover machinery that had
+**no** tests before (the subset sampler, `MAB` in cross mode, and all three rung-3 pieces).
+
+### 4. The suite runs here, but some modules are slow on CPU rather than instant
 
 891 tests collect in 10.7 s on Windows with CPU-only TensorFlow, and a full run reached **562 tests
 with zero failures** before it was stopped at ~29 minutes of CPU time and a 2.9 GB working set. It was
