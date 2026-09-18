@@ -59,8 +59,17 @@ against the offsets computed by replicating the original inline walk on the real
 **all 21 match exactly, so the numbering is unchanged.** That is what keeps the stored
 `holdout_game_ids` valid and window 0 comparable to v2-run1..4.
 
-**The on-disk sidecar is still stale** -- it was built with raw ids. The rebuild is deferred to W5,
-which changes the columns anyway, so it is paid once.
+**W1 and W5 are both verified against the rebuilt sidecar.** `python -m player_priors` was re-run
+after W5 changed the columns (~13 min, pure pandas, 559k rows across 21 seasons). Measured on the real
+corpus afterwards:
+
+| | before W1 | after |
+|---|---|---|
+| games the sidecar and the corpus agree on | **1,277 of 26,969** | **26,969 of 26,969** |
+
+`require_priors` reports 26,969 and nothing is uncovered, so `train.py --full` no longer aborts before
+its first epoch. The 2023 table carries 20 columns with the last 17 in `PLAYER_PRIOR_KEYS` order, and
+`career_stage` reads mean 4.86 / max 19 against the 4.84 / 19 measured independently beforehand.
 
 ---
 
