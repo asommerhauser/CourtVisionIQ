@@ -603,6 +603,36 @@ SEASONS_PER_STAGE = 3
 #   "pre_playoffs"-> stop at the last regular-season game (holdout = first HOLDOUT_GAMES playoffs).
 BOUNDARY_CYCLE = ("frac:0.25", "frac:0.50", "pre_playoffs")
 
+# --- Training corpus floor (3.2 W2: seasons before this leave the TRAINING pool) ---
+# Seasons 2003-2007 are dropped from training. Not as a fix for the static-identity problem --
+# docs/v3_direction.md 1f is right that it is not one -- but as the simplification that makes the
+# vocabulary floor below possible: the vocabulary is built from what clears a games threshold inside
+# the subset, and old-era players are exactly the rows that would otherwise sit in the embedding
+# table under-trained.
+#
+# Expect it to be NEUTRAL on every metric. Old seasons are already discounted twice, once by
+# SUBSET_RECENCY_HALFLIFE_SEASONS in sampling and once by RECENCY_HALFLIFE_SEASONS / RECENCY_FLOOR in
+# the loss, so a 2006 game contributes roughly three thousandths of what a current game does and
+# 2003-2007 together are on the order of one percent of the gradient. The cost the direction names
+# still stands: rare tokens get rarer, and the rarest foul and rebound sub-types are where it shows.
+#
+# WHERE this is applied is load-bearing. game_id is POSITIONAL -- data_loading.season_offsets shifts
+# each season file's ids past every earlier file's maximum, and the raw per-season ranges are not
+# even ordered by season (2016 holds 1313-2628, 2019 holds 1-1312). Filtering the FILE LIST would
+# therefore renumber every surviving game, invalidating training/full_run_state.json,
+# training/subset_games.json and every results/<run>/holdout.json, and breaking the property that
+# holdout window 0 is byte-identical to the games v2-run1..4 scored. So the floor is applied to ROWS,
+# after the offset walk, by data_loading.load_training_corpus -- every id survives and only `pos` and
+# `boundary_idx` renumber.
+#
+# It is also why cleaned_csvs stays unfiltered, which makes the direction's own warning -- "cut the
+# training games, never the sidecar", the thing it calls the single easiest mistake to make -- true by
+# construction: player_priors and season_context walk cleaned_csvs directly, so the priors chain
+# still seeds 2008 from real 2007 production.
+#
+# None means no floor. The test suite sets None, because 18 test modules build 2003 fixtures.
+MIN_TRAIN_SEASON = 2008
+
 # --- Recency weighting (single full train: older seasons contribute less to the loss) ---
 # Every game still trains, but its loss weight decays with age so the modern game dominates the
 # gradient. Newest season = 1.0; weight halves every RECENCY_HALFLIFE_SEASONS seasons, floored at

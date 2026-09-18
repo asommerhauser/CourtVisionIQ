@@ -77,12 +77,19 @@ def season_offsets(data_dir) -> dict[Path, int]:
     return offsets
 
 
-def load_all_cleaned(data_dir, parse_rosters: bool = False) -> pd.DataFrame:
+def load_all_cleaned(data_dir, parse_rosters: bool = False, *,
+                     min_season: int | None = None) -> pd.DataFrame:
     """Concatenate all cleaned CSVs, keeping ``game_id`` globally unique across files.
 
     The numbering is ``season_offsets``'; see there for why it is not computed here any more.
     With ``parse_rosters`` the roster string-lists are decoded to real Python lists (what the
     box-score tool consumes).
+
+    ``min_season`` drops rows from seasons before it **after** the offset walk, so every surviving
+    game keeps the id it already had. Filtering the file list instead would renumber the whole
+    corpus; see ``config.MIN_TRAIN_SEASON``. ``None`` (the default) means the whole corpus, which is
+    what the box-score tool, the shell and the report stack want -- the floor is a *training* bound,
+    not a corpus one, so it is opt-in and ``load_training_corpus`` is the thing that opts in.
     """
     offsets = season_offsets(data_dir)
     frames = []
@@ -93,11 +100,41 @@ def load_all_cleaned(data_dir, parse_rosters: bool = False) -> pd.DataFrame:
     if not frames:
         raise FileNotFoundError(f"No cleaned CSVs found in {Path(data_dir).resolve()}")
     out = pd.concat(frames, ignore_index=True)
+    if min_season is not None and "season" in out.columns:
+        kept = out["season"].astype(int) >= int(min_season)
+        if not kept.any():
+            raise ValueError(
+                f"min_season={min_season} leaves no games: the cleaned data in "
+                f"{Path(data_dir).resolve()} spans seasons "
+                f"{int(out['season'].min())}-{int(out['season'].max())}")
+        out = out[kept].reset_index(drop=True)
     if parse_rosters:
         for col in (*ROSTER_STR_COLS, *REST_STR_COLS):
             if col in out.columns:
                 out[col] = out[col].apply(_parse_roster)
     return out
+
+
+def training_min_season() -> int | None:
+    """``config.MIN_TRAIN_SEASON``, read at call time.
+
+    Read here rather than imported at module scope on purpose: 3.0 lost a day to
+    ``from config import X`` freezing three knobs at import time, so switching one off in a test or
+    on the command line did nothing and the "feature disabled" path was silently untested.
+    """
+    import config
+    return getattr(config, "MIN_TRAIN_SEASON", None)
+
+
+def load_training_corpus(data_dir, parse_rosters: bool = False) -> pd.DataFrame:
+    """The corpus **as training sees it**: ``load_all_cleaned`` floored at the training season bound.
+
+    One name so the floor cannot be applied in some training paths and not others. Every head's
+    ``_load_all`` and ``training.chronology.game_index`` come through here; anything that genuinely
+    wants all 21 seasons -- the box-score validator, the shell, the priors sidecar, season context --
+    keeps calling ``load_all_cleaned`` and says so by doing it.
+    """
+    return load_all_cleaned(data_dir, parse_rosters, min_season=training_min_season())
 
 
 def _parse_roster(value):

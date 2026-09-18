@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 
 from config import BOUNDARY_CYCLE, HOLDOUT_GAMES, SEASONS_PER_STAGE, SEED, TEST_FRAC
-from data_loading import load_all_cleaned
+from data_loading import load_training_corpus
 
 
 def game_index(data_dir: str = "./data") -> pd.DataFrame:
@@ -36,7 +36,7 @@ def game_index(data_dir: str = "./data") -> pd.DataFrame:
     games precede that season's playoffs and dates break ties within a phase. ``season_reg_ordinal``
     is the 0-based rank among a season's regular games (−1 for playoff games).
     """
-    df = load_all_cleaned(data_dir)
+    df = load_training_corpus(data_dir)
     meta = df.groupby("game_id", sort=False).first().reset_index()[
         [c for c in ("game_id", "season", "playoff", "game_date") if c in df.columns]
     ]

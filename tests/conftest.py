@@ -63,6 +63,12 @@ def _restore_build_constants():
     """
     saved = {k: copy.deepcopy(getattr(_config, k))
              for k in _BUILD_CONSTANTS if hasattr(_config, k)}
+    # The training corpus floor is OFF for tests. 18 modules build 2003 fixtures, and the production
+    # floor of 2008 would empty every one of them -- so the default here is "no floor" and the tests
+    # that exercise the floor set it themselves. That keeps the floor's own behaviour explicitly
+    # tested rather than incidentally relied on.
+    if hasattr(_config, "MIN_TRAIN_SEASON"):
+        _config.MIN_TRAIN_SEASON = None
     yield
     for k, v in saved.items():
         setattr(_config, k, v)
