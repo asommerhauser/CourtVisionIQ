@@ -43,8 +43,19 @@ Carried forward from [`v3_progress.md`](v3_progress.md), with **rule 1 amended**
 | branch | workstream | retrain? | state |
 |---|---|---|---|
 | `v3.2/w0-spec` | direction, build guide, this tracker | no | **built** |
+| `v3.2/test-tiers` | WT: `pytest.ini` markers, two conftest fixtures | no | **built**, 49-test subset green |
+| `v3.2/priors-join` | W1: one definition of the `game_id` numbering | yes (sidecar rebuild) | **built**, 153 tests green |
 
-Nothing else yet.
+**W1 verified two ways.** `tests/test_player_priors.py` gains three tests that build a real sidecar
+over two season files carrying *the same raw ids* -- the case that used to collapse -- and assert the
+corpus is covered, that the causal seed chain still crosses the season boundary, and that a
+`--seasons` partial rebuild still lands on corpus ids. And `season_offsets("./data")` was compared
+against the offsets computed by replicating the original inline walk on the real 21-season corpus:
+**all 21 match exactly, so the numbering is unchanged.** That is what keeps the stored
+`holdout_game_ids` valid and window 0 comparable to v2-run1..4.
+
+**The on-disk sidecar is still stale** -- it was built with raw ids. The rebuild is deferred to W5,
+which changes the columns anyway, so it is paid once.
 
 ---
 

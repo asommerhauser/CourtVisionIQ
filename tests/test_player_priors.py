@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from data_loading import load_all_cleaned, season_offsets
 from player_priors import (
     LEAGUE_DEFAULTS,
     PLAYER_PRIOR_KEYS,
@@ -27,6 +28,8 @@ from player_priors import (
     TEAM_PRIOR_KEYS,
     PriorCarry,
     PlayerTotals,
+    build,
+    priors_dir,
     priors_for_season,
     shrink,
 )
@@ -231,3 +234,78 @@ def test_a_prior_vector_is_ordered_the_way_the_model_unstacks_it():
     frame = _season([_game(1, "2023-01-01")])
     players, _ = priors_for_season(frame, PriorCarry())
     assert list(players.columns[-N_PLAYER_PRIORS:]) == list(PLAYER_PRIOR_KEYS)
+
+
+# ------------------------------------------------------------------- the sidecar/corpus join
+
+def _write_season(tmp_path, label, games):
+    """One cleaned season CSV, written the way data_cleaner leaves it."""
+    path = tmp_path / f"season{label}.csv"
+    _season(games).to_csv(path, index=False)
+    return path
+
+
+def test_the_sidecar_is_keyed_the_way_the_corpus_is_numbered(tmp_path):
+    """The regression that made a real train abort before its first epoch.
+
+    Raw ``game_id`` values collide across season files, so ``load_all_cleaned`` shifts each file's
+    ids past every earlier file's maximum. ``build`` used to read each CSV directly and keep the raw
+    id, so the sidecar was keyed by per-season id and the corpus by cumulative id. On the real data
+    they agreed on 1,277 of 26,969 games -- season 2003, the only file whose offset is zero -- and
+    ``merge_prior_features`` raises on a sidecar that does not cover the corpus.
+
+    Both seasons here deliberately use the SAME raw ids, which is the case that used to collapse.
+    """
+    _write_season(tmp_path, "2003", [_game(500, "2003-01-01"), _game(501, "2003-01-02")])
+    _write_season(tmp_path, "2004", [_game(500, "2004-01-01"), _game(501, "2004-01-02")])
+
+    build(str(tmp_path), echo=None)
+
+    sidecar = pd.concat([pd.read_parquet(p)
+                         for p in sorted(priors_dir(str(tmp_path)).glob("players_*.parquet"))])
+    corpus_ids = set(int(g) for g in load_all_cleaned(str(tmp_path))["game_id"].unique())
+
+    assert len(corpus_ids) == 4, "two seasons of two games, renumbered so none collide"
+    assert corpus_ids <= set(int(g) for g in sidecar["game_id"]), (
+        "every game in the corpus must have priors under the id the corpus uses")
+
+
+def test_the_second_seasons_priors_still_seed_from_the_first(tmp_path):
+    """Offsetting must not disturb the causal seed chain.
+
+    ``build`` walks seasons ascending so each one seeds from the last, and it sorts by season label
+    while the numbering comes from file order. Those are two different sorts, so this pins that the
+    carry still crosses the season boundary: a player with a full first season does not read as a
+    debutant in the second.
+    """
+    _write_season(tmp_path, "2003", [_game(500, "2003-01-01", baskets=9),
+                                     _game(501, "2003-01-02", baskets=9)])
+    _write_season(tmp_path, "2004", [_game(500, "2004-01-01")])
+
+    build(str(tmp_path), echo=None)
+    second = pd.read_parquet(priors_dir(str(tmp_path)) / "players_2004.parquet")
+    opener = second[second["player"] == "H1"].iloc[0]
+
+    assert opener["prior_games"] == 0, "first game of a season has no in-season history"
+    assert opener["pts_36"] != pytest.approx(LEAGUE_DEFAULTS["pts_36"]), (
+        "with zero in-season games the prior IS the seed, so it must carry 2003 forward "
+        "rather than fall back to the league mean")
+
+
+def test_a_partial_rebuild_still_lands_on_corpus_ids(tmp_path):
+    """``--seasons`` rebuilds a subset, and its offsets come from the whole directory.
+
+    The offset for a file is a function of every file before it, so a partial rebuild that computed
+    offsets from only the requested seasons would write ids that no longer match the corpus -- the
+    same failure in a smaller disguise.
+    """
+    _write_season(tmp_path, "2003", [_game(500, "2003-01-01")])
+    _write_season(tmp_path, "2004", [_game(500, "2004-01-01")])
+
+    build(str(tmp_path), seasons=["2004"], echo=None)
+    only = pd.read_parquet(priors_dir(str(tmp_path)) / "players_2004.parquet")
+    offsets = season_offsets(str(tmp_path))
+    expected = 500 + offsets[tmp_path / "season2004.csv"]
+
+    assert set(int(g) for g in only["game_id"]) == {expected}
+    assert expected != 500, "the second file's offset is not zero, so the id must have moved"

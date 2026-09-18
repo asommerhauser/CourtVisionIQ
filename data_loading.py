@@ -39,20 +39,56 @@ def cleaned_csvs(data_dir) -> list[Path]:
     return out
 
 
+_OFFSET_CACHE: dict[tuple, dict[Path, int]] = {}
+
+
+def season_offsets(data_dir) -> dict[Path, int]:
+    """The per-file ``game_id`` offset that makes ids globally unique. **The** definition.
+
+    Raw ``game_id`` values collide across season files -- they are not even ordered by season
+    (2016 holds 1313-2628, 2019 holds 1-1312, 2003 holds 15556-16832) -- so each file's ids are
+    shifted past every earlier file's maximum. The numbering therefore depends only on the sorted
+    file order, and is stable for a given ``data_dir``.
+
+    This exists as its own function because it had two implementations and one of them was missing.
+    ``load_all_cleaned`` did the walk inline; ``player_priors.build`` read each season CSV directly
+    and applied no offset at all, so the priors sidecar was keyed by *per-season* id while every
+    training row carried the *cumulative* id. Measured over the real corpus, the two agreed on
+    **1,277 of 26,969 games** -- season 2003, the one file whose offset is zero -- and
+    ``prior_features.merge_prior_features`` raises on that, so a full train aborted before its first
+    epoch. A rule read in two places drifts; this is the one place.
+
+    Memoized on each file's (size, mtime) so the repeated ``load_all_cleaned`` calls across a
+    train's preprocess passes cost one extra column-only read, not one per call, and a re-clean
+    invalidates it.
+    """
+    paths = cleaned_csvs(data_dir)
+    key = tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in paths)
+    hit = _OFFSET_CACHE.get(key)
+    if hit is not None:
+        return dict(hit)
+    offsets: dict[Path, int] = {}
+    offset = 0
+    for p in paths:
+        offsets[p] = offset
+        ids = pd.read_csv(p, usecols=["game_id"])["game_id"].astype(int)
+        offset = int(ids.max()) + offset + 1
+    _OFFSET_CACHE[key] = dict(offsets)
+    return offsets
+
+
 def load_all_cleaned(data_dir, parse_rosters: bool = False) -> pd.DataFrame:
     """Concatenate all cleaned CSVs, keeping ``game_id`` globally unique across files.
 
-    Each file's ``game_id`` is offset by the running max so ids never collide across
-    seasons; the numbering depends only on the (sorted) file order, so it is stable for a
-    given ``data_dir``. With ``parse_rosters`` the roster string-lists are decoded to real
-    Python lists (what the box-score tool consumes).
+    The numbering is ``season_offsets``'; see there for why it is not computed here any more.
+    With ``parse_rosters`` the roster string-lists are decoded to real Python lists (what the
+    box-score tool consumes).
     """
+    offsets = season_offsets(data_dir)
     frames = []
-    offset = 0
     for p in cleaned_csvs(data_dir):
         df = pd.read_csv(p)
-        df["game_id"] = df["game_id"].astype(int) + offset
-        offset = int(df["game_id"].max()) + 1
+        df["game_id"] = df["game_id"].astype(int) + offsets[p]
         frames.append(df)
     if not frames:
         raise FileNotFoundError(f"No cleaned CSVs found in {Path(data_dir).resolve()}")
