@@ -339,6 +339,10 @@ class EventTimeModel:
         # 1) Build (or load) the shared vocab language, then FREEZE it so token IDs
         #    are stable and unseen values map to UNK rather than mutating the space.
         if rebuild_vocabs:
+            # The alias map is written by the subset extract, which runs AFTER this object
+            # was constructed -- so re-read it before any name is registered, or the floor
+            # silently does nothing. See Encoder.prepare_for_rebuild.
+            self.encoder.prepare_for_rebuild()
             for col, src in ROSTER_COLS.items():
                 df[src].apply(self.encoder.encode_roster)
             for field in CATEGORICAL_FIELDS:

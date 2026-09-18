@@ -135,6 +135,10 @@ class ConditionalTimeModel(SubstitutionModel):
         df = self._load_all()  # raw cleaned stream (no opening-sub augmentation)
 
         if rebuild_vocabs:
+            # The alias map is written by the subset extract, which runs AFTER this object
+            # was constructed -- so re-read it before any name is registered, or the floor
+            # silently does nothing. See Encoder.prepare_for_rebuild.
+            self.encoder.prepare_for_rebuild()
             for col, src in ROSTER_COLS.items():
                 df[src].apply(self.encoder.encode_roster)
             for field in CATEGORICAL_FIELDS:

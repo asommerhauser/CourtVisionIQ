@@ -210,3 +210,46 @@ def test_the_pre_flight_is_a_no_op_without_a_floor(tmp_path):
 def test_the_pre_flight_reports_how_many_are_aliased(tmp_path):
     save_aliases(tmp_path, {"a": "ANON_0", "b": "ANON_0"}, floor=20)
     assert require_player_floor(tmp_path, 20) == 2
+
+
+def test_a_rebuild_picks_up_a_map_written_after_the_encoder_was_constructed(tmp_path):
+    """**The ordering gap the pre-flight cannot see.**
+
+    A head's ``Encoder`` is built when the head object is created, which is *before*
+    ``full_run.train`` extracts the subset -- and the extract is what writes ``anon_slots.json``. So at
+    construction the map is legitimately empty. A rebuild that trusted that in-memory copy would
+    register every below-floor player under his own name and the floor would do nothing.
+
+    Nothing else catches it: ``require_player_floor`` checks the FILE, which exists;
+    ``assert_aliases_absent`` returns early on an empty map; and the only symptom is an embedding table
+    that did not shrink. Without ``prepare_for_rebuild`` this test fails.
+    """
+    enc = Encoder(vocab_dir=tmp_path)
+    assert enc.aliases == {}, "nothing on disk yet, which is the normal case at construction"
+
+    save_aliases(tmp_path, {"fringe": "ANON_0"}, floor=20)   # the extract runs
+    enc.prepare_for_rebuild()                                # what the rebuild branch now does
+
+    enc.encode_roster(["star", "fringe"])
+    enc.freeze_all()
+    assert "fringe" not in enc.player_vocab.string_to_token, (
+        "the floor must apply to the vocab this rebuild writes")
+    assert enc.encode_player("fringe") == enc.encode_player("ANON_0")
+
+
+def test_every_rebuild_branch_refreshes_the_alias_map():
+    """All six heads own a rebuild branch, and each must refresh -- not just the vocab owner.
+
+    ``event_time`` is the only head that runs with ``rebuild_vocabs=True`` in a full train today, but
+    that is a property of ``models.pipeline``'s routing rather than of these call sites, and a single
+    head left out would be a silent floor rather than a failure.
+    """
+    import pathlib
+    heads = ["event_time_model", "player_model", "conditional_time_model",
+             "conditional_type_model", "substitution_model", "sub_decision_model"]
+    for head in heads:
+        src = pathlib.Path("models") / f"{head}.py"
+        text = src.read_text(encoding="utf-8")
+        i = text.index("if rebuild_vocabs:")
+        window = text[i:i + 700]
+        assert "prepare_for_rebuild()" in window, f"{head} rebuilds without refreshing the aliases"
