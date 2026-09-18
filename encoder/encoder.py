@@ -141,6 +141,23 @@ class Encoder:
         self.save_all()
         return self
 
+    def prepare_for_rebuild(self) -> "Encoder":
+        """Re-read the alias map before a vocab rebuild registers any name.
+
+        The ordering this exists for: an ``Encoder`` is constructed when a head object is created, which
+        is BEFORE ``full_run.train`` extracts the subset -- and the extract is what writes
+        ``anon_slots.json``. So at construction the map is legitimately empty, and a rebuild that trusted
+        the in-memory copy would register every below-floor player under his own name and the floor would
+        do nothing at all.
+
+        Nothing else would notice. ``require_player_floor`` checks that the FILE exists, which it does;
+        ``assert_aliases_absent`` returns early when the in-memory map is empty; and the only symptom
+        would be an embedding table that did not shrink. The ``load_all`` path already refreshes, so this
+        is the rebuild branch's half of the same contract.
+        """
+        self.aliases = load_aliases(self.vocab_dir)
+        return self
+
     def save_all(self) -> None:
         for v in self.vocabs.values():
             v.save()

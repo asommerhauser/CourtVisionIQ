@@ -50,6 +50,7 @@ Carried forward from [`v3_progress.md`](v3_progress.md), with **rule 1 amended**
 | `v3.2/vocab-floor` | W4: the floor, and anonymous slots by graph colouring | yes | **built**, 20 new tests; verified on the real corpus |
 | `v3.2/prior-scalars` | W5: three rates, career stage, deltas; 14 -> 21 scalars | yes | **built**, sidecar rebuilt |
 | `v3.2/film-context` | W6: per-block scale and shift from a game-context vector | yes | **built**, identity at init verified |
+| `v3.2/vocab-floor-refresh` | W4 fix: reload the alias map before a vocab rebuild | yes | **built**, guard verified by breaking it |
 | `v3.2/subset-all-heads` | W3: all twelve heads on the subset; coverage retired | yes | **built**, 124 tests green |
 
 **W1 verified two ways.** `tests/test_player_priors.py` gains three tests that build a real sidecar
@@ -243,6 +244,16 @@ luck: it marks the ids that actually appear in a game, so the anonymous tokens p
 and the rest are not. The `UNK`-is-samplable worry that motivated the whole design disappears, because
 no real player maps to `UNK` any more. Verified end to end — `PAD` and `UNK` both read 0, and two
 anonymous players sharing a game get distinct available ids.
+
+**A third gap, found by tracing the handover order rather than by reading the code.** A head's `Encoder`
+is constructed when the head object is created, which is **before** `full_run.train` extracts the subset
+— and the extract is what writes `anon_slots.json`. So at construction the map is legitimately empty, and
+a rebuild trusting that in-memory copy would register every below-floor player under his own name and the
+floor would do nothing. **None of the existing guards see it:** `require_player_floor` checks the file,
+which exists; `assert_aliases_absent` returns early on an empty map; and the only symptom is an embedding
+table that did not shrink. `Encoder.prepare_for_rebuild()` re-reads the map, and all six heads' rebuild
+branches call it — with a test that greps for it in each, verified to fail when the call is removed from
+one head.
 
 **Two silent failures made loud.** `Encoder.freeze_all` refuses a vocab that still holds a row for an
 aliased player: `Vocab` is append-only, so a rebuild over a pre-floor vocab would keep every below-floor
