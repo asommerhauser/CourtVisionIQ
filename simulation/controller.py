@@ -313,6 +313,10 @@ class GameController:
         event = self.sim._masked_sample(pred["event_logits"], allowed,
                                         self.sim.encoder.encode_event, greedy=self.greedy,
                                         temperature=config.EVENT_TEMPERATURE, bias=config.EVENT_BIAS)
+        # 3.2 W10. The event head samples from here rather than from a predict_* wrapper, so the hook
+        # lives here too -- and this is the head whose own output histogram W9 scores, which makes it
+        # the one decision the replay pass can least afford to miss.
+        self.sim._log_decision("event_time", "event_output", event)
         return event, pred["delta_seconds"]
 
     def _advance_for(self, event: str, actor: str | None, marginal: float, *,
