@@ -40,6 +40,9 @@ Carried forward from [`v3_progress.md`](v3_progress.md), with **rule 1 amended**
 
 ## What is built
 
+**All twelve workstreams are built.** Branches below in the order they were merged; every one is a
+`--no-ff` merge onto `feature/version3.2`.
+
 | branch | workstream | retrain? | state |
 |---|---|---|---|
 | `v3.2/w0-spec` | direction, build guide, this tracker | no | **built** |
@@ -51,6 +54,12 @@ Carried forward from [`v3_progress.md`](v3_progress.md), with **rule 1 amended**
 | `v3.2/prior-scalars` | W5: three rates, career stage, deltas; 14 -> 21 scalars | yes | **built**, sidecar rebuilt |
 | `v3.2/film-context` | W6: per-block scale and shift from a game-context vector | yes | **built**, identity at init verified |
 | `v3.2/vocab-floor-refresh` | W4 fix: reload the alias map before a vocab rebuild | yes | **built**, guard verified by breaking it |
+| `v3.2/cross-roster` | W7: each lineup attends over the other before pooling | yes | **built**, 13 tests; 87-test graph/persistence run green |
+| `v3.2/rung2-bridge` | W8: the three missing pieces of checkpoint selection | no | **built**, 29 tests |
+| `v3.2/head-metrics` | W9: twelve heads, twelve metrics, measured normalisers | no | **built**, 21 tests |
+| `v3.2/decision-log` | W10: what each head sampled, per sim | no | **built**, 20 tests |
+| `v3.2/weighted-replay` | W11: advantages, the filter, the weight channel | no | **built**, 20 tests |
+| `v3.2/ab-harness` | W12: three arms, paired statistics, run-state records | no | **built**, 18 tests |
 | `v3.2/subset-all-heads` | W3: all twelve heads on the subset; coverage retired | yes | **built**, 124 tests green |
 
 **W1 verified two ways.** `tests/test_player_priors.py` gains three tests that build a real sidecar
@@ -329,7 +338,59 @@ because both avoid a `Lambda` in a graph that has to reload by name. And the sea
 The per-head name test now passes `film=config.FILM_ENABLED`. With `film=False` the non-FiLM names are
 still present and still in order, so the assertion would have passed while checking nothing about W6.
 
-### 6. Coverage-completeness is retired, and the sampler gets its first tests
+### 6. Cross-roster attention needed the encoder split, and MAB needed a wrapper
+
+§5.2 says "``layers/mab.py`` already has the block", which is true and not sufficient. `MAB` was written
+for cross-attention -- `call(X, Y)` already means "X attends to Y" -- but had **never been used that
+way**: `SAB` passes `Y = X` and `PMA` passes learned seeds, and there is no `tests/test_mab.py`, so the
+path it exists for was entirely unexercised. Three consequences, each of which bites in a functional
+graph: no `compute_output_shape` (and a second positional tensor is not in the standard `inputs` slot, so
+Keras has nothing to infer from), lazily-created variables (which under `load_weights` means saved weights
+have nowhere to land), and post-norm against a pre-norm backbone.
+
+The last one turns out to be fine, but only because of *where* this sits: inside the roster encoder, among
+the post-norm `SAB` layers it was designed alongside, rather than spliced into the residual stream.
+
+And **"before pooling" forced a split**. Cross-attention needs both sides' slots live at the same moment,
+and a layer that returns a pooled vector has already thrown them away -- so `RosterSetEncoder` grew
+`encode_slots` and `pool_slots`, with `call` now exactly those two in sequence and a test asserting the
+split changed nothing about what it computes.
+
+### 7. The A/B thresholds needed the paired difference sd, not a single run's
+
+A correction caught by trying to reproduce §7.2's table and failing. **0.174 is one run's per-game Brier
+sd**; a comparison rests on the sd of the per-game *difference*, which is about half that because two arms
+on the same games make correlated errors. §9.2 records the measurement that pins it: paired run3-vs-run4
+came to ±0.0109 at one standard error over their 64 shared games, so the difference sd is
+0.0109 × √64 ≈ **0.087**. With both constants the harness reproduces all three published figures.
+
+Using the single-run figure for a paired comparison would have **doubled the threshold and hidden every
+gain 3.2 expects**.
+
+One discrepancy recorded rather than silently fixed: a strictly-correct unpaired comparison of two
+independent runs carries a further √2, making that row 0.049 rather than §7.2's 0.036. The 0.036 is 2 SE of
+a *single* run's Brier, which is the form §9.2 recorded and the project's documents quote, so it is
+reproduced as recorded with the discrepancy named in the docstring.
+
+### 8. Two pieces of the replay pass turned out to be free
+
+§4.2 describes logging context tensors and building a weighted pass. Both are smaller than that.
+
+**The labels need no construction.** A sim's play-by-play *is* what the model sampled, so running it
+through the ordinary preprocess yields "what this sim did" as targets.
+
+**The weight needs no new machinery.** Every head already multiplies its loss mask by a per-game weight
+through `season_features.apply_recency`, which reads `split["recency_weight"]` — so an advantage is that
+existing channel with a different number in it, and all twelve heads already honour it. A test runs the
+result through `apply_recency` to prove the two actually meet.
+
+What is *not* free is the context: `build_model_inputs` serves a dict memoised per row and shared across
+the ~5 head calls at one position, and the prior columns alone run to megabytes per position at
+`SEQ = 600`. So the decision log is a thin index and the context is re-derived — which is also why the log
+is written *beside* `playbyplay/` rather than inside it, since `harvest.py` prunes that directory and would
+take the labels with it.
+
+### 9. Coverage-completeness is retired, and the sampler gets its first tests
 
 §2.2 argues the guarantee is inert under a minimum-games floor: anyone it rescues with a single game
 falls below the floor anyway, and it drags old games into a deliberately modern-heavy sample to do it.
@@ -353,7 +414,7 @@ conditional heads, which was true of nothing, because `timeout_team` already tra
 what W4's floor reads; and `extract` prints the distribution plus a kept/anonymous table at floors
 10-30, so the floor is chosen against the real histogram rather than the estimate in measurement 2.
 
-### 7. The replay estimator keeps only positive advantages
+### 10. The replay estimator keeps only positive advantages
 
 §4.2: "the advantage is the sample weight. Positive advantage reinforces those choices, negative makes
 them less likely." A negative weight on cross-entropy is `-w·log p` with `w < 0`, which is **minimized
@@ -363,7 +424,7 @@ constants that cannot be tuned inside a single 3.2 GPU-hour pass. Filtering to t
 their nine siblings is bounded by construction, needs no hyper-parameters, and never pushes away from
 anything.
 
-### 8. Two §4 citations corrected rather than implemented
+### 11. Two §4 citations corrected rather than implemented
 
 - §4.4 rule 2 says to "drop `seconds` from the team aggregate entirely" and that "`eval_metrics`
   already says this in its headline block". **`_BOX_ACCURACY_STATS`
@@ -378,7 +439,7 @@ anything.
   The other ten heads' queried positions are event-token-gated (`next_event == <token>`) and much
   sparser, so the decision log is defined per head from its own sampling call.
 
-### 9. Rung 2 stays scoped to `event_time`
+### 12. Rung 2 stays scoped to `event_time`
 
 §4.6 prices the bridge at one day. `rollout_score_fn` exists only on `EventTimeModel.train`
 (`models/event_time_model.py:711`); the other five head classes have the identical signature without
@@ -419,22 +480,120 @@ Each would have surfaced as a failure or a silent constant in the first real 3.0
 
 ## Handover — the WSL/CUDA sequence
 
-Filled in as the build lands. The shape it will take:
+Everything in §3–§5 of the build is in the tree and green locally. What is left needs a GPU.
+
+**Read the ordering note first.** `training.subset extract` reads `training/full_run_state.json`, which
+only `FullRun.setup` writes — and `setup` runs as part of `train.py --full`. So the extract cannot precede
+the first setup, and it does not need to: `train()` extracts the subset itself when the manifest is absent,
+*before* the vocab rebuild, which is the order W4's floor requires. The explicit extract below exists only
+so the games-per-player histogram can be read and the floor confirmed before hours of training start.
 
 ```bash
 cd /mnt/c/Projects/CourtVisionIQ
 git checkout feature/version3.2 && git pull
 source ~/cviq-venv/bin/activate
-python -m pytest -q -m ""                 # every tier; the local tier is already green here
-python -m player_priors                   # W1 + W5: rebuild the sidecar (~10 min, no GPU)
-python -m training.subset extract         # W2 + W3: the cut subset, and the per-player game counts
-rm encoder/vocabs/*.json                  # W4: Vocab is append-only; it must be deleted to shrink
-python train.py --full --name version3.2 --batch-size 64 --rebuild-vocabs
-python train.py --extend-holdout          # pool 100 -> 700
-python evaluate.py --model version3.2 --run v32-run1 --window 0 --monte-carlo 200 --procs auto
-python -m reporting.state_probes results/version3.2/v32-run1 --seasons 2023
 ```
 
-**Check the real games-per-player histogram from `training/subset_games.json` before the train** and
-confirm `MIN_PLAYER_SUBSET_GAMES`. Measurement 2 is an expected-exposure estimate; the extraction is
-the number.
+```bash
+# 1. The suite, every tier. The local tier (901 tests) is already green on the dev box; this adds the
+#    49 `slow` ones, which are the graph-heavy modules -- 87 tests including them took 29 minutes there.
+python -m pytest -q -m ""
+```
+
+```bash
+# 2. The priors sidecar. Already rebuilt on the dev box with W1's fix and W5's seventeen columns, so this
+#    is only needed if data/ moved or was re-cleaned. Pure pandas, ~13 min, no GPU.
+#    Gate: it must report 26,969 games covered. Before W1 it covered 1,277.
+python -m player_priors
+```
+
+```bash
+# 3. Set up the run under the 2011 floor. boundary_idx moves (it is a POSITION and 6,100 games left the
+#    pool); the holdout game IDS do not, which is what keeps window 0 comparable to v2-run1..4.
+python train.py --full --name version3.2 --batch-size 64 --rebuild-vocabs
+```
+
+**Before step 3, two things that cannot be recovered afterwards.**
+
+```bash
+# 3a. Vocab is APPEND-ONLY, so it must be deleted or the floor cannot shrink it. Encoder.freeze_all now
+#     refuses a stale vocab by name, so this fails loudly rather than silently training a 2,152-row table.
+rm encoder/vocabs/*.json
+```
+
+```bash
+# 3b. Read the REAL games-per-player histogram and confirm the floor. Measurement 2 is an expected-exposure
+#     estimate (subset ~5,374 games, median 34 games a player, 959 rows kept at a floor of 20); the
+#     extraction is the number. `extract` prints the distribution and a kept/anonymous table at floors
+#     10-30. Change MIN_PLAYER_SUBSET_GAMES now if the real histogram disagrees -- after the train it is a
+#     retrain.
+python -m training.subset extract
+```
+
+**Expected at the start of step 3**, in order: the priors coverage line, `subset heads [all twelve]`,
+`vocabulary floor 20: N players aliased to anonymous slots`, then the vocab rebuild. If the floor line is
+missing, `anon_slots.json` was not written and the floor is doing nothing — that is what
+`require_player_floor` refuses, so it should not be possible to get past it silently.
+
+```bash
+# 4. Widen the holdout pool 100 -> 700. Passes extend_holdout's prefix guard untouched.
+python train.py --extend-holdout
+```
+
+```bash
+# 5. Arm 1: the retrained bundle. Window 0 is the same 100 games v2-run1..4 scored.
+python evaluate.py --model version3.2 --run v32-a1 --window 0 --monte-carlo 200 --procs auto
+python -m reporting.state_probes results/version3.2/v32-a1 --seasons 2023
+```
+
+**Read the probes here, not Brier.** Brier moves least and that is structural: the winner is mostly decided
+by pre-game team strength, which lives in the priors, not by how faithfully the fourth quarter composes.
+The four numbers that matter are the 3rd- and 4th-foul benching rates (0.238 and 0.280 against a real
+0.776 and 0.961), the 4th-foul event rate (9.5× too high), and the Q4 blowout rotation ratio (0.838
+against 0.525).
+
+```bash
+# 6. Arm 2: rung 2. ROLLOUT_SELECTION is already True, and setup wrote train_tail_game_ids, so a second
+#    pass over the finished bundle now scores rollouts and records epochs_disagree in the run state.
+python train.py --model event_time --name version3.2
+python evaluate.py --model version3.2 --run v32-a2 --window 0 --monte-carlo 200 --procs auto
+```
+
+**Hold the seed fixed across arms.** §8's "repeat runs use a different `--seed`" is for repeats of one
+model; this is a model comparison, where a shared seed makes both arms face the same Monte-Carlo draw. The
+harness refuses a mismatched pair, and the run log should say why.
+
+```bash
+# 7. Arm 3: the KPI replay pass, then the final paired evaluation at 700 games.
+#    An expected Brier gain of 0.005-0.015 is borderline at 100 games (2 SE = 0.017) and clears the floor
+#    at 700 (0.007), which is the whole argument for the wider pool.
+python evaluate.py --model version3.2 --run v32-a3 --monte-carlo 200 --procs auto
+```
+
+### Gates, in order
+
+- **W1** — `require_priors` reports 26,969 games. Already verified on the dev box.
+- **W2–W5** — no gate of their own; read off `v3_2_direction.md` §7. Expect the cut to be neutral, and
+  watch the rookie / role-shifter row (+10.9% / +24.0% against the season average), which is where the
+  seven new scalars and the vocabulary floor either pay or do not. If it comes back **worse**, the first
+  suspect is the four big heads moving onto the subset (departure in `config.py`, stated when taken).
+- **W6** — context modulation must not worsen any probe. It starts as an exact identity, so any change is
+  learned rather than an initialisation artifact.
+- **W7** — scored on spread MAE.
+- **W8** — records `epochs_disagree`. That number is rung 3's original firing condition; 3.2 builds rung 3
+  anyway, so it is now evidence rather than a gate.
+- **W11** — must improve rollout CRPS and the foul and rotation probes on games the pass never saw, and
+  must **not** worsen margin dispersion. If dispersion worsens, `ROLLOUT_SCORE_DISPERSION_WEIGHT` failed
+  and the pass found the collapse-the-spread shortcut.
+
+### Known-open, deliberately
+
+- **Nine changes land in one retrain** (the corpus cut, the vocabulary floor, seven scalars, two layers,
+  plus 3.0's priors / running pace / regime latent / rung 1, none of which ever trained). A gain cannot be
+  attributed among them. Accepted; §5.3's multi-scale time is held for 3.3 to stop it becoming ten.
+- **`pf_36` and the foul objective land together**, so if the foul probes move, the two are confounded.
+- **Batched-rollout throughput under the new layers is unmeasured.** Every figure in §6.2 scales with the
+  37 GPU-min per 1,000 sims measured on the 3.0 graph at `ROLLOUT_BATCH_SIZE = 48`.
+- **A name absent from the training corpus still encodes as `UNK`**, so two genuinely unseen players on
+  one floor remain ambiguous. Pre-existing, and it only bites upcoming-season inference, where such a
+  player has no priors either.
