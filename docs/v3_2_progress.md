@@ -48,6 +48,7 @@ Carried forward from [`v3_progress.md`](v3_progress.md), with **rule 1 amended**
 | `v3.2/corpus-cut` | W2: corpus floor, applied to rows | yes | **built**, 165 tests green |
 | `v3.2/corpus-cut-2011` | W2a: the floor moves 2008 -> 2011 | yes | **built** |
 | `v3.2/vocab-floor` | W4: the floor, and anonymous slots by graph colouring | yes | **built**, 20 new tests; verified on the real corpus |
+| `v3.2/prior-scalars` | W5: three rates, career stage, deltas; 14 -> 21 scalars | yes | **built**, sidecar rebuilt |
 | `v3.2/subset-all-heads` | W3: all twelve heads on the subset; coverage retired | yes | **built**, 124 tests green |
 
 **W1 verified two ways.** `tests/test_player_priors.py` gains three tests that build a real sidecar
@@ -243,7 +244,44 @@ with no alias map on disk.
 so two genuinely unseen players on the same floor remain ambiguous. That is pre-existing behaviour and
 only bites upcoming-season inference, where such a player has no priors either.
 
-### 4. Coverage-completeness is retired, and the sampler gets its first tests
+### 4. The seven new scalars split into rates and derived, and only the rates are shrunk
+
+§3.3 and §3.4 list seven additions and treat them alike. They are not alike, and the implementation
+says so: `PLAYER_RATE_KEYS` holds the thirteen shrunk rates, `PLAYER_DERIVED_KEYS` holds `career_stage`
+and the three deltas. `shrink`'s default `keys` narrows to the rates accordingly — shrinking a career
+year toward a seed is meaningless, and a delta is *already* a difference of two shrunk quantities.
+
+**Each delta is taken against the seed** (last season's final rate) from the shrunk current rate, so on
+opening night the shrunk rate still is the seed and the delta reads zero, growing as the season
+accumulates evidence. That is the honest shape for "has his role changed": not yet known. A player with
+no previous season gets exactly 0.0 rather than a delta against the league mean — which would be a
+statement about how good he is wearing the clothes of a statement about change, and indistinguishable
+from a real role shift.
+
+**Two things the tests caught rather than the reading.**
+
+`career_stage` for a debutant is **0.0, not the league default**. The cold-start test asserted that
+every key equals `LEAGUE_DEFAULTS`, and it failed — correctly. A player in his first season *is* at
+stage 0; `LEAGUE_DEFAULTS["career_stage"] = 4.5` is what an *unknown name* reads through
+`_DEFAULT_PLAYER`, which is a different situation (no record at all, versus a record saying "season
+one"). The test now says both, and the distinction is the point of the input.
+
+And the test fixture stamped `season=2023` on every row regardless of which season file it was written
+to, so `career_stage` read 0 everywhere and the new tests failed for a fixture reason rather than a code
+one. Worth recording because the same fixture is now used by W1's join tests.
+
+**Normalization divisors are measured, not guessed**, since a test asserts an average player reads near
+1.0: `ft_pct` 0.78, `tp_pct` 0.36, `pf_36` 2.95 (2022-23 via `generate_box_score`: 0.7825 / 0.3600 /
+2.9689), `career_stage` 4.5 (mean 4.84 over 2011+ player-games, median 4). The three deltas centre on
+0.0 and are excluded from the [0.4, 1.6] band — a narrowing, not a weakening, since the band is a claim
+about rates. Shifting them to centre on 1.0 was rejected: it would make "no change" indistinguishable
+from "no information".
+
+**`feature_mismatch` finally has a caller.** It was written in 3.0 and tested, but nothing called it, so
+the 14 -> 21 change would have surfaced as a raw Keras kernel-shape error from `scalar_proj`.
+`shell/actions._check_features` now runs beside `_check_arch` on every load.
+
+### 5. Coverage-completeness is retired, and the sampler gets its first tests
 
 §2.2 argues the guarantee is inert under a minimum-games floor: anyone it rescues with a single game
 falls below the floor anyway, and it drags old games into a deliberately modern-heavy sample to do it.
@@ -267,7 +305,7 @@ conditional heads, which was true of nothing, because `timeout_team` already tra
 what W4's floor reads; and `extract` prints the distribution plus a kept/anonymous table at floors
 10-30, so the floor is chosen against the real histogram rather than the estimate in measurement 2.
 
-### 5. The replay estimator keeps only positive advantages
+### 6. The replay estimator keeps only positive advantages
 
 §4.2: "the advantage is the sample weight. Positive advantage reinforces those choices, negative makes
 them less likely." A negative weight on cross-entropy is `-w·log p` with `w < 0`, which is **minimized
@@ -277,7 +315,7 @@ constants that cannot be tuned inside a single 3.2 GPU-hour pass. Filtering to t
 their nine siblings is bounded by construction, needs no hyper-parameters, and never pushes away from
 anything.
 
-### 6. Two §4 citations corrected rather than implemented
+### 7. Two §4 citations corrected rather than implemented
 
 - §4.4 rule 2 says to "drop `seconds` from the team aggregate entirely" and that "`eval_metrics`
   already says this in its headline block". **`_BOX_ACCURACY_STATS`
@@ -292,7 +330,7 @@ anything.
   The other ten heads' queried positions are event-token-gated (`next_event == <token>`) and much
   sparser, so the decision log is defined per head from its own sampling call.
 
-### 7. Rung 2 stays scoped to `event_time`
+### 8. Rung 2 stays scoped to `event_time`
 
 §4.6 prices the bridge at one day. `rollout_score_fn` exists only on `EventTimeModel.train`
 (`models/event_time_model.py:711`); the other five head classes have the identical signature without
