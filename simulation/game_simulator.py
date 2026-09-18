@@ -571,6 +571,20 @@ class GameSimulator:
         out = _compiled_forward(cache, model, model_key, inputs)
         return {k: np.asarray(v) for k, v in out.items()}
 
+    def _log_decision(self, head: str, output: str, token) -> None:
+        """Record one sampled decision, if this sim is logging (3.2 W10).
+
+        A no-op by default: ``decision_log`` is None on every path except a KPI rollout, so the ordinary
+        eval carries no cost beyond an attribute lookup. The position is the decision index -- the same
+        ``n - 1`` the heads read their logits at -- so a replay of this sim's play-by-play through
+        preprocess lands on the row the head was actually asked about.
+        """
+        log = getattr(self, "decision_log", None)
+        if log is None:
+            return
+        n = min(len(self.history), self.sequence_length)
+        log.record(head, output, n - 1, token)
+
     def _head_logits(self, key: str, output_name: str, inputs: dict) -> np.ndarray:
         """Run a loaded head and return its logits at the decision position (n-1)."""
         n = min(len(self.history), self.sequence_length)
@@ -589,8 +603,12 @@ class GameSimulator:
         temperature = config.SUB_TEMPERATURE if temperature is None else temperature
         inputs = self._next_step_inputs(outgoing=None, delta_seconds=delta_seconds)
         logits = self._head_logits(PlayerModel.KEY, "player_output", inputs)
-        return self._constrained_sample(logits, candidates, greedy=greedy,
+        pick = self._constrained_sample(logits, candidates, greedy=greedy,
                                         temperature=temperature, bias=outgoing_bias)
+        # The player head, but asked "who comes off" rather than "who acts". Logged under the head that
+        # produced it, because that is the head the replay pass would train.
+        self._log_decision(PlayerModel.KEY, "player_output", pick)
+        return pick
 
     def predict_incoming(self, outgoing: str, candidates: list[str], *,
                          delta_seconds: float = 0.0, greedy: bool = False,
@@ -605,7 +623,9 @@ class GameSimulator:
             temperature = config.SUB_INCOMING_TEMPERATURE
         inputs = self._next_step_inputs(outgoing=outgoing, delta_seconds=delta_seconds)
         logits = self._head_logits(SubstitutionModel.KEY, "secondary_player_output", inputs)
-        return self._constrained_sample(logits, candidates, greedy=greedy, temperature=temperature)
+        pick = self._constrained_sample(logits, candidates, greedy=greedy, temperature=temperature)
+        self._log_decision(SubstitutionModel.KEY, "secondary_player_output", pick)
+        return pick
 
     def sample_substitution(self, *, team: str | None = None, delta_seconds: float = 0.0,
                             greedy: bool = False,
@@ -653,9 +673,9 @@ class GameSimulator:
         output = _SUBDEC_HOME if team == HOME else _SUBDEC_AWAY
         logits = self._head_logits(SubDecisionModel.KEY, output, inputs)
         probs = _softmax(np.asarray(logits, dtype=np.float64))
-        if greedy:
-            return int(np.argmax(probs))
-        return int(self.rng.choice(len(probs), p=probs / probs.sum()))
+        count = int(np.argmax(probs)) if greedy             else int(self.rng.choice(len(probs), p=probs / probs.sum()))
+        self._log_decision(SubDecisionModel.KEY, output, count)
+        return count
 
     # ===================================================================== #
     # --- Conditional heads (player / type / result) for the rollout       --
@@ -672,7 +692,9 @@ class GameSimulator:
         """
         inputs = self._conditioned_inputs(next_event=next_event, delta_seconds=delta_seconds)
         logits = self._head_logits(PlayerModel.KEY, "player_output", inputs)
-        return self._constrained_sample(logits, candidates, greedy=greedy, temperature=temperature)
+        pick = self._constrained_sample(logits, candidates, greedy=greedy, temperature=temperature)
+        self._log_decision(PlayerModel.KEY, "player_output", pick)
+        return pick
 
     def predict_type(self, key: str, next_event: str, next_player: str, allowed: list[str], *,
                      delta_seconds: float = 0.0, greedy: bool = False,
@@ -694,8 +716,10 @@ class GameSimulator:
                                           next_player=next_player)
         logits = self._head_logits(key, "type_output", inputs)
         eff_bias = {**config.TYPE_BIAS.get(key, {}), **(bias or {})} or None
-        return self._masked_sample(logits, allowed, self.encoder.encode_type, greedy=greedy,
+        pick = self._masked_sample(logits, allowed, self.encoder.encode_type, greedy=greedy,
                                    temperature=temperature, bias=eff_bias)
+        self._log_decision(key, "type_output", pick)
+        return pick
 
     def predict_result(self, next_player: str, next_type: str, allowed: list[str], *,
                        delta_seconds: float = 0.0, greedy: bool = False,
@@ -712,8 +736,10 @@ class GameSimulator:
         inputs = self._conditioned_inputs(next_event="shot", delta_seconds=delta_seconds,
                                           next_player=next_player, next_type=next_type)
         logits = self._head_logits("shot_result", "result_output", inputs)
-        return self._masked_sample(logits, allowed, self.encoder.encode_result, greedy=greedy,
+        pick = self._masked_sample(logits, allowed, self.encoder.encode_result, greedy=greedy,
                                    temperature=temperature, bias=bias)
+        self._log_decision("shot_result", "result_output", pick)
+        return pick
 
     def predict_delta(self, next_event: str, next_player: str, *,
                       delta_seconds: float = 0.0) -> float:

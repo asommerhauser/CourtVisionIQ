@@ -256,7 +256,9 @@ def run_jobs_batched(master: GameSimulator, jobs: list[GameJob], *, batch_size: 
                      greedy: bool = False, show_progress: bool = True,
                      progress: _Progress | None = None,
                      on_complete: Callable[[int, list[dict]], None] | None = None,
-                     keep_histories: bool = True) -> list[list[dict] | None]:
+                     keep_histories: bool = True,
+                     decisions_out: list | None = None,
+                     job_identity: Callable[[int], tuple] | None = None) -> list[list[dict] | None]:
     """Run ``jobs`` on a pool of ``batch_size`` concurrent slots; return histories in job order.
 
     ``batch_size`` is the number of games in flight at once (the VRAM knob), **not** a cohort
@@ -279,6 +281,14 @@ def run_jobs_batched(master: GameSimulator, jobs: list[GameJob], *, batch_size: 
     A job that raises is logged and skipped; its slot keeps pulling work. That matters more than it
     sounds: a slot that dies never comes back, so one bad sim used to narrow the pool for the rest
     of a multi-hour run.
+
+    ``decisions_out`` (3.2 W10, a caller-owned ``[None] * len(jobs)``) is filled with each worker's own
+    ``DecisionLog``, following the same out-parameter shape as ``boxes_out`` so the return type is
+    unchanged for every existing caller. One log per worker rather than one shared: up to ``batch_size``
+    slots sample concurrently on their own threads, so a shared list would need a lock and -- worse --
+    would lose which sim each decision came from, which is the one field the advantage calculation
+    cannot do without. ``job_identity(job_idx)`` supplies ``(game_id, sim_index)``; without it the job
+    index stands in.
     """
     histories: list[list[dict]] = [None] * len(jobs)  # type: ignore[list-item]
     if progress is None:
@@ -310,6 +320,14 @@ def run_jobs_batched(master: GameSimulator, jobs: list[GameJob], *, batch_size: 
                 history = None
                 try:
                     wsim = _WorkerSim(master, coord, worker_id=slot)
+                    if decisions_out is not None:
+                        from simulation.decision_log import DecisionLog
+                        gid, sim_index = (job_identity(job_idx) if job_identity is not None
+                                          else (job_idx, 0))
+                        # This worker's own log. Appending to a per-thread list is GIL-safe and needs
+                        # no lock; the sim identity travels with it.
+                        wsim.decision_log = DecisionLog(gid, sim_index)
+                        decisions_out[job_idx] = wsim.decision_log
                     ctrl = GameController(wsim, seed=job.seed, greedy=greedy)
                     ctrl.start(job.home_roster, job.away_roster, possession=job.possession,
                                season=str(job.season), home_starters=job.home_starters,
