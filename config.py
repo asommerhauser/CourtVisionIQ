@@ -723,37 +723,47 @@ FULL_ARTIFACTS_ROOT = f"./artifacts/{DEFAULT_MODEL}"
 # name ("v1.0"), not the bare "1.0" this constant used to hold.
 DEFAULT_VERSION = DEFAULT_MODEL
 
-# --- Representative subset for the small heads (training/subset.py) ---
-# The small categorical/regression heads (event/type/result/conditional-time) saturate long before
-# they see the whole corpus and start to overfit, so they train on a compact, *representative*
-# slice instead of every game. The slice is selected by a per-season sample RATE that is heavy on
-# the modern game (so current players are well-learned) and decays gently for older seasons, but it
-# stays coverage-complete: every player who appears in the train pool is guaranteed at least one
-# game, so no embedding goes starved. The big player-vocab heads (player / substitution /
-# sub_decision) keep the full corpus — they actually need the data.
+# --- Representative training subset (training/subset.py) ---
+# Every head trains on a compact, representative slice of the corpus rather than all of it. The slice
+# is selected by a per-season sample RATE that is heavy on the modern game and decays gently for older
+# seasons.
+#
+# 3.2 moved the FOUR remaining full-corpus heads (event_time, player, substitution, sub_decision) onto
+# the subset too, so all twelve are on it. Two reasons, and one stated risk.
+#
+# Consistency and compute: the four big heads drop from 26,267 games to roughly 5,200, taking their
+# epochs from ~420 s to ~84 s, which roughly pays for 3.2's two new architecture layers.
+#
+# THE RISK, stated rather than discovered later: thinning every player embedding lands on the
+# identity axis, which docs/v3_2_direction.md calls the larger of the programme's two failures. Three
+# things make it acceptable rather than reckless. The newest season enters the subset at rate 1.0, so
+# players who appear in the scored holdout keep most of their recent games -- what thins is older-era
+# players who rarely appear in what is scored. The per-player prior scalars enter the set encoder
+# additively BEFORE attention, so a player whose embedding is thin still arrives carrying his
+# production profile. And MIN_PLAYER_SUBSET_GAMES removes the players who would have had the thinnest
+# embeddings outright, rather than leaving them in the table under-trained. If the rookie /
+# role-shifter numbers come back WORSE rather than better, this is the first suspect.
+#
+# Coverage-completeness is retired with it -- see training/subset.build_subset for why a
+# minimum-games floor makes that guarantee inert.
 #
 # Per-season sample rate for the most recent seasons, NEWEST FIRST. Raised for v1.1
 # ((0.70, 0.40, 0.25) -> (1.0, 0.70, 0.50)): the subset heads (shot_result especially) under-fit
 # the modern game's efficiency (see RECENCY_HALFLIFE_SEASONS note), and shot_result early-stopped
-# at epoch 7 on the old 3,239-game subset — it has headroom for more modern data. The newest
-# season is itself already truncated at FINAL_SEASON_FRACTION (we cut partway through it), so
-# 100% of that is a modest absolute count.
+# at epoch 7 on the old 3,239-game subset. The newest season is itself already truncated at
+# FINAL_SEASON_FRACTION (we cut partway through it), so 100% of that is a modest absolute count.
 SUBSET_RECENT_SEASON_RATES = (1.0, 0.70, 0.50)
 # Seasons older than the recent block decay from the last recent rate, halving every this-many
-# seasons — a gentle exponential tail (tightened 8 -> 5 for v1.1, same rationale). Coverage still
-# guarantees every player a game, so old-only players pull in the older games they need
-# regardless of the rate.
+# seasons -- a gentle exponential tail (tightened 8 -> 5 for v1.1, same rationale).
 SUBSET_RECENCY_HALFLIFE_SEASONS = 5.0
 SUBSET_SEED = 42                     # deterministic subset selection
 SUBSET_GAMES_PATH = "./training/subset_games.json"  # persisted subset manifest (one extract step)
-# Heads trained on the representative subset rather than the full corpus. All SEVEN conditional
-# type/result heads share one cond_*.npz, so they move as a group — listing six of them was true
-# of nothing: timeout_team already trained on subset rows, because run_stage builds that shared file
-# once from cond_keys[0] (shot_type, which is listed). The list was wrong, not the behaviour, and
-# models.pipeline.run_stage now raises rather than let the two drift again. Everything NOT listed
-# here (event_time, player, substitution, sub_decision) trains on the full corpus.
+# Heads trained on the subset. As of 3.2 that is ALL TWELVE, so models.pipeline.run_stage's
+# all-or-nothing guard over the seven conditional heads (they share one cond_*.npz, so a partial
+# listing would make the stored tensors and the graphs disagree) is satisfied by definition.
 SUBSET_MODEL_KEYS = (
-    "event_time_cond",
+    "event_time", "event_time_cond", "player",
     "shot_type", "shot_result", "assist_type", "turnover_type", "foul_type", "rebound_type",
     "timeout_team",
+    "substitution", "sub_decision",
 )

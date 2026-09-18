@@ -236,9 +236,11 @@ class FullRun:
                     f"would have no train pool."
                 )
         bar = "=" * 70
+        # 3.2: every head is on the subset, so there is no full-corpus group left to
+        # name. The old line hardcoded the four head names and would have kept printing
+        # them after the routing changed underneath it.
         print(f"\n{bar}\n[{tag}] subset heads {list(SUBSET_MODEL_KEYS)}\n"
-              f"[{tag}]   -> {len(games)} games\n"
-              f"[{tag}] full corpus -> event_time, player, substitution, sub_decision\n{bar}")
+              f"[{tag}]   -> {len(games)} games, every head\n{bar}")
         return games
 
     # --------------------------------------------------------------- train

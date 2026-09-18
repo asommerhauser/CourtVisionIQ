@@ -90,23 +90,31 @@ def build_subset(train_games, game_players: dict[int, set], game_season: dict[in
                  recent_rates=SUBSET_RECENT_SEASON_RATES,
                  halflife: float = SUBSET_RECENCY_HALFLIFE_SEASONS,
                  seed: int = SUBSET_SEED) -> tuple[list[int], dict]:
-    """Select a per-season-rate, coverage-complete subset of ``train_games``.
+    """Select a per-season-rate subset of ``train_games``.
 
-    Returns ``(sorted_game_ids, stats)``. Two phases:
-      1. **Coverage** — walk players rarest-first; for any not yet covered, add one game containing
-         them, picked recency-weighted among their games. Guarantees every train player appears
-         (rare / old-only players anchor the older games they need).
-      2. **Per-season fill** — bring each season up to ``round(rate(season) * games_in_season)`` by
-         adding more of that season's games at random (within a season every game is equally recent,
-         so the fill is uniform). A season already over its target from coverage keeps its games.
+    Returns ``(sorted_game_ids, stats)``. One phase: bring each season up to
+    ``round(rate(season) * games_in_season)`` by sampling that season's games uniformly (within a
+    season every game is equally recent, so there is nothing to weight).
+
+    **Coverage-completeness was retired in 3.2.** It used to run first: walk players rarest-first and,
+    for any not yet covered, add one game containing them, so every player in the train pool was
+    guaranteed at least one game and no embedding trained on zero rows. Under W4's vocabulary floor
+    that guarantee is **inert** -- anyone it rescues with a single game falls below the floor anyway
+    and maps to an anonymous slot -- and it was actively harmful, because it dragged old games into
+    the sample for players who will be anonymous regardless. See docs/v3_2_direction.md 2.2.
+
+    ``stats["players"]`` carries the per-player game count **within the subset**, which is what W4's
+    floor reads. It is produced here because this is the only place the (game -> players) map is
+    already in hand.
     """
     rng = np.random.default_rng(seed)
     train = sorted(int(g) for g in train_games)
     if not train:
-        return [], {"n_train": 0, "n_subset": 0, "n_players": 0, "n_covered": 0}
+        return [], {"n_train": 0, "n_subset": 0, "n_players": 0, "players": {}}
 
-    newest = max(game_season.get(g, 0) for g in train)
-    recency_w = {g: 0.5 ** ((newest - game_season.get(g, newest)) / max(halflife, 1e-6)) for g in train}
+    # Per-game recency weights are gone with coverage-completeness: they only ever broke ties when
+    # choosing WHICH game to add for a rare player, and the per-season fill is uniform by
+    # construction. The modern tilt now lives entirely in the per-season RATES.
 
     # Games grouped by season, and the target count per season from its sample rate.
     season_games: dict[int, list[int]] = defaultdict(list)
@@ -115,30 +123,9 @@ def build_subset(train_games, game_players: dict[int, set], game_season: dict[in
     rates = season_sample_rates(season_games.keys(), recent_rates, halflife)
     targets = {s: min(len(gs), round(rates.get(s, 0.0) * len(gs))) for s, gs in season_games.items()}
 
-    # Player -> list of train games containing them; and per-player frequency (for rarest-first).
-    player_games: dict[str, list[int]] = defaultdict(list)
-    for g in train:
-        for p in game_players.get(g, ()):  # only players that actually appear
-            player_games[p].append(g)
-    freq = Counter({p: len(gs) for p, gs in player_games.items()})
-
     chosen: set[int] = set()
-    covered: set[str] = set()
 
-    # Phase 1: coverage, rarest players first (so scarce/old-only players anchor the old games).
-    for p in sorted(player_games, key=lambda p: freq[p]):
-        if p in covered:
-            continue
-        cands = [g for g in player_games[p] if g not in chosen]
-        if not cands:
-            covered.add(p)
-            continue
-        w = np.array([recency_w[g] for g in cands], dtype=np.float64)
-        pick = int(cands[rng.choice(len(cands), p=w / w.sum())])
-        chosen.add(pick)
-        covered.update(game_players.get(pick, ()))
-
-    # Phase 2: per-season fill up to each season's target (uniform within the season).
+    # Per-season fill up to each season's target (uniform within the season).
     for s, gs in season_games.items():
         need = targets[s] - sum(1 for g in gs if g in chosen)
         if need <= 0:
@@ -156,13 +143,17 @@ def build_subset(train_games, game_players: dict[int, set], game_season: dict[in
                  "rate": round(rates.get(s, 0.0), 3)}
         for s, gs in sorted(season_games.items())
     }
+    # Per-player game count INSIDE the subset -- W4's vocabulary floor is defined against this, not
+    # against the corpus and not against the train pool. Counted after selection for that reason.
+    subset_players: Counter = Counter()
+    for g in out:
+        subset_players.update(game_players.get(g, ()))
     stats = {
         "n_train": len(train),
         "n_subset": len(out),
         "subset_frac_actual": round(len(out) / len(train), 4),
-        "n_players": len(player_games),
-        "n_covered": len(covered),
-        "uncovered_players": len(player_games) - len(covered),
+        "n_players": len(subset_players),
+        "players": dict(sorted(subset_players.items())),
         "by_season": by_season,
     }
     return out, stats
@@ -205,10 +196,22 @@ def extract(*, recent_rates=SUBSET_RECENT_SEASON_RATES,
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     Path(out_path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
+    counts = sorted(stats["players"].values())
+    med = counts[len(counts) // 2] if counts else 0
     print(f"[subset] {stats['n_subset']} / {stats['n_train']} train games "
-          f"({stats['subset_frac_actual']:.1%} overall), every player covered: "
-          f"{stats['uncovered_players'] == 0} "
-          f"({stats['n_covered']}/{stats['n_players']} players).")
+          f"({stats['subset_frac_actual']:.1%} overall), {stats['n_players']} players in the subset, "
+          f"median {med} games each.")
+    # The distribution, because W4's vocabulary floor is chosen against it and a floor at the median
+    # halves the embedding table. Printed so the number is read before the floor is set, not after.
+    if counts:
+        import numpy as _np
+        qs = [int(_np.percentile(counts, q)) for q in (10, 25, 50, 75, 90)]
+        print(f"[subset]   games per player: p10 {qs[0]}  p25 {qs[1]}  p50 {qs[2]}  "
+              f"p75 {qs[3]}  p90 {qs[4]}  max {counts[-1]}")
+        for floor in (10, 15, 20, 25, 30):
+            keep = sum(1 for c in counts if c >= floor)
+            print(f"[subset]   floor {floor:>3}: {keep:>5} players kept, "
+                  f"{len(counts) - keep:>5} -> anonymous ({keep / len(counts):.1%} kept)")
     for s, b in stats["by_season"].items():
         print(f"[subset]   {s}: {b['chosen']:>4}/{b['total']:<4} ({b['chosen']/b['total']:.0%}, "
               f"target rate {b['rate']:.0%})")
@@ -235,8 +238,9 @@ def show(path: str = SUBSET_GAMES_PATH) -> None:
           f"({payload.get('subset_frac_actual', 0):.1%} overall), "
           f"recent_rates={payload.get('recent_season_rates')}, "
           f"halflife={payload['halflife_seasons']}, seed={payload['seed']}")
-    print(f"Players covered: {payload['n_covered']}/{payload['n_players']} "
-          f"(uncovered {payload['uncovered_players']})")
+    counts = sorted((payload.get("players") or {}).values())
+    med = counts[len(counts) // 2] if counts else 0
+    print(f"Players in the subset: {payload['n_players']} (median {med} games each)")
     for s, b in payload["by_season"].items():
         print(f"  {s}: {b['chosen']}/{b['total']} ({b['rate']:.0%} target)")
 
