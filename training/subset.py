@@ -40,7 +40,15 @@ from config import (
     FINAL_HOLDOUT_GAMES, SUBSET_GAMES_PATH, SUBSET_RECENCY_HALFLIFE_SEASONS,
     SUBSET_RECENT_SEASON_RATES, SUBSET_SEED, TEST_FRAC,
 )
+import config
+from config import VOCAB_DIR
 from data_loading import ROSTER_STR_COLS, load_training_corpus
+from player_floor import (
+    ANON_FILENAME,
+    build_alias_map,
+    n_slots as n_anon_slots,
+    save_aliases,
+)
 from training.chronology import game_index, sequential_partition
 
 
@@ -186,10 +194,36 @@ def extract(*, recent_rates=SUBSET_RECENT_SEASON_RATES,
         recent_rates=recent_rates, halflife=halflife, seed=seed,
     )
 
+    # --- W4: the player vocabulary floor, and the anonymous slots below it ---
+    # Built here because this is the only step that already holds BOTH halves: the per-player subset
+    # game counts the floor is defined against, and the per-game name sets the slot assignment needs
+    # to colour. Doing it in a head's preprocess would mean parsing every roster cell a second time.
+    #
+    # ``game_players`` covers the training corpus only, which is exactly right: it is floored at
+    # MIN_TRAIN_SEASON, and no game below that floor ever reaches a head. Train, val and holdout are
+    # all inside it, so no game anywhere can contain two players sharing a slot.
+    floor = getattr(config, "MIN_PLAYER_SUBSET_GAMES", None)
+    aliases = build_alias_map(stats["players"], game_players, floor,
+                              max_slots=getattr(config, "ANON_SLOTS_MAX", None))
+    if aliases:
+        save_aliases(VOCAB_DIR, aliases, floor=floor)
+        print(f"[subset] vocabulary floor {floor}: "
+              f"{len(stats['players']) - len(aliases)} players keep their own embedding row, "
+              f"{len(aliases)} are aliased to {n_anon_slots(aliases)} anonymous slots "
+              f"-> {Path(VOCAB_DIR) / ANON_FILENAME}")
+    else:
+        # Either the floor is off, or every player clears it. Remove any stale map so a later train
+        # cannot pick up a floor that is no longer configured -- that would be invisible.
+        stale = Path(VOCAB_DIR) / ANON_FILENAME
+        if stale.is_file():
+            stale.unlink()
+            print(f"[subset] no vocabulary floor in effect; removed stale {stale}")
+
     payload = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "data_dir": data_dir, "boundary_idx": boundary,
         "recent_season_rates": list(recent_rates), "halflife_seasons": halflife, "seed": seed,
+        "player_floor": floor, "n_anon_slots": n_anon_slots(aliases), "n_aliased": len(aliases),
         **stats,
         "subset_game_ids": subset_ids,
     }

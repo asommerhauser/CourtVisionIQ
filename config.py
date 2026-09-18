@@ -731,6 +731,36 @@ FULL_ARTIFACTS_ROOT = f"./artifacts/{DEFAULT_MODEL}"
 # name ("v1.0"), not the bare "1.0" this constant used to hold.
 DEFAULT_VERSION = DEFAULT_MODEL
 
+# --- Player vocabulary floor (3.2 W4) ---
+# A player needs this many games INSIDE the subset to get his own embedding row. Everyone below the
+# floor is aliased to an anonymous slot token, keeping his season-to-date priors and losing his
+# identity row.
+#
+# Why: docs/v3_direction.md 1f names the 2,153 x 192 player embedding as where the memorisation
+# lives. This is the one capacity change in 3.2 and it goes DOWNWARD -- long-retired players leave
+# with the corpus cut, and the thin rows the floor catches leave here. Measured at the 2011 cut, a
+# floor of 20 takes the table to 959 rows and makes 4.0% of all minutes anonymous (2.0% of the 2021+
+# minutes the scored holdout is drawn from).
+#
+# Why anonymity is affordable: the per-player prior scalars enter the roster set encoder ADDITIVELY,
+# before the SAB layers (models/roster_set_encoder.py:137). An anonymous player therefore still
+# arrives carrying his production profile -- and for a deep-bench player the embedding row was mostly
+# noise. See docs/v3_2_progress.md measurement 2 for the floor table it was chosen from.
+#
+# Set to None to keep every player (the test suite does this: its fixtures have no subset manifest).
+MIN_PLAYER_SUBSET_GAMES = 20
+
+# Anonymous slots are NOT a fixed count: the assignment colours the co-occurrence graph of below-floor
+# players, so two who ever appear in the same game never share a slot, and the number of slots is
+# whatever that needs. Measured on the real corpus at floor 20: 36 slots for zero collisions, against
+# 12 anonymous players in the busiest single game.
+#
+# That is the whole reason a GLOBAL name -> slot map is enough, and no per-game bookkeeping is needed.
+# A naive `rank mod slots` assignment collides in 7.4% of games at 16 slots and 2.2% at 64; the
+# colouring collides in none, at 36. This is only a sanity bound -- if a re-clean ever pushed the
+# requirement past it, that is a finding, not something to silently truncate into.
+ANON_SLOTS_MAX = 128
+
 # --- Representative training subset (training/subset.py) ---
 # Every head trains on a compact, representative slice of the corpus rather than all of it. The slice
 # is selected by a per-season sample RATE that is heavy on the modern game and decays gently for older

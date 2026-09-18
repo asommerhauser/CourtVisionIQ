@@ -31,7 +31,7 @@ from config import (
     DEFAULT_MODEL, EVAL_BATCH, EVAL_GAMES_PER_BATCH, FINAL_HOLDOUT_GAMES, FINAL_SEASON_FRACTION,
     HOLDOUT_WINDOW_GAMES,
     FULL_RUN_STATE_PATH, ROLLOUT_BATCH_SIZE, SEED, STAGE_SIMS, SUBSET_GAMES_PATH,
-    SUBSET_MODEL_KEYS, TEST_FRAC,
+    SUBSET_MODEL_KEYS, TEST_FRAC, VOCAB_DIR,
 )
 # model_name is re-exported: it lives in models.artifacts (TF-free, so eval_pool can reach
 # it), but train.py and the tests have always imported it from here.
@@ -259,6 +259,15 @@ class FullRun:
         # the first sign of that would be the eval, hours later. Refuse here instead.
         covered = require_priors(self.state["data_dir"])
         print(f"[train] priors sidecar covers {covered:,} games")
+        # W4's floor has the same shape of silent failure: configured but never materialised, every
+        # player keeps his own embedding row and nothing looks wrong. The subset extract below writes
+        # the map, so this only fires when the extract predates the floor.
+        import config as _config
+        from player_floor import require_player_floor
+        n_aliased = require_player_floor(VOCAB_DIR, getattr(_config, "MIN_PLAYER_SUBSET_GAMES", None))
+        if n_aliased:
+            print(f"[train] vocabulary floor {_config.MIN_PLAYER_SUBSET_GAMES}: "
+                  f"{n_aliased:,} players aliased to anonymous slots")
         idx = game_index(self.state["data_dir"])
         partition = sequential_partition(idx, self.state["boundary_idx"],
                                          n_holdout=FINAL_HOLDOUT_GAMES, val_frac=TEST_FRAC, seed=SEED)

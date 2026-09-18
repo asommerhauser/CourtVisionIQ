@@ -24,10 +24,12 @@ retrain; `v3_2_direction.md` §7 already assumes it, crediting `corr(home, away)
 
 On top of the twelve in `v3_2_direction.md` §Decisions:
 
-1. **Below-floor players get per-game anonymous slot tokens, not one shared `UNK`** (W4). Measured:
-   at a floor of 20 subset games, **32.7% of games roster two or more below-floor players**, which
+1. **Below-floor players get anonymous slot tokens, not one shared `UNK`** (W4). Measured: at a floor
+   of 20 subset games, **28.7% of games roster two or more below-floor players** (up to twelve), which
    one `UNK` id cannot represent — and `game_available_mask` marks it available, so the player head
-   can sample a man who is not identifiable.
+   could sample a token that resolves to no one man. The slots come from **colouring the co-occurrence
+   graph**, which needs 36 of them for zero collisions on the real corpus, so one *global* map gives
+   the guarantee a per-game map would with none of the bookkeeping.
 2. **The replay estimator keeps only positive advantages** (W11). §4.2's signed sample weight is
    `-w·log p` with `w < 0`, which is minimized by driving that action's probability to zero and the
    loss to −∞. Filtering is bounded by construction and needs no trust region.
@@ -61,7 +63,7 @@ one retrain, so it cannot be A/B'd separately afterwards.
 | [W1](#w1--the-priors-join) | The priors join — **blocking** | yes | Light | — | — |
 | [W2](#w2--corpus-cut-at-2011) | Corpus cut at 2011 | yes | Moderate | — | — |
 | [W3](#w3--all-twelve-heads-on-the-subset) | All twelve heads on the subset | yes | Light | — | — |
-| [W4](#w4--vocabulary-floor-and-per-game-anonymous-slots) | Vocabulary floor, anonymous slots | yes | Moderate | Moderate | Moderate |
+| [W4](#w4--vocabulary-floor-and-anonymous-slots) | Vocabulary floor, anonymous slots | yes | Moderate | Moderate | Moderate |
 | [W5](#w5--three-prior-stats-career-stage-season-deltas) | Three prior stats, career stage, deltas | yes | Moderate | Light | Light |
 | [W6](#w6--context-modulation-film) | Context modulation (FiLM) | yes | — | Moderate | — |
 | [W7](#w7--cross-roster-attention) | Cross-roster attention | yes | — | Moderate | — |
@@ -229,12 +231,12 @@ guarantee being retired in either direction.
 
 ---
 
-## W4 — vocabulary floor and per-game anonymous slots
+## W4 — vocabulary floor and anonymous slots
 
 **The highest-risk block in 3.2.**
 
 **What it is.** The player vocabulary is rebuilt from players clearing a minimum number of games
-**within the subset**; everyone below becomes an anonymous per-game slot.
+**within the subset**; everyone below is aliased to an anonymous slot token.
 
 **Why.** `v3_direction.md` §1f names the 2,152 × 192 embedding table as where the memorisation lives.
 This shrinks it by removing long-retired players outright and the thin rows the floor catches — the
@@ -254,23 +256,54 @@ median — a far deeper cut than §3.2 implies. Two things follow.
 **Order of operations, which matters.** Cut the corpus (W2) → carve the subset (W3) → count games per
 player **within the subset** → build the vocabulary from those clearing the floor.
 
-**Anonymous slots, not one `UNK`.** At a floor of 20, two or more below-floor players are rostered in
-28.7% of games, up to a maximum of 12. One shared id cannot tell them apart, and the player and
-substitution heads would spend probability on an unresolvable token. So `ANON_SLOTS = 16` tokens are
-reserved and assigned **per game, by sorted name within that game**, so preprocess and inference
-agree; `UNK` stays as the overflow. The embedding then becomes an honest "generic bench slot" and all
-identity flows through the seventeen prior scalars — which is a truer version of §3.2's own argument
-than one shared token would be.
+**Anonymous slots, not one `UNK`, and the slots come from a graph colouring.** At a floor of 20, two
+or more below-floor players are rostered in 28.7% of games, up to twelve in one game. One shared id
+cannot tell them apart, and the player and substitution heads would spend probability on a token that
+resolves to no one man.
+
+The obvious fix is a *per-game* map. **It is not needed.** Build the co-occurrence graph over
+below-floor players — an edge between any two who ever appear in the same game — and colour it, so no
+edge joins two players of the same colour. **Measured on the real corpus: 36 slots, zero collisions
+across all 16,535 games.** One global, stateless `name -> token` map then gives exactly the guarantee a
+per-game map would, with none of the bookkeeping: no grouping by game in six heads' preprocess, no
+second parse of every roster cell, and nothing threaded through `simulation/input_cache.py` or
+`simulation/game_input.py`. For comparison, a naive `rank mod slots` assignment collides in 7.4% of
+games at 16 slots and 2.2% at 64.
+
+So the slot count is **not** a fixed constant — it is whatever the colouring needs, with
+`ANON_SLOTS_MAX = 128` as a sanity bound that raises rather than truncating (truncating would put two
+players on the same floor under one token, invisibly).
+
+**What a slot's embedding means.** Not "a different person every game": it is a fixed partition of
+below-floor players into buckets averaging ~18 men, where no two bucket-mates ever share a floor. The
+row learns "generic deep-bench player", which is what it should learn, and everything distinguishing
+one from another arrives through the twenty-one prior scalars.
 
 **Why anonymity is affordable.** The prior scalars enter additively at
 `x = emb + scalar_proj(stacked)` (`models/roster_set_encoder.py:137`), *before* the SAB layers. An
 anonymous player loses his identity row and keeps his season-to-date production. For a deep-bench
 player that is the right trade; the embedding row was mostly noise anyway.
 
-**The one hard correctness item.** `game_available_mask` (`models/event_time_model.py:219-239`) sets
-`mask[ids] = 1.0` over the ids in a game and zeroes `PAD` at `:238` — **but not `UNK`**. It must admit
-exactly the anonymous tokens present in that game and zero the rest, or the heads can sample a player
-who is not in the game.
+**`game_available_mask` needs no change, and that is a consequence of the design.** It sets
+`mask[ids] = 1.0` over the ids that actually appear in the game (`models/event_time_model.py:219-239`),
+so the anonymous tokens present are marked available and the rest are not, automatically. The `UNK`
+worry that motivated this — it zeroes `PAD` at `:238` but not `UNK` — goes away because no real player
+maps to `UNK` any more. Verified end to end: `PAD` and `UNK` both read 0, and two anonymous players
+sharing a game get distinct available ids.
+
+**Where it is applied.** Inside `Encoder` — `encode_roster`, `encode_player` and
+`encode_secondary_player` all route names through `Encoder.alias` — because the map is part of *the
+language*. So every call site is untouched, the map is saved and loaded with the vocabs, snapshotted
+into `artifacts/<name>/vocabs/` by the existing `snapshot_vocabs`, and fingerprinted by the manifest.
+`secondary_player` shares the aliasing because it shares the vocab, or a below-floor assister would be
+one id there and another on the floor. Reserved tokens (`PAD`, `UNK`, `start`, `end`, `none`) are never
+aliased — `player` legitimately holds `"start"` on a period-opening row.
+
+**Two silent failures are made loud.** `Encoder.freeze_all` refuses to freeze a vocab that still holds
+a row for an aliased player, which is what a rebuild over a pre-floor vocab produces (`Vocab` is
+append-only, so the floor would otherwise do nothing and the only symptom would be a table that did
+not shrink). And `player_floor.require_player_floor`, called from `full_run.train` beside
+`require_priors`, refuses a configured floor with no alias map on disk.
 
 **Also.** `Vocab` is append-only (`encoder/vocab.py:36-43`), so `encoder/vocabs/*.json` must be
 deleted before the rebuild or the table never shrinks. (Noted in passing: the committed
