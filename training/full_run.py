@@ -626,10 +626,16 @@ class FullRun:
             kwargs["n_sims"] = int(n_sims)
         summary = run_replay_pass(self.state, out_root=out_root, **kwargs)
 
-        self.state["replay_pass"] = {k: summary[k] for k in
-                                     ("out_root", "games", "sims_per_game", "sim_games",
-                                      "kept_by_head", "epochs", "lr")}
-        self._save()
+        # W12's own record, in W12's shape: kept-per-head is the number that separates "the pass
+        # trained on everything" from "no sim beat its siblings for this head", which are the two
+        # readings of an unchanged probe and look identical without it.
+        from reporting.ab_harness import record_phase, replay_pass_record
+
+        record = replay_pass_record(games=summary["games"], sims_per_game=summary["sims_per_game"],
+                                    head_kept=summary["kept_by_head"], seed=SEED)
+        record["out_root"] = summary["out_root"]
+        record_phase(self.state_path, "kpi", record)
+        self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
         print()
         print("=" * 70)
         print(f"STOP -- replay pass done. Arm 3 is the bundle at {summary['out_root']}.")
