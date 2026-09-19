@@ -41,6 +41,10 @@ def main() -> None:
                       help="Retrain ONE head in place (keeps the others).")
     mode.add_argument("--continue", dest="cont", action="store_true",
                       help="Resume an interrupted full train at the next unfinished head.")
+    mode.add_argument("--replay-pass", dest="replay_pass", action="store_true",
+                      help="W4 rung 3 (arm 3): simulate the training subset, score each sim against "
+                           "the real game, and run ONE weighted pass over the sims that beat their "
+                           "siblings. Needs a finished bundle; writes a NEW one (<name>-kpi).")
     mode.add_argument("--status", action="store_true", help="Show full-run progress.")
     mode.add_argument("--extend-holdout", dest="extend_holdout", action="store_true",
                       help="Re-cut the holdout to FINAL_HOLDOUT_GAMES on an already-trained "
@@ -51,6 +55,17 @@ def main() -> None:
     ap.add_argument("--name", help="Model name, e.g. v1.1 or endgame-feats (required with --full). "
                                    "Free-form; a retrain takes a NEW name rather than overwriting.")
     ap.add_argument("--version", help="Deprecated alias for --name (accepts a bare '1.1').")
+    ap.add_argument("--replay-games", dest="replay_games", type=float, default=None,
+                    metavar="FRACTION",
+                    help="With --replay-pass: fraction of the subset to replay "
+                         "(default config.REPLAY_GAME_FRACTION).")
+    ap.add_argument("--replay-sims", dest="replay_sims", type=int, default=None, metavar="N",
+                    help="With --replay-pass: sims per replayed game "
+                         "(default config.REPLAY_SIMS_PER_GAME). Below 2 there is no sibling "
+                         "baseline and every advantage is zero.")
+    ap.add_argument("--out-root", dest="out_root", default=None, metavar="DIR",
+                    help="With --replay-pass: where the fine-tuned bundle goes "
+                         "(default: the input root plus config.REPLAY_ARTIFACTS_SUFFIX).")
     ap.add_argument("--batch-size", type=int, help="Train batch size (required with --full).")
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--clean", action="store_true",
@@ -95,6 +110,9 @@ def main() -> None:
         # data_dir is left to the state: for a trained model the corpus it was cut against is
         # authoritative, and argparse's "./data" default would silently override a different one.
         run.extend_holdout()
+    elif args.replay_pass:
+        run.replay_pass(out_root=args.out_root, fraction=args.replay_games,
+                        n_sims=args.replay_sims)
     elif args.status:
         run.status()
 

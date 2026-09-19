@@ -167,7 +167,9 @@ def run_stage(data_dir: str, game_partition, *, artifacts_root: str = DEFAULT_AR
               done: list[str] | None = None, on_trained=None,
               subset_keys=None, subset_train_games=None,
               rebuild_vocabs: bool = False,
-              rollout_score_fn_factory=None) -> list[str]:
+              rollout_score_fn_factory=None,
+              processed_dir: str | None = None,
+              on_preprocessed=None) -> list[str]:
     """Train every model on ``game_partition`` (one stage / one full train) and return the keys
     trained this call.
 
@@ -183,6 +185,13 @@ def run_stage(data_dir: str, game_partition, *, artifacts_root: str = DEFAULT_AR
     group is done, their preprocess — is skipped, so an interruption picks up at the next unfinished
     model. ``on_trained(key)`` (when given) is called right after each model finishes so the caller
     can persist progress before the next (crash-resilient) model starts.
+
+    ``processed_dir`` (optional) overrides where each head reads and writes its tensors. It exists
+    for the replay pass, which preprocesses a corpus of SIMS: left at the default those tensors
+    would overwrite the real ones under ``./data/processed`` and the next ``--continue`` would
+    train on simulations without a word about it. ``on_preprocessed(key, model)`` is called after
+    each head preprocesses and before it trains -- the one point where a caller can reweight a
+    split that only exists on disk.
 
     ``subset_keys`` / ``subset_train_games`` (optional): the small heads listed in ``subset_keys``
     preprocess + train on ``subset_train_games`` instead of the full train pool — a compact,
@@ -213,6 +222,23 @@ def run_stage(data_dir: str, game_partition, *, artifacts_root: str = DEFAULT_AR
         return dict(rebuild_vocabs=(rebuild_vocabs and owns_vocab),
                     game_partition=part, refit_norm_stats=refit_norm_stats)
 
+    kw = {"processed_dir": processed_dir} if processed_dir else {}
+
+    def _head(cls):
+        """Construct one head against this call's data and tensor dirs."""
+        return cls(Encoder(), path=data_dir, **kw)
+
+    def _prep(model, key: str) -> None:
+        """Preprocess one head, then hand it to the caller before it trains.
+
+        Every preprocess goes through here so ``on_preprocessed`` cannot be attached to five of the
+        six call sites -- the shape of bug this file has already had twice (the missing
+        ``sub_decision`` in LARGE_OUTPUT_MODELS, the conditional heads' shared partition).
+        """
+        model.preprocess(**_pp(key))
+        if on_preprocessed is not None:
+            on_preprocessed(key, model)
+
     def _train(model, key: str) -> None:
         if key in done:
             print(f"[stage] '{key}' already trained this call — skipping")
@@ -240,20 +266,20 @@ def run_stage(data_dir: str, game_partition, *, artifacts_root: str = DEFAULT_AR
             on_trained(key)
 
     # 1) Event/Time, 2) Player — each its own preprocess + train.
-    et = EventTimeModel(Encoder(), path=data_dir)
+    et = _head(EventTimeModel)
     if EventTimeModel.KEY not in done:
-        et.preprocess(**_pp(EventTimeModel.KEY))
+        _prep(et, EventTimeModel.KEY)
         _train(et, EventTimeModel.KEY)
 
-    pl = PlayerModel(Encoder(), path=data_dir)
+    pl = _head(PlayerModel)
     if PlayerModel.KEY not in done:
-        pl.preprocess(**_pp(PlayerModel.KEY))
+        _prep(pl, PlayerModel.KEY)
         _train(pl, PlayerModel.KEY)
 
     # 2b) Conditional time head — own preprocess + train (raw stream; conditions on event + actor).
-    ct = ConditionalTimeModel(Encoder(), path=data_dir)
+    ct = _head(ConditionalTimeModel)
     if ConditionalTimeModel.KEY not in done:
-        ct.preprocess(**_pp(ConditionalTimeModel.KEY))
+        _prep(ct, ConditionalTimeModel.KEY)
         _train(ct, ConditionalTimeModel.KEY)
 
     # 3) Conditional heads — one shared preprocess (only if a head still needs training), then each.
@@ -274,19 +300,19 @@ def run_stage(data_dir: str, game_partition, *, artifacts_root: str = DEFAULT_AR
             "Add the missing keys to config.SUBSET_MODEL_KEYS, or remove all of them."
         )
     if any(k not in done for k in cond_keys):
-        CONDITIONAL_MODEL_CLASSES[0](Encoder(), path=data_dir).preprocess(**_pp(cond_keys[0]))
+        _prep(_head(CONDITIONAL_MODEL_CLASSES[0]), cond_keys[0])
     for cls in CONDITIONAL_MODEL_CLASSES:
-        _train(cls(Encoder(), path=data_dir), cls.KEY)
+        _train(_head(cls), cls.KEY)
 
     # 4) Substitution, 5) Stint-length — self-contained preprocess + train.
-    sub = SubstitutionModel(Encoder(), path=data_dir)
+    sub = _head(SubstitutionModel)
     if SubstitutionModel.KEY not in done:
-        sub.preprocess(**_pp(SubstitutionModel.KEY))
+        _prep(sub, SubstitutionModel.KEY)
         _train(sub, SubstitutionModel.KEY)
 
-    subdec = SubDecisionModel(Encoder(), path=data_dir)
+    subdec = _head(SubDecisionModel)
     if SubDecisionModel.KEY not in done:
-        subdec.preprocess(**_pp(SubDecisionModel.KEY))
+        _prep(subdec, SubDecisionModel.KEY)
         _train(subdec, SubDecisionModel.KEY)
 
     print(f"\n[stage] trained this call: {trained}")

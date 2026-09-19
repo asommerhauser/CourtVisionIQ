@@ -102,6 +102,27 @@ REGIME_ENABLED = True
 REGIME_DIM = 4
 REGIME_L2 = 1e-3
 
+# --- W4 rung 3: the weighted replay pass (models/replay.py, training/replay_pass.py) ------------
+# One pass, AFTER the main train, over one game in ten of the training subset, ten sims each. The
+# sibling set is what makes the leave-one-out baseline work, so it is ten sims of the SAME game
+# rather than one sim of ten games. Never a holdout window: fine-tuning on one would turn the
+# report into a training metric.
+REPLAY_GAME_FRACTION = 0.1
+REPLAY_SIMS_PER_GAME = 10
+# One pass means one epoch. The same pass every epoch of a thirty-epoch stage is ~96 GPU-hours,
+# which is worse than the naive form this design exists to avoid (W11).
+REPLAY_EPOCHS = 1
+# A tenth of the train LR. NOT in the spec, chosen here: one pass over ~5,200 sim-games at 3e-4
+# moves the weights about as far as several ordinary epochs, and W11's gate says the pass must not
+# worsen margin dispersion. A fine-tune free to overwrite the bundle cannot be judged against that.
+REPLAY_LR = 3e-5
+# Sim ids live above every real id so the two can never collide, and carry the real id in their
+# digits so an advantage finds its way back to the rows it belongs to (training/replay_corpus.py).
+REPLAY_ID_BASE = 1_000_000_000
+# The pass writes a NEW bundle rather than overwriting the one it started from -- arm 3 is compared
+# against arm 2, so arm 2 has to still exist when it finishes.
+REPLAY_ARTIFACTS_SUFFIX = "-kpi"
+
 # LOCAL_ATTENTION_HEADS = 0 disables the mechanism entirely and rebuilds the pre-2.0 graph
 # unchanged, which is what makes that A/B a clean comparison.
 LOCAL_ATTENTION_HEADS = 2   # heads per block restricted to the window (0 = all global)

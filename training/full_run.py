@@ -596,6 +596,48 @@ class FullRun:
         self._record_selection(holder, name)
         print(f"[retrain] '{name}' done.")
 
+    # ------------------------------------------------------------ replay pass
+    def replay_pass(self, *, out_root: str | None = None, fraction=None, n_sims=None) -> dict:
+        """W4 rung 3: simulate the subset, score the sims, and train once on the good ones.
+
+        Arm 3 of the 3.2 A/B. It needs a FINISHED bundle for the same reason rung 2 does -- a rollout
+        drives all twelve heads -- so it pre-flights the same way rather than failing partway through a
+        rollout with a head missing.
+
+        Writes a NEW artifacts root (``<name>-kpi`` by default) and leaves this run's state pointing at
+        the bundle it started from: arm 3 is compared against arm 2, so arm 2 has to survive the pass.
+        The new bundle is recorded in the state under ``replay_pass`` so the comparison can find it
+        without being told twice.
+        """
+        from training.replay_pass import run_replay_pass
+
+        self._require()
+        absent = missing_heads(self.state["artifacts_root"])
+        if absent:
+            raise SystemExit(
+                f"the replay pass needs a finished bundle; {len(absent)} of {len(STAGE_MODEL_KEYS)} "
+                f"heads have no weights under {self.state['artifacts_root']} ({', '.join(absent)}). "
+                f"Run the full train first:  python train.py --full --name <name> --batch-size 64")
+
+        kwargs = {}
+        if fraction is not None:
+            kwargs["fraction"] = float(fraction)
+        if n_sims is not None:
+            kwargs["n_sims"] = int(n_sims)
+        summary = run_replay_pass(self.state, out_root=out_root, **kwargs)
+
+        self.state["replay_pass"] = {k: summary[k] for k in
+                                     ("out_root", "games", "sims_per_game", "sim_games",
+                                      "kept_by_head", "epochs", "lr")}
+        self._save()
+        print()
+        print("=" * 70)
+        print(f"STOP -- replay pass done. Arm 3 is the bundle at {summary['out_root']}.")
+        print(f"  python evaluate.py --model {Path(summary['out_root']).name} --run v32-a3 "
+              f"--window 0 --monte-carlo 200 --procs auto")
+        print("=" * 70)
+        return summary
+
     # ------------------------------------------------------- retrain-shot-type
     def retrain_shot_type(self) -> None:
         """Targeted retrain of ONLY the shot_type head, reusing the existing cond_*.npz.
