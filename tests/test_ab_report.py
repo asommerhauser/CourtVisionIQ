@@ -10,11 +10,12 @@ def _run(tmp_path, name, *, n=6, window=0, seed=0, sims=200, flip=0):
     """A results dir with ``n`` finished games. ``flip`` games are predicted backwards."""
     run_dir = tmp_path / "results" / "version3.2" / name
     for i in range(n):
-        game = run_dir / "games" / f"game{1000 + i}"
+        gid = 1000 + window * 100 + i          # windows are disjoint games; arms share them
+        game = run_dir / "games" / f"game{gid}"
         game.mkdir(parents=True)
         p_home = 0.2 if i < flip else 0.8
         (game / "record.json").write_text(json.dumps({
-            "game_id": 1000 + i, "n_sims": sims, "seed_base": seed,
+            "game_id": gid, "n_sims": sims, "seed_base": seed,
             "win_prob_home": p_home, "actual_home_win": True,
             "pred_margin_mean": 4.0, "pred_margin_std": 11.0, "actual_margin": 3,
         }), encoding="utf-8")
@@ -105,3 +106,29 @@ def test_html_survives_a_missing_number():
                                "threshold_2se": 0.01, "separated": False,
                                "verdict": "the same model"}]}
     assert "the same model" in render_html(report)
+
+
+def test_an_arm_can_span_several_windows(tmp_path):
+    """700 games is seven runs. Pooling happens here, so each window keeps its own k."""
+    a = [_run(tmp_path, f"v32-a1-w{k}", n=4, window=k) for k in range(3)]
+    b = [_run(tmp_path, f"v32-a2-w{k}", n=4, window=k) for k in range(3)]
+    report = compare([a, b], out_dir=tmp_path / "out", echo=lambda *_: None)
+
+    assert report["arms"][0]["windows"] == [0, 1, 2]
+    assert report["arms"][0]["n_games"] == 12
+    assert report["comparisons"][0]["n"] == 12
+
+
+def test_arms_spanning_different_windows_are_refused(tmp_path):
+    wide = [_run(tmp_path, f"v32-a1-w{k}", n=4, window=k) for k in range(3)]
+    narrow = [_run(tmp_path, "v32-a2-w0", n=4, window=0)]
+    with pytest.raises(ValueError, match="different holdout windows"):
+        compare([wide, narrow], echo=lambda *_: None)
+
+
+def test_windows_that_overlap_are_refused(tmp_path):
+    """The same game scored twice would be paired twice, which is a fabricated n."""
+    same = [_run(tmp_path, "v32-a1-w0", n=4, window=0), _run(tmp_path, "v32-a1-again", n=4, window=0)]
+    with pytest.raises(SystemExit, match="overlap"):
+        read_arm(same, "retrained")
+

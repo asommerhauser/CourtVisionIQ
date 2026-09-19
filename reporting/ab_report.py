@@ -48,37 +48,55 @@ def _report_json(run_dir: Path) -> dict:
         return {}
 
 
-def read_arm(run_dir, arm: str) -> tuple[dict, list[dict]]:
-    """``(identity, records)`` for one arm, read from what the run itself wrote.
+def read_arm(run_dirs, arm: str) -> tuple[dict, list[dict]]:
+    """``(identity, records)`` for one arm, read from what its runs themselves wrote.
 
     The identity is reconstructed rather than passed in, so a mislabelled comparison is impossible from
-    the command line: the window, the sim count and the seed come from the run directory, and
+    the command line: the windows, the sim count and the seed come from the run directories, and
     ``assert_comparable`` then judges them.
+
+    **An arm may be several runs.** ``--window K`` scores exactly ``HOLDOUT_WINDOW_GAMES``, so the 700
+    games W11's detection threshold rests on are seven runs, not one: at 100 games a 0.005-0.015 gain
+    sits inside 2 SE (0.017) and is unreadable, and at 700 the threshold is 0.007 and it is not. The
+    windows stay separate runs on purpose -- each records its own k, and drift with k is a finding --
+    so they are pooled here, at the point of comparison, rather than merged into one evaluation.
     """
     from eval_pool import finished_records
 
-    run_dir = Path(run_dir)
-    records = finished_records(run_dir)
-    if not records:
-        raise SystemExit(f"{run_dir} holds no finished games (games/*/record.json). "
-                         f"Has this arm been evaluated?")
-    report = _report_json(run_dir)
-    sims = report.get("n_sims") or max(int(r.get("n_sims", 0) or 0) for r in records)
-    seeds = {int(r.get("seed_base") or 0) for r in records}
+    dirs = [Path(d) for d in ([run_dirs] if isinstance(run_dirs, (str, Path)) else run_dirs)]
+    records, windows, sims_seen, seeds = [], [], set(), set()
+    for run_dir in dirs:
+        got = finished_records(run_dir)
+        if not got:
+            raise SystemExit(f"{run_dir} holds no finished games (games/*/record.json). "
+                             f"Has this arm been evaluated?")
+        report = _report_json(run_dir)
+        records.extend(got)
+        windows.append(int(report.get("window") or 0))
+        sims_seen.add(int(report.get("n_sims") or max(int(r.get("n_sims", 0) or 0) for r in got)))
+        seeds.update(int(r.get("seed_base") or 0) for r in got)
+
     if len(seeds) > 1:
-        raise SystemExit(f"{run_dir} mixes seed bases {sorted(seeds)}; it is not one run's worth of "
-                         f"games and cannot stand as one arm")
-    identity = describe_arm(
+        raise SystemExit(f"arm {arm!r} mixes seed bases {sorted(seeds)}; a shared seed is what makes "
+                         f"two arms face the same Monte-Carlo draw, so this is not one arm")
+    if len(sims_seen) > 1:
+        raise SystemExit(f"arm {arm!r} mixes sim counts {sorted(sims_seen)}; Brier's Monte-Carlo "
+                         f"inflation differs with the sim count, so these runs cannot be pooled")
+    seen = {int(r["game_id"]) for r in records}
+    if len(seen) != len(records):
+        raise SystemExit(f"arm {arm!r} covers {len(records)} records over {len(seen)} distinct games; "
+                         f"the windows given overlap, and a game scored twice would be paired twice")
+    return describe_arm(
         arm,
-        model=report.get("model") or run_dir.parent.name,
-        run=report.get("run_name") or run_dir.name,
-        window=int(report.get("window") or 0),
+        model=_report_json(dirs[0]).get("model") or dirs[0].parent.name,
+        run=", ".join(d.name for d in dirs),
+        window=min(windows),
         seed=sorted(seeds)[0],
-        monte_carlo=int(sims),
+        monte_carlo=sorted(sims_seen)[0],
         n_games=len(records),
-        run_dir=str(run_dir),
-    )
-    return identity, records
+        windows=sorted(windows),
+        run_dir=", ".join(str(d) for d in dirs),
+    ), records
 
 
 def pairs_for(n_arms: int) -> list[tuple[int, int]]:
@@ -102,6 +120,14 @@ def compare(run_dirs, *, arms=ARMS, state_path=None, out_dir=None, echo=print) -
     read = [read_arm(d, name) for d, name in zip(run_dirs, names)]
     identities = [identity for identity, _ in read]
     assert_comparable(identities)
+    # assert_comparable judges one window field, which an arm spanning several runs cannot express:
+    # arms on windows 0-6 and on window 0 alone both report a window of 0 and would pass. The pairing
+    # is by game id, so a mismatch here is not fatal to the arithmetic -- it just silently compares
+    # 700 games against the 100 they contain, and reports it as 700.
+    spans = {tuple(i.get("windows", [i["window"]])) for i in identities}
+    if len(spans) > 1:
+        raise ValueError(f"arms cover different holdout windows ({sorted(spans)}); they would be "
+                         f"compared on the games they happen to share, under the wider arm's name")
 
     for identity in identities:
         echo(f"[ab] {identity['arm']:<10} {identity['n_games']:>4} games  "
@@ -122,7 +148,8 @@ def compare(run_dirs, *, arms=ARMS, state_path=None, out_dir=None, echo=print) -
                  f"{result['threshold_2se']:.4f})  {result['verdict']}")
 
     report = {"arms": identities, "comparisons": comparisons}
-    out_dir = Path(out_dir or run_dirs[0])
+    first = run_dirs[0]
+    out_dir = Path(out_dir or (first if isinstance(first, (str, Path)) else first[0]))
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / f"{REPORT_NAME}.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     (out_dir / f"{REPORT_NAME}.html").write_text(render_html(report), encoding="utf-8")
@@ -185,7 +212,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="Compare the 3.2 arms (retrained, rung2, kpi) with a paired Brier test.")
     ap.add_argument("run_dirs", nargs="+", metavar="RUNDIR",
-                    help="Each arm's results dir, IN ARM ORDER: retrained, rung2, kpi.")
+                    help="Each arm's results dir(s), IN ARM ORDER: retrained, rung2, kpi. An arm "
+                         "spanning several holdout windows is one comma-separated argument, e.g. "
+                         "results/version3.2/v32-a1-w0,results/version3.2/v32-a1-w1 -- 700 games is "
+                         "seven windows, and that is what the detection threshold rests on.")
     ap.add_argument("--state", default=None,
                     help="Full-run state file to record the comparison in (optional).")
     ap.add_argument("--out", default=None,
@@ -197,7 +227,8 @@ def main(argv=None) -> None:
     args = build_parser().parse_args(argv)
     if len(args.run_dirs) > len(ARMS):
         raise SystemExit(f"at most {len(ARMS)} arms ({', '.join(ARMS)}), got {len(args.run_dirs)}")
-    compare(args.run_dirs, state_path=args.state, out_dir=args.out)
+    per_arm = [[d for d in group.split(",") if d] for group in args.run_dirs]
+    compare(per_arm, state_path=args.state, out_dir=args.out)
 
 
 if __name__ == "__main__":

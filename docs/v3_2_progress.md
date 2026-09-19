@@ -504,6 +504,61 @@ factory arming on a complete bundle, and the channel reaching `run_stage` from `
 relaunched before this fix existed. That is arm 1 behaving as designed either way; the flag has to go back
 to `True` for step 6.
 
+### 14. W11 and W12 were libraries nothing imported — arm 3 was arm 1 with a new name
+
+The same discovery as departure 13, twice over and larger. `models/replay.py` (the estimator),
+`simulation/decision_log.py` (what each head sampled) and `reporting/ab_harness.py` (arm identities,
+the comparability refusal, the paired test) were all built, all tested, and **imported by nothing
+outside `tests/`**. The handover's arm 3 was `evaluate.py --run v32-a3`, which evaluates the bundle
+arm 1 produced and labels the result the third arm; its comparison was two Brier numbers read by eye.
+
+So the pass needed a driver and the comparison needed one:
+
+* **`training/replay_pass.py`** — select one game in ten of the subset, simulate ten sims each, score
+  every sim per head (with the three game-state probes computed from the sim's own rows, so the foul
+  and rotation behaviour the gate names actually reaches the weights), keep the sims that beat their
+  siblings, and run one weighted pass through `run_stage`.
+* **`training/replay_corpus.py`** — the labels. A sim's play-by-play *is* what the model sampled, but
+  it is not a corpus: three things a simulation cannot know are carried from the real fixture
+  (season context, per-slot rest re-laid against each sim row's own roster, and the priors, re-keyed
+  onto the sim ids because `merge_prior_features` raises on partial coverage).
+* **`reporting/ab_report.py`** — read each arm, refuse an incomparable set, run the paired test over
+  both increments and the whole, write JSON and a page, and record it in the run state.
+
+Two things `run_stage` grew to make the pass safe, both enforced rather than remembered.
+`processed_dir`, because preprocessing a corpus of sims at the default path would overwrite
+`./data/processed` and the next `--continue` would train on simulations silently. And
+`on_preprocessed`, the one seam where a weight can reach a split that only exists on disk — routed
+through a single `_prep` helper so it cannot be attached to five of the six preprocess call sites,
+which is the shape of bug this file has had twice already.
+
+**Departures taken here, both stated rather than hidden.** `REPLAY_LR = 3e-5`, a tenth of the train
+LR: the spec names no learning rate, and one pass over ~5,200 sim-games at 3e-4 moves the weights
+about as far as several ordinary epochs, which cannot be judged against a gate that says "must not
+worsen margin dispersion". And the labels come from re-preprocessing the sim corpus rather than from
+the decision log's `(position, head, output, token)` rows — the log's own docstring says the context
+is re-derived by replaying the rows, and the rows already carry every head's choices, so the log
+stays a cross-check rather than a second label path.
+
+### 15. "The final paired evaluation at 700 games" was not expressible — an arm is now several runs
+
+`--window K` scores exactly `HOLDOUT_WINDOW_GAMES` (100). There is no flag that evaluates the whole
+700-game pool, so the handover's step 7 — the sentence carrying the entire argument for widening the
+pool — had no command behind it. Written as it was, it would have scored window 0 and reported it
+as 700.
+
+700 games is **seven runs per arm** (`--window 0` through `--window 6`), pooled at the point of
+comparison rather than merged into one evaluation: each run records its own k, and drift with k is a
+finding (`v3_direction.md` SS4), so merging them would destroy a measurement to save a column.
+`read_arm` therefore takes one run dir or several, and refuses an arm whose runs mix seeds or sim
+counts, or whose windows overlap — a game scored twice would be paired twice and inflate n.
+
+`assert_comparable` judges a single window field, which an arm spanning seven runs cannot express:
+an arm on windows 0-6 and an arm on window 0 alone both report 0 and would pass. `compare` checks the
+window *set* as well, because the failure is not an exception — the pairing is by game id, so a
+mismatch silently compares 700 games against the 100 they contain and reports it under the wider
+arm's name.
+
 ## Gaps found in 3.0's code while planning 3.2
 
 Each would have surfaced as a failure or a silent constant in the first real 3.0 train.
@@ -632,10 +687,22 @@ model; this is a model comparison, where a shared seed makes both arms face the 
 harness refuses a mismatched pair, and the run log should say why.
 
 ```bash
-# 7. Arm 3: the KPI replay pass, then the final paired evaluation at 700 games.
-#    An expected Brier gain of 0.005-0.015 is borderline at 100 games (2 SE = 0.017) and clears the floor
-#    at 700 (0.007), which is the whole argument for the wider pool.
-python evaluate.py --model version3.2 --run v32-a3 --monte-carlo 200 --procs auto
+# 7. Arm 3: the KPI replay pass itself. Simulates one game in ten of the subset at ten sims each,
+#    scores every sim against the real game per head, keeps the ones that beat their siblings, and
+#    runs ONE weighted pass. Writes a NEW bundle (version3.2-kpi) and leaves arm 2 intact.
+python train.py --replay-pass
+```
+
+```bash
+# 8. Score arm 3 on the same window, with the same seed and sim count as the other two.
+python evaluate.py --model version3.2-kpi --run v32-a3 --window 0 --monte-carlo 200 --procs auto
+```
+
+```bash
+# 9. The comparison. Arms in order; each arm may be several windows, comma-separated. At 100 games an
+#    expected Brier gain of 0.005-0.015 sits inside 2 SE (0.017) and is unreadable; 700 games puts the
+#    threshold at 0.007. 700 games is SEVEN runs per arm (--window 0..6), not one -- see departure 15.
+python -m reporting.ab_report results/version3.2/v32-a1 results/version3.2/v32-a2     results/version3.2-kpi/v32-a3 --state training/full_run_state.json
 ```
 
 ### Gates, in order
@@ -650,9 +717,13 @@ python evaluate.py --model version3.2 --run v32-a3 --monte-carlo 200 --procs aut
 - **W7** — scored on spread MAE.
 - **W8** — records `epochs_disagree`. That number is rung 3's original firing condition; 3.2 builds rung 3
   anyway, so it is now evidence rather than a gate.
-- **W11** — must improve rollout CRPS and the foul and rotation probes on games the pass never saw, and
-  must **not** worsen margin dispersion. If dispersion worsens, `ROLLOUT_SCORE_DISPERSION_WEIGHT` failed
+- **W11** — `python train.py --replay-pass` (departure 14). Must improve rollout CRPS and the foul and
+  rotation probes on games the pass never saw, and must **not** worsen margin dispersion. If dispersion worsens, `ROLLOUT_SCORE_DISPERSION_WEIGHT` failed
   and the pass found the collapse-the-spread shortcut.
+
+- **W12** — `python -m reporting.ab_report <arm dirs>` prints and records the paired test. The
+  comparison refuses rather than reports when the arms are not comparable, which is the gate:
+  a number that survives it is readable, and one that does not was never a finding.
 
 ### Known-open, deliberately
 
@@ -660,6 +731,11 @@ python evaluate.py --model version3.2 --run v32-a3 --monte-carlo 200 --procs aut
   plus 3.0's priors / running pace / regime latent / rung 1, none of which ever trained). A gain cannot be
   attributed among them. Accepted; §5.3's multi-scale time is held for 3.3 to stop it becoming ten.
 - **`pf_36` and the foul objective land together**, so if the foul probes move, the two are confounded.
+- **The replay pass has never run.** Every part of it is built and unit-tested, but the chain
+  (simulate -> score -> corpus -> preprocess -> weighted pass) has only ever run against fixtures. The
+  first real invocation is on a pod, and the first thing to read is the per-head kept counts: a head
+  where no sim beat its siblings trains on an all-zero weight, which is a no-op pass rather than a
+  change, and looks identical to a pass that did nothing wrong.
 - **Batched-rollout throughput under the new layers is unmeasured.** Every figure in §6.2 scales with the
   37 GPU-min per 1,000 sims measured on the 3.0 graph at `ROLLOUT_BATCH_SIZE = 48`.
 - **A name absent from the training corpus still encodes as `UNK`**, so two genuinely unseen players on
