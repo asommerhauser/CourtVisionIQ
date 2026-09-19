@@ -84,3 +84,86 @@ def test_train_when_trained_is_a_noop(tmp_path):
     run = FullRun(state_path=_state(tmp_path, status="trained"))
     run.train()                         # already trained -> no retrain
     assert run.state["status"] == "trained"
+
+
+# ---------------------------------------------------------------- rung 2's pre-flight
+# The first 3.2 full train died three epochs into 'event_time': ROLLOUT_SELECTION was on, the
+# callback fired at ROLLOUT_EVAL_EVERY, and GameSimulator.load raised on an artifacts root the
+# train itself was still filling. A rollout scores the WHOLE bundle, so rung 2 belongs to the
+# second pass -- these pin both halves of that: the refusal, and the channel the second pass needs.
+
+def _rollout_state(tmp_path, artifacts_root, **over):
+    s = {"data_dir": "./data", "processed_dir": str(tmp_path / "proc"),
+         "artifacts_root": str(artifacts_root), "reports_root": str(tmp_path / "reports"),
+         "epochs": 1, "batch_size": 8, "n_games": 300, "boundary_idx": 158,
+         "holdout_game_ids": [1, 2, 3], "train_tail_game_ids": [1, 2],
+         "eval_batch": 10, "run_name": "r", "status": "setup", "trained_models": []}
+    s.update(over)
+    p = tmp_path / "state.json"; p.write_text(json.dumps(s), encoding="utf-8")
+    return str(p)
+
+
+def _fake_bundle(root, keys):
+    """Weight files with no weights in them: the pre-flight tests existence, never contents."""
+    for k in keys:
+        (root / k).mkdir(parents=True, exist_ok=True)
+        (root / k / f"{k}.weights.h5").write_bytes(b"")
+
+
+def test_missing_heads_counts_what_is_not_on_disk(tmp_path):
+    from models.registry import STAGE_MODEL_KEYS
+    from training.full_run import missing_heads
+
+    root = tmp_path / "artifacts"
+    assert missing_heads(root) == list(STAGE_MODEL_KEYS)
+    _fake_bundle(root, STAGE_MODEL_KEYS[:-1])
+    assert missing_heads(root) == [STAGE_MODEL_KEYS[-1]]
+    _fake_bundle(root, STAGE_MODEL_KEYS)
+    assert missing_heads(root) == []
+
+
+def test_rung2_refuses_a_bundle_still_being_built(tmp_path, monkeypatch, capsys):
+    import config
+
+    monkeypatch.setattr(config, "ROLLOUT_SELECTION", True, raising=False)
+    run = FullRun(state_path=_rollout_state(tmp_path, tmp_path / "artifacts"))
+
+    assert run._rollout_score_factory() == (None, None)
+    out = capsys.readouterr().out
+    # The refusal has to name the remedy, or it reads as the feature silently not working.
+    assert "rung 2" in out and "python train.py --model event_time" in out
+
+
+def test_rung2_arms_itself_on_a_finished_bundle(tmp_path, monkeypatch):
+    import config
+    from models.registry import STAGE_MODEL_KEYS
+
+    monkeypatch.setattr(config, "ROLLOUT_SELECTION", True, raising=False)
+    root = tmp_path / "artifacts"
+    _fake_bundle(root, STAGE_MODEL_KEYS)
+    run = FullRun(state_path=_rollout_state(tmp_path, root))
+
+    factory, holder = run._rollout_score_factory()
+    assert factory is not None and holder == {}
+
+
+def test_retrain_hands_the_rollout_channel_to_run_stage(tmp_path, monkeypatch):
+    """Arm 2 is `train.py --model event_time`. It used to build no factory and pass none."""
+    import models.pipeline as pipeline
+    import config
+    import training.full_run as full_run_mod
+    from models.registry import STAGE_MODEL_KEYS
+
+    monkeypatch.setattr(config, "ROLLOUT_SELECTION", True, raising=False)
+    root = tmp_path / "artifacts"
+    _fake_bundle(root, STAGE_MODEL_KEYS)
+    run = FullRun(state_path=_rollout_state(tmp_path, root))
+
+    monkeypatch.setattr(FullRun, "_subset_games", lambda self, *, tag: {1, 2})
+    monkeypatch.setattr(full_run_mod, "game_index", lambda data_dir: "idx")
+    monkeypatch.setattr(full_run_mod, "sequential_partition", lambda *a, **k: ({1}, {2}, {3}))
+    seen = {}
+    monkeypatch.setattr(pipeline, "run_stage", lambda *a, **k: seen.update(k))
+
+    run.retrain_model("event_time")
+    assert seen["rollout_score_fn_factory"] is not None

@@ -49,6 +49,19 @@ from training.subset import extract as extract_subset, load_subset_games
 DEFAULT_STATE_PATH = FULL_RUN_STATE_PATH   # re-exported: train.py imports it from here
 
 
+def missing_heads(artifacts_root: str | Path) -> list[str]:
+    """Which of ``STAGE_MODEL_KEYS`` have no weights on disk under ``artifacts_root``.
+
+    Rung 2 scores a ROLLOUT, and a rollout drives the WHOLE bundle through a whole game -- not the
+    one head being trained. So it needs twelve finished heads, and on a first full train none of
+    them exist yet: ``GameSimulator.load`` raises ``FileNotFoundError`` the first time the callback
+    fires, which is the end of epoch ROLLOUT_EVAL_EVERY, after the epochs are already paid for.
+    """
+    from models.artifacts import ModelArtifacts
+    return [k for k in STAGE_MODEL_KEYS
+            if not ModelArtifacts.for_key(k, artifacts_root).weights_path.exists()]
+
+
 class FullRun:
     """Single full-train + batched holdout eval; each public method is one CLI subcommand."""
 
@@ -267,9 +280,23 @@ class FullRun:
         import config as _config
         if not getattr(_config, "ROLLOUT_SELECTION", False):
             return None, None
-        from models.rollout_bridge import build_rollout_score_fn
 
         root = self.state["artifacts_root"]
+        # The flag means "do rung 2 where rung 2 can run", not "attempt it and die". Checked HERE,
+        # before a single epoch, because the alternative is what actually happened: the first 3.2
+        # train crashed three epochs into 'event_time' on a bundle it was itself in the middle of
+        # building. Same shape as the priors and floor pre-flights above -- refuse early, in words.
+        absent = missing_heads(root)
+        if absent:
+            print(f"[train] rung 2 (rollout checkpoint selection) OFF for this pass: "
+                  f"{len(absent)} of {len(STAGE_MODEL_KEYS)} heads have no weights under {root} "
+                  f"({', '.join(absent)}).")
+            print("[train] A rollout scores the whole bundle, so selection cannot run on the "
+                  "pass that is still building it. Run it as a second pass once this train "
+                  "finishes:  python train.py --model event_time")
+            return None, None
+        from models.rollout_bridge import build_rollout_score_fn
+
         data_dir = self.state["data_dir"]
         holder: dict = {}
 
@@ -287,6 +314,23 @@ class FullRun:
                 data_dir=data_dir, seed=SEED)
 
         return factory, holder
+
+    def _record_selection(self, holder, key: str) -> None:
+        """Persist the head's rollout-vs-NLL checkpoint record, if rung 2 actually ran.
+
+        ``holder`` is the dict :meth:`_rollout_score_factory` hands out; it is ``None`` when
+        selection was off or refused, and holds no ``"head"`` when the head never trained. Both are
+        silent no-ops on purpose -- this is a record of what happened, not a requirement.
+        """
+        head = holder.get("head") if holder else None
+        selection = getattr(head, "_checkpoint_selection", None) if head is not None else None
+        if selection is None:
+            return
+        record_selection(self.state_path, key, selection)
+        print(f"[train] checkpoint selection recorded: rollout-best epoch "
+              f"{selection.get('rollout_best_epoch')}, NLL-best "
+              f"{selection.get('nll_best_epoch')}"
+              f"{' -- THEY DISAGREE' if selection.get('epochs_disagree') else ''}")
 
     # --------------------------------------------------------------- train
     def train(self, *, rebuild_vocabs: bool = False) -> None:
@@ -362,14 +406,7 @@ class FullRun:
 
         # W8: the record rung 3's condition is a number rather than a judgement. It was written to
         # EventTimeModel._checkpoint_selection and never read by anything.
-        head = holder.get("head") if holder else None
-        selection = getattr(head, "_checkpoint_selection", None) if head is not None else None
-        if selection is not None:
-            record_selection(self.state_path, "event_time", selection)
-            print(f"[train] checkpoint selection recorded: rollout-best epoch "
-                  f"{selection.get('rollout_best_epoch')}, NLL-best "
-                  f"{selection.get('nll_best_epoch')}"
-                  f"{' -- THEY DISAGREE' if selection.get('epochs_disagree') else ''}")
+        self._record_selection(holder, "event_time")
 
         write_manifest(self.state["artifacts_root"],
                        finished_at=datetime.now().isoformat(timespec="seconds"))
@@ -541,13 +578,22 @@ class FullRun:
                 sdict["trained_models"].append(key)
             self._save()
 
+        # W4 rung 2 runs HERE, not on the full train: this is the pass with a finished bundle on
+        # disk, which is the only kind a rollout can score. The factory refuses (and says so) when
+        # the bundle is incomplete, so a --model rescue mid-build stays a plain retrain. Omitting
+        # this channel is what made the handover's arm 2 a no-op -- selection was configured on,
+        # and nothing ever passed the callable to the head.
+        score_factory, holder = self._rollout_score_factory()
+
         run_stage(
             self.state["data_dir"], partition, artifacts_root=self.state["artifacts_root"],
             warm_start=False, refit_norm_stats=True, epochs=self.state["epochs"],
             batch_size=bs, report=True, run_name=self.state["run_name"],
             done=[k for k in STAGE_MODEL_KEYS if k != name], on_trained=on_trained,
             subset_keys=SUBSET_MODEL_KEYS, subset_train_games=subset_train,
+            rollout_score_fn_factory=score_factory,
         )
+        self._record_selection(holder, name)
         print(f"[retrain] '{name}' done.")
 
     # ------------------------------------------------------- retrain-shot-type

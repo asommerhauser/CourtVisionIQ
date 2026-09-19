@@ -472,6 +472,38 @@ a design change, not a bridge, and is 3.3.
 
 ---
 
+### 13. Rung 2 cannot run on the pass that builds the bundle — found by running it
+
+`ROLLOUT_SELECTION = True` was committed on, and the first 3.2 full train died three epochs into
+`event_time`: `ROLLOUT_EVAL_EVERY = 3`, the callback fired, `make_sim()` called
+`GameSimulator.load(artifacts_root)`, and nothing was there — because `event_time` is the head being
+trained and the other eleven have no weights yet. `FileNotFoundError`, two wasted epochs, on a rented card.
+
+`_rollout_score_factory`'s own docstring already said why ("mid-first-train the other eleven heads have
+no weights of their own, so a scored rollout would be scoring a bundle that does not exist"). Departure 12
+scoped rung 2 to a second pass. Neither fact was enforced anywhere: the flag meant "attempt it", and the
+only thing standing between a first-ever train and a crash was remembering to turn the flag off by hand.
+
+Two changes, both in `training/full_run.py`:
+
+* **The factory pre-flights the bundle.** `missing_heads(artifacts_root)` lists the heads with no
+  `.weights.h5` on disk; when any are missing the factory prints which ones, prints the remedy
+  (`python train.py --model event_time`), and returns `(None, None)`. `run_stage` already tolerated a
+  factory returning nothing, so the train simply proceeds without selection. Same shape as the priors and
+  floor pre-flights: refuse in words, before the epochs are paid for, rather than raising hours in.
+* **`retrain_model` passes the channel.** It never did. It called `run_stage` without
+  `rollout_score_fn_factory` and never called `record_selection`, so the handover's arm 2 — the pass whose
+  entire purpose is rung 2 — would have trained a fresh `event_time`, scored no rollouts, recorded no
+  `epochs_disagree`, and looked completely normal. The crash is what sent anyone to read that function.
+  The recorder is now one method (`_record_selection`) shared by the full train and the second pass.
+
+`tests/test_full_run.py` pins all four behaviours: the head inventory, the refusal and its wording, the
+factory arming on a complete bundle, and the channel reaching `run_stage` from `retrain_model`.
+
+**The pod is running with `ROLLOUT_SELECTION = False`** set by hand in `config.py`, because the train was
+relaunched before this fix existed. That is arm 1 behaving as designed either way; the flag has to go back
+to `True` for step 6.
+
 ## Gaps found in 3.0's code while planning 3.2
 
 Each would have surfaced as a failure or a silent constant in the first real 3.0 train.
@@ -506,11 +538,15 @@ Each would have surfaced as a failure or a silent constant in the first real 3.0
 
 Everything in §3–§5 of the build is in the tree and green locally. What is left needs a GPU.
 
-**Read the ordering note first.** `training.subset extract` reads `training/full_run_state.json`, which
-only `FullRun.setup` writes — and `setup` runs as part of `train.py --full`. So the extract cannot precede
-the first setup, and it does not need to: `train()` extracts the subset itself when the manifest is absent,
-*before* the vocab rebuild, which is the order W4's floor requires. The explicit extract below exists only
-so the games-per-player histogram can be read and the floor confirmed before hours of training start.
+**Read the ordering note first, and note what it cost.** `training.subset extract` reads
+`training/full_run_state.json`, which only `FullRun.setup` writes — and `setup` runs as part of
+`train.py --full`. The 3.2 handover said the extract could therefore not precede the first setup and
+listed it as a step anyway; on the pod it died with `FileNotFoundError: training/full_run_state.json`.
+`setup` is pure bookkeeping (it computes the cut and writes the state file plus a stub manifest, and
+deletes nothing), so the fix is to run it on its own first — step 3b below — and let `train.py --full`
+re-run it identically afterwards. The train would extract the subset itself, *before* the vocab rebuild,
+which is the order W4's floor requires; the explicit extract exists only so the real games-per-player
+histogram can be read and the floor confirmed before hours of training start.
 
 ```bash
 cd /mnt/c/Projects/CourtVisionIQ
@@ -546,7 +582,13 @@ rm encoder/vocabs/*.json
 ```
 
 ```bash
-# 3b. Read the REAL games-per-player histogram and confirm the floor. Measurement 2 is an expected-exposure
+# 3b. Setup ALONE, because 3c reads the state file it writes. Same defaults --full would pass, so the
+#     setup --full re-runs is identical. Expect the cut line and `holdout = 700 games`.
+python -c "from training.full_run import FullRun; FullRun().setup(name='version3.2', batch_size=64)"
+```
+
+```bash
+# 3c. Read the REAL games-per-player histogram and confirm the floor. Measurement 2 is an expected-exposure
 #     estimate (subset ~5,374 games, median 34 games a player, 959 rows kept at a floor of 20); the
 #     extraction is the number. `extract` prints the distribution and a kept/anonymous table at floors
 #     10-30. Change MIN_PLAYER_SUBSET_GAMES now if the real histogram disagrees -- after the train it is a
@@ -554,7 +596,8 @@ rm encoder/vocabs/*.json
 python -m training.subset extract
 ```
 
-**Expected at the start of step 3**, in order: the priors coverage line, `subset heads [all twelve]`,
+**Expected at the start of step 3**, in order: the priors coverage line, `rung 2 ... OFF for this pass`,
+`subset heads [all twelve]`,
 `vocabulary floor 20: N players aliased to anonymous slots`, then the vocab rebuild. If the floor line is
 missing, `anon_slots.json` was not written and the floor is doing nothing — that is what
 `require_player_floor` refuses, so it should not be possible to get past it silently.
@@ -577,8 +620,9 @@ The four numbers that matter are the 3rd- and 4th-foul benching rates (0.238 and
 against 0.525).
 
 ```bash
-# 6. Arm 2: rung 2. ROLLOUT_SELECTION is already True, and setup wrote train_tail_game_ids, so a second
-#    pass over the finished bundle now scores rollouts and records epochs_disagree in the run state.
+# 6. Arm 2: rung 2. ROLLOUT_SELECTION is already True, setup wrote train_tail_game_ids, and retrain_model
+#    now passes the score channel and records the selection (it did neither before -- see departure 13),
+#    so this second pass over the finished bundle scores rollouts and records epochs_disagree.
 python train.py --model event_time --name version3.2
 python evaluate.py --model version3.2 --run v32-a2 --window 0 --monte-carlo 200 --procs auto
 ```
