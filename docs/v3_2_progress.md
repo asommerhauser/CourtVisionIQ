@@ -662,47 +662,115 @@ missing, `anon_slots.json` was not written and the floor is doing nothing — th
 python train.py --extend-holdout
 ```
 
+### The three passes
+
+Everything past step 4 is **three passes, not nine steps**. Each answers a question the next one is
+not entitled to ask, and the sim count is set by that question rather than carried forward.
+
+| | question | shape | cost |
+|---|---|---|---|
+| Pass 1 | Did the retrain fix the behaviour probes? | 1 arm, 100 games × 20 sims | ~1.2 GPU-h |
+| Pass 2 | Did rung 2 and the replay pass change anything at all? | 2 trains, no eval | ~4 GPU-h |
+| Pass 3 | Which arm is better? | 2 arms, 700 games × 50 sims | ~43 GPU-h |
+
+**Corrected 2026-09-20.** The version of this section committed with the build ran all three arms at
+window 0 at `--monte-carlo 200`, in arm order, and read the comparison off them. That is 60,000
+game-sims, ~37 GPU-h, spent where no comparison exists: the paired Brier SE at a 100-game window is
+~0.0140 (`config.py`, measured on v2-run2 against v1.0 full4-s100), so every arm difference lands
+inside one sigma by construction. §6.2 of `v3_2_direction.md` budgets **two** arms at 50 sims for one
+final paired evaluation, and nothing at all for a three-arm window-0 sweep. **Sims buy probes; games
+buy Brier** — the paired SE falls as 1/sqrt(games), while sims only remove the per-game Monte-Carlo
+term.
+
+#### Pass 1 — the diagnostic
+
 ```bash
 # 5. Arm 1: the retrained bundle. Window 0 is the same 100 games v2-run1..4 scored.
-python evaluate.py --model version3.2 --run v32-a1 --window 0 --monte-carlo 200 --procs auto
+python evaluate.py --model version3.2 --run v32-a1 --window 0 --monte-carlo 20 --procs auto
 python -m reporting.state_probes results/version3.2/v32-a1 --seasons 2023
 ```
 
-**Read the probes here, not Brier.** Brier moves least and that is structural: the winner is mostly decided
-by pre-game team strength, which lives in the priors, not by how faithfully the fourth quarter composes.
-The four numbers that matter are the 3rd- and 4th-foul benching rates (0.238 and 0.280 against a real
-0.776 and 0.961), the 4th-foul event rate (9.5× too high), and the Q4 blowout rotation ratio (0.838
-against 0.525).
+**20 sims is the right number here, not a budget cut.** `state_probes` scores the real side against
+the WHOLE SEASON and never the window, so only the sim side scales with `--monte-carlo`: 100 games ×
+20 sims puts ~2,400 events under the 3rd-foul probe (SE ~0.009) and ~80 under the 4th (SE ~0.05),
+against gaps of 0.54 and 0.68. Both are 10-60× their standard error, and 50 sims resolves nothing
+that 20 does not.
+
+**Read the probes here, not Brier.** Brier moves least and that is structural: the winner is mostly
+decided by pre-game team strength, which lives in the priors, not by how faithfully the fourth
+quarter composes. The four numbers that matter are the 3rd- and 4th-foul benching rates (0.238 and
+0.280 against a real 0.776 and 0.961), the 4th-foul event rate (9.5× too high), and the Q4 blowout
+rotation ratio (0.838 against 0.525).
+
+**At 20 sims, Brier and spread corr are biased rather than merely noisy.** The Monte-Carlo term
+inflates Brier by ~0.010 and pulls spread corr from a signal 0.420 down to 0.375 (`config.py`). They
+are not readable off this run, and never comparable to a run at a different sim count.
+
+**If the probes have not moved, pass 2 is the wrong next spend.** Rung 2 and the replay pass are both
+refinements to how a bundle is selected, and neither reaches the regime latent — which the
+2026-09-19 subset train fitted at 1e-4 sd against a 0.01 init. A simulator that still never benches
+anyone in foul trouble is not waiting on better checkpoint selection.
+
+#### Pass 2 — the two retrains, no evaluation
 
 ```bash
-# 6. Arm 2: rung 2. ROLLOUT_SELECTION is already True, setup wrote train_tail_game_ids, and retrain_model
-#    now passes the score channel and records the selection (it did neither before -- see departure 13),
-#    so this second pass over the finished bundle scores rollouts and records epochs_disagree.
-python train.py --model event_time --name version3.2
-python evaluate.py --model version3.2 --run v32-a2 --window 0 --monte-carlo 200 --procs auto
+# 6a. Copy the arm-1 bundle to its own NAME first. On a --model retrain, `--name` is a GUARD checked
+#     against the state's version (train.py), NOT a destination, so arm 2 overwrites
+#     artifacts/version3.2/event_time/ in place and arm 1 stops existing. Nothing compares a
+#     manifest's `name` field to its directory, so the copy loads fine as version3.2-a1 — rewrite
+#     the field anyway, so no report can attribute a run to the wrong bundle.
+cp -r artifacts/version3.2 artifacts/version3.2-a1
+python -c "import json,pathlib; p=pathlib.Path('artifacts/version3.2-a1/manifest.json'); m=json.loads(p.read_text()); m['name']='version3.2-a1'; p.write_text(json.dumps(m, indent=2))"
 ```
 
-**Hold the seed fixed across arms.** §8's "repeat runs use a different `--seed`" is for repeats of one
-model; this is a model comparison, where a shared seed makes both arms face the same Monte-Carlo draw. The
-harness refuses a mismatched pair, and the run log should say why.
+```bash
+# 6b. Arm 2: rung 2. ROLLOUT_SELECTION is already True, setup wrote train_tail_game_ids, and
+#     retrain_model now passes the score channel and records the selection (it did neither before
+#     — see departure 13), so this second pass over the finished bundle scores rollouts.
+python train.py --model event_time --name version3.2
+```
 
 ```bash
-# 7. Arm 3: the KPI replay pass itself. Simulates one game in ten of the subset at ten sims each,
-#    scores every sim against the real game per head, keeps the ones that beat their siblings, and
-#    runs ONE weighted pass. Writes a NEW bundle (version3.2-kpi) and leaves arm 2 intact.
+# 7. Arm 3: the KPI replay pass itself. One game in ten of the subset at ten sims each, every sim
+#    scored against the real game per head, the ones that beat their siblings kept, then ONE
+#    weighted pass. Writes a NEW bundle (version3.2-kpi) and leaves arm 2 intact.
 python train.py --replay-pass
 ```
 
-```bash
-# 8. Score arm 3 on the same window, with the same seed and sim count as the other two.
-python evaluate.py --model version3.2-kpi --run v32-a3 --window 0 --monte-carlo 200 --procs auto
-```
+**Both gates are printed by the TRAINS, which is why this pass has no eval.** Arm 2's W8 number is
+`epochs_disagree`, recorded during selection. Arm 3's first read is the per-head kept counts: a head
+where no sim beat its siblings trains on an all-zero weight, which is a no-op pass that looks
+identical to a clean one. An arm whose own train says it changed nothing does not go to pass 3.
+
+#### Pass 3 — the comparison, once
+
+Seven windows per arm at 50 sims, and only for the arms pass 2 says are real. Each window needs its
+own `--run`: `--window` is pinned to the run dir on first use, so a later call at a different window
+is an error rather than a re-slice.
 
 ```bash
-# 9. The comparison. Arms in order; each arm may be several windows, comma-separated. At 100 games an
-#    expected Brier gain of 0.005-0.015 sits inside 2 SE (0.017) and is unreadable; 700 games puts the
-#    threshold at 0.007. 700 games is SEVEN runs per arm (--window 0..6), not one -- see departure 15.
-python -m reporting.ab_report results/version3.2/v32-a1 results/version3.2/v32-a2     results/version3.2-kpi/v32-a3 --state training/full_run_state.json
+# 8. One arm, seven windows. Repeat for the other arm, changing only --model and the run prefix:
+#    arm 2 is `--model version3.2` (the overwritten bundle), arm 3 `--model version3.2-kpi`.
+for w in 0 1 2 3 4 5 6; do
+  python evaluate.py --model version3.2-a1 --run v32-a1-w$w --window $w --monte-carlo 50 --procs auto
+done
+```
+
+**Hold the seed fixed across arms.** §8's "repeat runs use a different `--seed`" is for repeats of one
+model; this is a model comparison, where a shared seed makes both arms face the same Monte-Carlo
+draw. The harness refuses a mismatched pair, and the run log should say why.
+
+**700 games at 50 sims is ~4.2 GB of play-by-play per arm** (0.12 MB per game-sim), so run
+`harvest.py` beside the pool — a pod disk quota already killed one eval at 32/100 games.
+
+```bash
+# 9. The comparison. One positional per ARM, that arm's windows comma-separated inside it. 700 games
+#    puts the readable threshold at 0.007 against an expected gain of 0.005-0.015; at 100 games the
+#    threshold was 0.017 and the answer was never readable — see departure 15.
+python -m reporting.ab_report \
+  "$(printf 'results/version3.2-a1/v32-a1-w%s,' 0 1 2 3 4 5 6 | sed 's/,$//')" \
+  "$(printf 'results/version3.2/v32-a2-w%s,' 0 1 2 3 4 5 6 | sed 's/,$//')" \
+  --state training/full_run_state.json
 ```
 
 ### Gates, in order
