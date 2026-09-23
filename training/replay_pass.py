@@ -216,7 +216,9 @@ def run_replay_pass(state: dict, *, out_root: str | None = None, work_dir: str |
          f"(subset of {len(subset)}), from {in_root} -> {out_root}")
 
     echo("[replay] loading the real rows for the replayed games ...")
-    df = load_all_cleaned(data_dir, parse_rosters=True)
+    # Filter BEFORE roster parsing: parsing the whole corpus to keep a few hundred games is the
+    # ~13M-row literal_eval and most-of-20-GB footprint rung 2 already paid for once (departure 16).
+    df = load_all_cleaned(data_dir, parse_rosters=True, game_ids=games)
     wanted = set(games)
     rows = df[df["game_id"].isin(wanted)]
     real_frames = {int(g): part for g, part in rows.groupby("game_id")}

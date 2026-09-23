@@ -79,7 +79,10 @@ ROSTER_SAB_LAYERS = 3      # Set-Attention blocks in the roster set-encoder (was
 # setup() records the train-tail games eval_game_ids samples from, and models.pipeline has a channel to
 # pass the callable to the event/time head. Before all three, turning this on would have selected on a
 # score computed over an empty game set.
-ROLLOUT_SELECTION = True
+# 2026-09-23: OFF. The first full rung-2 pass (event_time, 14 evaluations at 20 games x 3 sims) scored
+# 17.6-24.3 with no trend while val NLL fell monotonically -- noise at that size, at ~85% of wall time.
+# 3.2 runs rung 3 (the replay pass) unconditionally, so this gate has no decision left to make.
+ROLLOUT_SELECTION = False
 ROLLOUT_EVAL_EVERY = 3
 ROLLOUT_EVAL_GAMES = 20
 # 10 -> 3 on 2026-09-23, sized to the measured rate rather than to an estimate. One process runs
