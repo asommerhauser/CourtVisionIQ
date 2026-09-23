@@ -1,10 +1,12 @@
 """
-Rung 2's bridge: the three defects that made its first real invocation cost 9.5 hours of silence.
+Rung 2's bridge: the defects found by actually running it, over two nights.
 
 On 2026-09-22 ``python train.py --model event_time --name version3.2`` reached epoch 3 -- the first
 ``ROLLOUT_EVAL_EVERY`` boundary -- and went quiet. Nine and a half hours later it had produced no
-output of any kind, held 20 GB of RSS, and was burning 1.2 cores at 1% GPU utilisation. Three
-separate defects composed into that, and each gets a test here:
+output of any kind, held 20 GB of RSS, and was burning 1.2 cores at 1% GPU utilisation. On
+2026-09-23, with the inference path fixed and a heartbeat added, the same evaluation got all the way
+to the scoring step in 62 minutes and died there on a shape mismatch nobody had ever reached. Each
+defect gets a test here:
 
 * **Nothing timed or bounded an evaluation.** A rollout that never returns and a rollout that is
   merely slow look identical from outside, so the run could not be judged while it was running.
@@ -17,8 +19,14 @@ separate defects composed into that, and each gets a test here:
   runs ``ast.literal_eval`` per row; doing that over 21 seasons to slice out the scored games is
   where the RSS went. The slice now happens inside the load.
 
-The budget and corpus groups are pure and need no simulator. The streaming test is the elaborate
-one, built on stubs: if it fails, suspect the stubs before the code.
+* **The real side was never summarized.** ``probe_real`` returns counts and the scorer reads rates,
+  so the two arguments to one comparison had different shapes -- invisible until an evaluation
+  survived long enough to score.
+* **The compiled path retraced per call.** ``reduce_retracing`` alone did not collapse a sequence
+  axis that grows one event at a time; the signature now declares it dynamic.
+
+The budget, corpus and summarize groups are pure and need no simulator. The streaming test is the
+elaborate one, built on stubs: if it fails, suspect the stubs before the code.
 """
 from __future__ import annotations
 
@@ -137,7 +145,9 @@ def test_the_probes_read_the_streamed_histories(monkeypatch):
     monkeypatch.setattr(ev, "build_game_record", lambda df, boxes, n_sims: {"gid": 1})
     monkeypatch.setattr(em, "_aggregate", lambda records: {"headline": {}})
     monkeypatch.setattr(gi, "extract_game_input", lambda df, data_dir: object())
-    monkeypatch.setattr(sp, "probe_real", lambda *a, **kw: {})
+    # A blank POOL, not a summary: the bridge summarizes it itself, and stubbing the summarized
+    # shape here would hide exactly the bug that killed the first real evaluation.
+    monkeypatch.setattr(sp, "probe_real", lambda *a, **kw: sp._blank())
     monkeypatch.setattr(rb, "sim_probe_summary", _capture)
     monkeypatch.setattr(rb, "scored_probe_rows", lambda report: {"rows": []})
     monkeypatch.setattr(rb, "rollout_score", lambda aggregate, probes: 1.25)
@@ -153,6 +163,23 @@ def test_the_probes_read_the_streamed_histories(monkeypatch):
     assert score_fn(0) == 1.25
     assert len(seen["histories"]) == 2                  # one per sim, from the stream
     assert seen["histories"][0] == [{"event": "SHOT"}]  # and the rows survived the handover
+
+
+# --------------------------------------------------------------------------- the real side
+
+def test_the_real_side_is_summarized_not_the_raw_pool():
+    """``probe_real`` returns COUNTS; the scorer reads RATES. The bridge has to summarize.
+
+    This is what actually killed the first evaluation that ever reached the scoring step
+    (``KeyError: 'foul_trouble_3'``, 2026-09-23). It survived review because the two sides of the
+    same comparison were built by different code: the sim side goes through ``sim_probe_summary``,
+    which summarizes, and the real side did not. A pool has ``foul_events``; a summary has
+    ``foul_trouble_3``.
+    """
+    import reporting.state_probes as sp
+    pool = sp._blank()
+    assert "foul_trouble_3" not in pool          # the shape the bridge used to hand over
+    assert "foul_trouble_3" in sp.summarize(pool)  # the shape _rows_for_frame requires
 
 
 # --------------------------------------------------------------------------- the inference path
@@ -187,3 +214,26 @@ def test_the_compiled_forward_honours_a_per_simulator_override(monkeypatch):
     opted_out: dict = {}
     gs._compiled_forward(opted_out, _NumpyOnlyModel(), "m", inputs, enabled=False)
     assert opted_out == {}                           # explicit False beats the module default
+
+
+def test_the_trace_signature_frees_the_batch_and_sequence_axes():
+    """One trace per key-set, or the rollout pays a ~10-minute compile per new sequence length.
+
+    A rollout grows its sequence one event at a time and its batch shrinks as sims finish, so a
+    signature that pins either axis retraces for hundreds of distinct shapes. Everything past the
+    sequence axis stays static, because the built layers were constructed against those sizes.
+    """
+    import tensorflow as tf
+    from simulation.game_simulator import _dynamic_specs
+
+    specs = _dynamic_specs(tf, {
+        "event": np.zeros((4, 37), dtype="int32"),            # (batch, seq)
+        "home_roster": np.zeros((4, 37, 5), dtype="int32"),   # (batch, seq, roster)
+        "prior_home": np.zeros((4, 37, 5, 17), dtype="float32"),
+    })
+
+    assert specs["event"].shape.as_list() == [None, None]
+    assert specs["home_roster"].shape.as_list() == [None, None, 5]
+    assert specs["prior_home"].shape.as_list() == [None, None, 5, 17]
+    assert specs["prior_home"].dtype == tf.float32
+    assert specs["event"].dtype == tf.int32

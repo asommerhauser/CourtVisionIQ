@@ -143,10 +143,18 @@ def build_rollout_score_fn(state: dict, *, make_sim, live_model=None, data_dir: 
     cache: dict = {}
 
     def _real_summary() -> dict:
-        """The real side, walked once. It cannot change between epochs."""
+        """The real side, walked once. It cannot change between epochs.
+
+        ``summarize`` is not optional. ``probe_real`` returns the raw POOL -- counts keyed
+        ``foul_events`` / ``foul_benched`` -- while ``_rows_for_frame`` reads the summarized
+        shape, keyed ``foul_trouble_3``. ``compare()`` wraps it and this did not, so the first
+        evaluation that ever reached the scoring step died on ``KeyError: foul_trouble_3``
+        (2026-09-23). It survived review because the sim side goes through ``sim_probe_summary``,
+        which does summarize, so the two arguments to the same function had different shapes.
+        """
         if "real" not in cache:
-            from reporting.state_probes import probe_real
-            cache["real"] = probe_real(data_dir, seasons=seasons, echo=None)
+            from reporting.state_probes import probe_real, summarize
+            cache["real"] = summarize(probe_real(data_dir, seasons=seasons, echo=None))
         return cache["real"]
 
     def _games():
@@ -241,6 +249,11 @@ def build_rollout_score_fn(state: dict, *, make_sim, live_model=None, data_dir: 
         per_game = simulate_games(sim, games, n_sims=sims_per_game, seed0=seed + epoch,
                                   batch_size=config.ROLLOUT_BATCH_SIZE, game_ids=ids,
                                   on_sim=_on_sim)
+
+        # Judged HERE, on the rollout alone, and before the scoring step: the cost being bounded is
+        # the simulation, and a downstream failure must not swallow the measurement that explains
+        # it. On 2026-09-23 the scoring step raised at 62 minutes and the budget never fired.
+        _check_budget((time.monotonic() - started) / 60.0, epoch)
 
         # Streaming mode returns empty history lists by contract -- every history was handed to
         # ``_on_sim`` instead, so the probes read what that collected. The box scores still come back

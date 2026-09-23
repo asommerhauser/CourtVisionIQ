@@ -607,6 +607,47 @@ costs 25 minutes to learn the answer instead of a night. The honest state of run
 model — `config.py`'s ~7.5 GPU-min per evaluation, derived from 37 GPU-min per 1,000 sims on the
 **3.0** graph — has one real observation against it and none in its favour.
 
+### 17. The second run priced rung 2, and found two more defects downstream of the first
+
+2026-09-23, same command with departure 16's fixes in place. It reached the scoring step and died
+there, which is progress: nothing had ever got that far.
+
+**The measurement, which is the point of the run.** With compiled inference on, the evaluation ran
+**~62 min for 200 game-sims** against the 7.5 min `config.py` budgets. But the heartbeat shows the
+cost is not uniform — it alternates between stretches at **~20 sims/min** and stalls of **~10
+minutes** during which nothing completes:
+
+```
+[rollout] epoch 3: 44/200 sims, 17.2 min elapsed, ~78 min projected
+[rollout] epoch 3: 49/200 sims, 27.7 min elapsed, ~113 min projected     <- 5 sims in 10.5 min
+[rollout] epoch 3: 94/200 sims, 31.0 min elapsed, ~66 min projected      <- 45 sims in 3.3 min
+[rollout] epoch 3: 97/200 sims, 41.1 min elapsed, ~85 min projected      <- 3 sims in 10.1 min
+```
+
+TensorFlow named the cause itself: `5 out of the last 5 calls to _compiled_forward.<locals>.<lambda>
+triggered tf.function retracing`. Roughly **45 of the 62 minutes were compilation**, and the steady
+rate implies **~10 min for the whole evaluation** once it stops. That is inside the budget, and it
+makes rung 2 affordable — but only after the retracing is fixed, which is the second defect below.
+
+**Defect A: the compiled path retraced on essentially every call.** A rollout grows its sequence one
+event at a time, so the seq axis takes every value up to SEQ while the batch axis shrinks as sims
+finish. `reduce_retracing=True` did not collapse that — exactly the failure mode
+`simulation/game_simulator.py` warns about in its own comment, now observed. The fix declares the
+signature explicitly: batch and sequence axes `None`, feature dims static, one trace per key-set.
+The eager fallback still catches anything the signature cannot express.
+
+**Defect B: the real side was never summarized.** `_real_summary` returned `probe_real(...)`, which
+is the raw **pool** (`foul_events`, `foul_benched`), while `_rows_for_frame` reads the **summarized**
+shape (`foul_trouble_3`). `compare()` wraps it in `summarize` and the bridge did not, so the
+evaluation died on `KeyError: 'foul_trouble_3'`. It survived review because the two arguments to one
+comparison are built by different code: the sim side goes through `sim_probe_summary`, which
+summarizes, and the real side did not. **This bug was always there** — the 9.5-hour run would have
+hit it too, had it ever finished an evaluation. A stall hid a crash.
+
+**And the budget never fired**, at 62 minutes against a 25-minute ceiling, because the check sat
+after the scoring step and the scoring step raised first. It now runs on the rollout alone, before
+anything downstream can throw.
+
 ## Gaps found in 3.0's code while planning 3.2
 
 Each would have surfaced as a failure or a silent constant in the first real 3.0 train.

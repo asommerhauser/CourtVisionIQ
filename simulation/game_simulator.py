@@ -113,13 +113,29 @@ _EAGER = object()  # sentinel cache value: this (model_key, signature) must run 
 _INPUT_CACHE_ENABLED = os.environ.get("CVIQ_INPUT_CACHE", "1") != "0"
 
 
+def _dynamic_specs(tf, inputs: dict) -> dict:
+    """``TensorSpec`` per input with the batch and sequence axes free, feature dims pinned.
+
+    Rank 1 gets ``[None]``; rank 2 (batch, seq) gets ``[None, None]``; higher ranks keep every
+    axis past the sequence, because a built ``Dense`` or embedding depends on those and a None
+    there would either refuse to trace or trace something that cannot run.
+    """
+    specs = {}
+    for key, value in inputs.items():
+        arr = np.asarray(value)
+        shape = [None] * min(2, arr.ndim) + list(arr.shape[2:])
+        specs[key] = tf.TensorSpec(shape=shape, dtype=tf.as_dtype(arr.dtype), name=key)
+    return specs
+
+
 def _compiled_forward(cache: dict, model, model_key: str, inputs: dict,
                       enabled: bool | None = None):
     """Run ``model(inputs, training=False)`` via a per-signature cached ``tf.function``.
 
     ``cache`` is owned by the caller (one per GameSimulator). The signature is the head key plus the
-    sorted input names, so each distinct call shape compiles once; ``reduce_retracing`` absorbs the
-    varying batch/sequence dims. Any exception (or the kill-switch) pins that signature to eager.
+    sorted input names, so each set of inputs compiles exactly once: the batch and sequence axes
+    are declared dynamic in the signature rather than left to ``reduce_retracing`` to relax. Any
+    exception (or the kill-switch) pins that signature to eager, permanently.
 
     ``enabled`` overrides the process-wide ``CVIQ_TF_INFER`` for ONE simulator, so a caller that
     knows it is about to make millions of tiny forward passes can opt in without flipping the
@@ -136,7 +152,20 @@ def _compiled_forward(cache: dict, model, model_key: str, inputs: dict,
     if fn is _EAGER:
         return model(inputs, training=False)
     if fn is None:
-        fn = tf.function(lambda x, _m=model: _m(x, training=False), reduce_retracing=True)
+        # An explicit signature, not just ``reduce_retracing``. A rollout grows its sequence one
+        # event at a time, so the seq axis takes every value from 1 to SEQ and the batch axis shrinks
+        # as sims finish -- hundreds of distinct shapes. Measured 2026-09-23, relaxation alone did not
+        # collapse them: TF warned "5 out of the last 5 calls triggered retracing", and the rollout
+        # spent ~45 of its 62 minutes in ~10-minute compile stalls, running at ~20 sims/min in
+        # between. Pinning the batch and seq axes to None traces ONCE per key-set; the feature dims
+        # stay static because the built layers depend on them.
+        try:
+            fn = tf.function(lambda x, _m=model: _m(x, training=False),
+                             input_signature=[_dynamic_specs(tf, inputs)],
+                             reduce_retracing=True)
+        except Exception:   # a dtype or rank the signature cannot express -> eager, permanently
+            cache[sig] = _EAGER
+            return model(inputs, training=False)
         cache[sig] = fn
     try:
         return fn({k: tf.convert_to_tensor(v) for k, v in inputs.items()})
