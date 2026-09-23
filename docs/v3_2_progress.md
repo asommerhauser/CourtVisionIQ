@@ -685,6 +685,33 @@ graph on the same card. Watch `nvidia-smi` on the first run; 100 (two waves, ~30
 and still beats 63. The trace signature from departure 17 stays — it is correct on its own terms,
 it simply was not what cost the time.
 
+### 19. Width is not free: size the evaluation to the measured rate
+
+Departure 18's premise, that a wave costs ~15 min however wide it is, does not survive the
+coordinator. `_BatchCoordinator.run` is a barrier: a round waits for every live slot to submit, and
+each slot's controller step (sampling, the rule engine, input building) is Python under the one GIL.
+So a round should cost roughly `slots x per-sim Python`, and a 200-wide wave should take about four
+48-wide waves. That is inferred, not measured at 200. But the repo already measured this ceiling: the
+run-4 logs' full-batch figure is ~3.5 sims/min per process, and rung 2 measured ~3.2 (200 sims in 63
+and 68 min). The process was already at its ceiling. Waves were how that fixed rate showed up in
+the heartbeat, not what caused it.
+
+The traceback that prompted this (`68.7 min`, arm2c) was run 3 itself, from before `8f85ee0`. The
+200-slot configuration was never run, and on this reading it would have cost the same ~60 min with
+**no heartbeat at all until the very end**, because every sim would finish in the one wave.
+
+What changed:
+
+* `ROLLOUT_EVAL_SIMS` 10 —> 3: 20 games x 3 = 60 sims, ~19 min at the measured rate, inside the
+  25-minute budget. Games stay at 20 because the behaviour probes pool over games. The budget stays
+  at 25 so the guard still means something.
+* `ROLLOUT_EVAL_BATCH_SIZE = None` means one slot per sim. That removes the only waste width can
+  remove (a last partial wave) and it is the right size under either reading of the cost.
+* The rollout heartbeat is on a **timer**, not on completions, and prints `fwd/s` and `avg batch`
+  from the first minute. Run 3's first line came at 15.2 min. If `fwd/s` stays flat as the batch
+  fills, width is free after all and sims can go back up. If it falls in proportion, the GIL
+  reading holds, and more sims per evaluation means `--procs`-style processes, not more slots.
+
 ## Gaps found in 3.0's code while planning 3.2
 
 Each would have surfaced as a failure or a silent constant in the first real 3.0 train.

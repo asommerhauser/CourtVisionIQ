@@ -220,36 +220,53 @@ def build_rollout_score_fn(state: dict, *, make_sim, live_model=None, data_dir: 
         if not games:
             return None
 
-        # A heartbeat, and the reason this runs in STREAMING mode. ``on_sim`` fires on the slot thread
-        # as each sim lands, which is the only progress signal a rollout emits: without it one
-        # evaluation is a single blocking call that prints nothing until it returns, and an
-        # evaluation that never returns is indistinguishable from one that is merely slow. That cost
-        # 9.5 hours of silence on 2026-09-22. The projection is the number worth reading -- it is
-        # accurate within the first minute, long before the evaluation finishes.
+        # Streaming mode: ``on_sim`` fires on the slot thread as each sim lands and hands over its
+        # history, which the probes read below.
         total_sims = len(games) * sims_per_game
         streamed: list = []
-        beat = {"done": 0, "last": started, "lock": threading.Lock()}
 
         def _on_sim(_g, _s, history, _box) -> None:
             if history:
                 streamed.append(list(history))   # list.append is atomic under the GIL
-            with beat["lock"]:
-                beat["done"] += 1
-                done, now = beat["done"], time.monotonic()
-                due = (now - beat["last"]) >= _HEARTBEAT_SECONDS
-                if due:
-                    beat["last"] = now
-            if echo and due:
-                mins = (now - started) / 60.0
-                echo(f"[rollout] epoch {epoch + 1}: {done}/{total_sims} sims, {mins:.1f} min "
-                     f"elapsed, ~{mins / max(done, 1) * total_sims:.0f} min projected")
 
-        # One batched call for every game and sim: a single game keeps only ~2 sims on the same head
-        # at once, so pooling is what fills the batch.
-        per_game = simulate_games(sim, games, n_sims=sims_per_game, seed0=seed + epoch,
-                                  batch_size=getattr(config, "ROLLOUT_EVAL_BATCH_SIZE",
-                                                     config.ROLLOUT_BATCH_SIZE),
-                                  game_ids=ids, on_sim=_on_sim)
+        # One slot per sim unless the knob says otherwise. Sims of similar length finish together,
+        # so any width below total_sims leaves a last partial wave running mostly-empty rounds.
+        width = int(getattr(config, "ROLLOUT_EVAL_BATCH_SIZE", None) or total_sims)
+
+        # The heartbeat runs on a TIMER, not on completions. It used to fire only when a sim landed,
+        # and with every slot mid-game nothing lands for ~15 min: the first line of run 3 came at
+        # 15.2 min. Forward passes and batch fill move from the first second, and they are the two
+        # numbers that say whether width is buying anything -- fwd/s that falls as avg batch rises is
+        # a GIL-bound process at its ceiling. The completion projection joins once sims land.
+        from simulation.batched_rollout import _Progress
+        progress = _Progress(total=total_sims, enabled=False)   # counts only; the pulse prints
+        stop = threading.Event()
+
+        def _pulse() -> None:
+            while not stop.wait(_HEARTBEAT_SECONDS):
+                now = time.monotonic()
+                with progress._lock:
+                    done, passes, rows = progress.completed, progress.passes, progress.rows
+                mins = (now - started) / 60.0
+                rolling = max(now - progress._start, 1e-6)
+                line = (f"[rollout] epoch {epoch + 1}: {done}/{total_sims} sims, {mins:.1f} min "
+                        f"elapsed, {passes / rolling:.1f} fwd/s, avg batch "
+                        f"{rows / passes if passes else 0:.1f} of {width}")
+                if done:
+                    line += f", ~{mins / done * total_sims:.0f} min projected"
+                echo(line)
+
+        pulse = threading.Thread(target=_pulse, daemon=True) if echo else None
+        if pulse is not None:
+            pulse.start()
+        try:
+            # One batched call for every game and sim: a single game keeps only ~2 sims on the same
+            # head at once, so pooling is what fills the batch.
+            per_game = simulate_games(sim, games, n_sims=sims_per_game, seed0=seed + epoch,
+                                      batch_size=width, game_ids=ids, on_sim=_on_sim,
+                                      progress=progress)
+        finally:
+            stop.set()
 
         # Judged HERE, on the rollout alone, and before the scoring step: the cost being bounded is
         # the simulation, and a downstream failure must not swallow the measurement that explains

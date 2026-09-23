@@ -152,7 +152,7 @@ def simulate_games(sim: GameSimulator, games: list, *, n_sims: int, seed0: int,
                    batch_size: int = ROLLOUT_BATCH_SIZE, show_progress: bool = False,
                    game_ids: list[int] | None = None,
                    on_sim: Callable[[int, int, list, BoxScore], None] | None = None,
-                   boxes_out: list[list] | None = None):
+                   boxes_out: list[list] | None = None, progress=None):
     """Pool ``n_sims`` sims for **several** games into ONE batched rollout, then split back per game.
 
     A single game only keeps ~2 sims on the same head at once (its sims desync across the event/
@@ -178,6 +178,10 @@ def simulate_games(sim: GameSimulator, games: list, *, n_sims: int, seed0: int,
     ``boxes_out`` (a caller-owned ``[[None] * n_sims for _ in games]``) is filled **live** as sims
     land, so a signal handler can read the boxes collected so far off a run that is being killed.
 
+    ``progress`` (a ``batched_rollout._Progress``) is handed straight to the driver, so a caller can
+    read forward passes and batch fill while every slot is still mid-game -- the only signal that
+    exists before the first sim completes.
+
     Without ``on_sim`` this is the original all-at-once path, unchanged.
     """
     if game_ids is not None and len(game_ids) != len(games):
@@ -199,7 +203,8 @@ def simulate_games(sim: GameSimulator, games: list, *, n_sims: int, seed0: int,
         spans.append((start, len(jobs), home_team, away_team))
 
     if on_sim is None:
-        histories = run_jobs_batched(sim, jobs, batch_size=batch_size, show_progress=show_progress)
+        histories = run_jobs_batched(sim, jobs, batch_size=batch_size, show_progress=show_progress,
+                                     progress=progress)
 
         out: list[tuple[list[BoxScore], list[list[dict]]]] = []
         for start, end, home_team, away_team in spans:
@@ -221,7 +226,7 @@ def simulate_games(sim: GameSimulator, games: list, *, n_sims: int, seed0: int,
         on_sim(g, s, history, box)
 
     run_jobs_batched(sim, jobs, batch_size=batch_size, show_progress=show_progress,
-                     on_complete=_on_complete, keep_histories=False)
+                     progress=progress, on_complete=_on_complete, keep_histories=False)
     return [([b for b in boxes_by_game[g] if b is not None], []) for g in range(len(games))]
 
 

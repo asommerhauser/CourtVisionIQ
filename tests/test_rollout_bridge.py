@@ -125,7 +125,8 @@ def test_the_probes_read_the_streamed_histories(monkeypatch):
     """
     seen: dict = {}
 
-    def _fake_simulate_games(sim, games, *, n_sims, seed0, batch_size, game_ids, on_sim):
+    def _fake_simulate_games(sim, games, *, n_sims, seed0, batch_size, game_ids, on_sim,
+                             progress=None):
         for g in range(len(games)):
             for s in range(n_sims):
                 on_sim(g, s, [{"event": "SHOT"}], object())

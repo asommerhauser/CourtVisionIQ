@@ -82,7 +82,12 @@ ROSTER_SAB_LAYERS = 3      # Set-Attention blocks in the roster set-encoder (was
 ROLLOUT_SELECTION = True
 ROLLOUT_EVAL_EVERY = 3
 ROLLOUT_EVAL_GAMES = 20
-ROLLOUT_EVAL_SIMS = 10
+# 10 -> 3 on 2026-09-23, sized to the measured rate rather than to an estimate. One process runs
+# ~3.2 game-sims/min however the sims are scheduled (see ROLLOUT_EVAL_BATCH_SIZE), so 200 sims was
+# 63 and 68 min on two runs and 60 is ~19 min, inside ROLLOUT_EVAL_BUDGET_MIN. Games are kept at 20
+# and sims cut, because the behaviour probes pool over games and the per-game box noise is what
+# averaging across twenty games is for. Raise it only with a measured rate that pays for it.
+ROLLOUT_EVAL_SIMS = 3
 # Games before the train cut to sample the eval set from. NEVER a holdout window: selecting a
 # checkpoint against the holdout turns the report into a training metric, and nothing downstream
 # would look wrong.
@@ -104,6 +109,8 @@ ROLLOUT_COMPILED_INFERENCE = True
 # number instead of paying the same cost at every ROLLOUT_EVAL_EVERY epoch for the rest of the run.
 # 25 is ~3x the 7.5-minute estimate above -- wide enough to absorb the one-time simulator load the
 # first evaluation pays, narrow enough to fail inside a single epoch rather than overnight.
+# That estimate was wrong by ~8x (measured 63-68 min for 200 sims); ROLLOUT_EVAL_SIMS is now sized
+# to the measured rate, and the budget is left where it was so the guard still means something.
 ROLLOUT_EVAL_BUDGET_MIN = 25.0
 
 SCHEDULED_SAMPLING = True
@@ -371,18 +378,18 @@ SUB_MAX_GAP_SECONDS = 600.0
 # across the pooled games (see EVAL_GAMES_PER_BATCH) so the GPU isn't starved by a single game's ~2-wide
 # effective batch (its sims desync across heads). Lower it if concurrent workers pressure the GPU.
 ROLLOUT_BATCH_SIZE = 48
-# Rung 2 sizes its own, because the arithmetic there is different and was measured 2026-09-23.
-# Slots are CONCURRENT, not a cohort, but a game-sim is ~2,500 forward passes that cannot be
-# parallelised within a game -- so a wave costs ~15 min however wide it is, and completions arrive
-# in waves of ROLLOUT_BATCH_SIZE. At 48, one 200-sim evaluation is 4.2 waves: measured at 63 and 68
-# minutes on two runs, with wave boundaries 15.5 / 15.0 / 14.7 min apart. Width is nearly free
-# until VRAM binds; depth is the whole cost. So size this to cover a WHOLE evaluation
-# (ROLLOUT_EVAL_GAMES x ROLLOUT_EVAL_SIMS) and it becomes one wave, ~15-18 min, inside
-# ROLLOUT_EVAL_BUDGET_MIN. Raise the two eval knobs and this must rise with them or the cost goes
-# back to stepping in waves. UNMEASURED at this width: the peak is attention at
-# batch x heads x seq x seq, so watch nvidia-smi on the first run and drop to 100 (two waves) if
-# it crowds the training graph.
-ROLLOUT_EVAL_BATCH_SIZE = 200
+# Rung 2 sizes its own: None means one slot per sim, so a whole evaluation
+# (ROLLOUT_EVAL_GAMES x ROLLOUT_EVAL_SIMS) is in flight at once and never steps in waves.
+# Why, and why NOT a big fixed width: slots are concurrent, and game-sims of similar length finish
+# together, so at 48 slots 200 sims completed in waves 15 min apart (63 and 68 min, 2026-09-23).
+# 8f85ee0 read that as "width is free" and set 200. It is not: the coordinator is a barrier, every
+# slot's controller step runs in Python under ONE GIL, so a round should cost ~slots x the per-sim
+# Python work, making a 200-wide wave ~4x a 48-wide one (inferred, not yet measured at 200). The
+# repo's own full-batch figure (~3.5 sims/min per process, run-4 logs) is the rate rung 2 measured
+# -- the process was already at its ceiling, and only fewer sims or more processes change the
+# total. The rollout heartbeat now prints fwd/s and avg batch, which settles it. Matching slots to
+# sims removes the one real waste (a last partial wave), which is all width can buy here.
+ROLLOUT_EVAL_BATCH_SIZE = None
 # Eval pools this many holdout games' sims into ONE batched rollout so the GPU sees a full batch
 # (one game alone only keeps ~2 sims on the same head at a time -> the card sat ~10% utilized). With
 # STAGE_SIMS sims each, the pool is EVAL_GAMES_PER_BATCH*STAGE_SIMS concurrent sims, run in cohorts of
