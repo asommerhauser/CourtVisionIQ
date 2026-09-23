@@ -648,6 +648,43 @@ hit it too, had it ever finished an evaluation. A stall hid a crash.
 after the scoring step and the scoring step raised first. It now runs on the rollout alone, before
 anything downstream can throw.
 
+### 18. The stalls were waves, not compilation — and the fix is width, not tracing
+
+Departure 17 read the ~10-minute gaps between rollout heartbeats as `tf.function` retracing, on the
+strength of TensorFlow's own warning. **That was wrong, and the third run disproved it**: with the
+explicit trace signature in place the evaluation took 68 min against the previous 62, and the gaps
+landed in exactly the same places.
+
+`ROLLOUT_BATCH_SIZE` is **not a cohort size** (`batched_rollout.run_jobs_batched`): it is the number
+of **concurrent slots**. 48 game-sims run at once, take similar wall time, and therefore *complete in
+waves of 48* — and between waves nothing completes, because every slot is mid-game. The wave
+boundaries on run 3:
+
+| sims done | at | gap |
+|---|---|---|
+| 47/200 | 18.5 min | |
+| 93/200 | 34.0 min | 15.5 |
+| 142/200 | 49.0 min | 15.0 |
+| 183/200 | 63.7 min | 14.7 |
+
+A metronome, not a compiler.
+
+**The cost model that follows.** A game-sim is ~2,500 forward passes that are *sequential within a
+game* — each event depends on the last. So a wave costs ~15 min however wide it is, and an
+evaluation costs `ceil(total_sims / slots) x 15 min`. At 48 slots, 200 sims is 4.2 waves and ~63 min.
+**Width is nearly free; depth is the entire cost.**
+
+So rung 2 gets its own width. `ROLLOUT_EVAL_BATCH_SIZE = 200` covers a whole evaluation
+(`ROLLOUT_EVAL_GAMES x ROLLOUT_EVAL_SIMS`) in ONE wave, predicting ~15-18 min — inside the
+25-minute budget, against 63 measured. Raising either eval knob without raising this puts the cost
+back into waves, which is stated at the knob.
+
+**Unmeasured, deliberately named:** peak memory at this width. The attention score tensor is
+`batch x heads x seq x seq`, so 200 slots is ~4x the 48-slot peak, alongside a resident training
+graph on the same card. Watch `nvidia-smi` on the first run; 100 (two waves, ~30 min) is the fallback
+and still beats 63. The trace signature from departure 17 stays — it is correct on its own terms,
+it simply was not what cost the time.
+
 ## Gaps found in 3.0's code while planning 3.2
 
 Each would have surfaced as a failure or a silent constant in the first real 3.0 train.

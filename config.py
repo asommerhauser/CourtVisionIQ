@@ -371,6 +371,18 @@ SUB_MAX_GAP_SECONDS = 600.0
 # across the pooled games (see EVAL_GAMES_PER_BATCH) so the GPU isn't starved by a single game's ~2-wide
 # effective batch (its sims desync across heads). Lower it if concurrent workers pressure the GPU.
 ROLLOUT_BATCH_SIZE = 48
+# Rung 2 sizes its own, because the arithmetic there is different and was measured 2026-09-23.
+# Slots are CONCURRENT, not a cohort, but a game-sim is ~2,500 forward passes that cannot be
+# parallelised within a game -- so a wave costs ~15 min however wide it is, and completions arrive
+# in waves of ROLLOUT_BATCH_SIZE. At 48, one 200-sim evaluation is 4.2 waves: measured at 63 and 68
+# minutes on two runs, with wave boundaries 15.5 / 15.0 / 14.7 min apart. Width is nearly free
+# until VRAM binds; depth is the whole cost. So size this to cover a WHOLE evaluation
+# (ROLLOUT_EVAL_GAMES x ROLLOUT_EVAL_SIMS) and it becomes one wave, ~15-18 min, inside
+# ROLLOUT_EVAL_BUDGET_MIN. Raise the two eval knobs and this must rise with them or the cost goes
+# back to stepping in waves. UNMEASURED at this width: the peak is attention at
+# batch x heads x seq x seq, so watch nvidia-smi on the first run and drop to 100 (two waves) if
+# it crowds the training graph.
+ROLLOUT_EVAL_BATCH_SIZE = 200
 # Eval pools this many holdout games' sims into ONE batched rollout so the GPU sees a full batch
 # (one game alone only keeps ~2 sims on the same head at a time -> the card sat ~10% utilized). With
 # STAGE_SIMS sims each, the pool is EVAL_GAMES_PER_BATCH*STAGE_SIMS concurrent sims, run in cohorts of

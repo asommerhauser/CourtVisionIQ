@@ -247,8 +247,9 @@ def build_rollout_score_fn(state: dict, *, make_sim, live_model=None, data_dir: 
         # One batched call for every game and sim: a single game keeps only ~2 sims on the same head
         # at once, so pooling is what fills the batch.
         per_game = simulate_games(sim, games, n_sims=sims_per_game, seed0=seed + epoch,
-                                  batch_size=config.ROLLOUT_BATCH_SIZE, game_ids=ids,
-                                  on_sim=_on_sim)
+                                  batch_size=getattr(config, "ROLLOUT_EVAL_BATCH_SIZE",
+                                                     config.ROLLOUT_BATCH_SIZE),
+                                  game_ids=ids, on_sim=_on_sim)
 
         # Judged HERE, on the rollout alone, and before the scoring step: the cost being bounded is
         # the simulation, and a downstream failure must not swallow the measurement that explains
