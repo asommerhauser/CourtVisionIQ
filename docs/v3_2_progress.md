@@ -559,6 +559,54 @@ window *set* as well, because the failure is not an exception — the pairing is
 mismatch silently compares 700 games against the 100 they contain and reports it under the wider
 arm's name.
 
+### 16. Rung 2's first real invocation ran 9.5 hours without finishing one evaluation
+
+`python train.py --model event_time --name version3.2`, 2026-09-22. Epochs 1 and 2 took 187 s and
+103 s. Epoch 3 — the first `ROLLOUT_EVAL_EVERY` boundary — went silent and stayed silent for
+**9 h 27 m**, at which point the process had 20 GB resident, 11 h of CPU against 9 h of wall clock
+(122%, i.e. ~1.2 cores), **1% GPU utilisation**, no open data files and byte-identical RSS across
+samples. `py-spy` could not attach: these pods have no `SYS_PTRACE`. The diagnosis came from `/proc`
+instead, and it was not one defect but three, each of which alone would have been survivable.
+
+**The inference path.** `simulation/game_simulator.py` wraps each head in a cached `tf.function`
+— and that wrapper is **opt-in, default off** (`CVIQ_TF_INFER`), because its payoff is GPU-specific
+and was never measured on hardware. Its own comment predicts the observed failure exactly: called
+eagerly, each tiny forward pass pays Python-side op-dispatch that dominates, and *"the GPU sits
+mostly idle waiting on Python"*. Every path had run eagerly until now and been merely slower; rung 2
+is the first caller that makes ~200 game-sims of tiny passes **inside the training loop**, where
+"slower" compounds into a run whose remaining cost is already unaffordable. `evaluate.py` hides this
+behind `--procs`, which buys back a factor of eight with processes and leaves the per-sim cost
+unexamined. The env var stayed off on the pod (`CVIQ_TF_INFER=[]`), so arm 1 was scored on the eager
+path too — which means **pass 3's 43 GPU-h budget rests on the same unmeasured number.**
+
+**Nothing timed or bounded an evaluation.** One evaluation was a single blocking call that printed
+on completion. A rollout that never returns and a rollout that is merely slow are therefore
+indistinguishable from outside, which is why nine hours passed before anyone could say which it was.
+
+**The corpus was parsed whole to keep twenty games.** `_games()` called
+`load_all_cleaned(parse_rosters=True)` over all 21 seasons and filtered afterwards — an
+`ast.literal_eval` per row for ~13M rows, in the training process, to keep the ~1,000 rows of the
+scored games. That is most of the 20 GB, held for the whole train beside the training graph and a
+twelve-head simulator, on the host-RAM budget that already cost 2.0 a train.
+
+**What changed.** `ROLLOUT_COMPILED_INFERENCE` (default on) opts rung 2's simulator into the
+compiled forward per-simulator, via a new `enabled=` argument on `_compiled_forward`, without
+flipping the process-wide default for paths where it is still unmeasured. The evaluation times
+itself, announces its shape and inference path on the first call, emits a progress line a minute
+through `simulate_games` streaming mode, and aborts through `ROLLOUT_EVAL_BUDGET_MIN` (25 min) with
+the measured number when one evaluation runs past it. `load_all_cleaned` grew a `game_ids=` filter
+applied **before** roster parsing. The streaming rewiring moves where probe histories come from
+— the return value is empty by contract in that mode — which is a silent-wrong failure if got
+wrong, so `tests/test_rollout_bridge.py` covers it specifically.
+
+**What is still unknown, and should not be written up as fixed.** The compiled path has *never been
+measured on a GPU in this repository*. Its own comment warns that if `reduce_retracing` fails to
+collapse the varying sequence-length dimension it retraces per event and runs **slower**. So the next
+invocation is a measurement, and the budget guard is what makes taking that measurement cheap: it
+costs 25 minutes to learn the answer instead of a night. The honest state of rung 2 is that its cost
+model — `config.py`'s ~7.5 GPU-min per evaluation, derived from 37 GPU-min per 1,000 sims on the
+**3.0** graph — has one real observation against it and none in its favour.
+
 ## Gaps found in 3.0's code while planning 3.2
 
 Each would have surfaced as a failure or a silent constant in the first real 3.0 train.
@@ -729,6 +777,24 @@ python -c "import json,pathlib; p=pathlib.Path('artifacts/version3.2-a1/manifest
 #     — see departure 13), so this second pass over the finished bundle scores rollouts.
 python train.py --model event_time --name version3.2
 ```
+
+**Read epoch 3, then decide.** The first `ROLLOUT_EVAL_EVERY` boundary is where this pass either
+works or does not, and departure 16 is what happens when nobody looks. The rollout now announces
+itself on the first evaluation and emits a progress line a minute:
+
+```
+[rollout] scoring 20 games x 10 sims every 3 epochs, compiled inference, budget 25 min/evaluation.
+[rollout] epoch 3: 48/200 sims, 1.0 min elapsed, ~4 min projected
+[rollout] epoch 3: score 8.1234 over 20 games x 10 sims in 4.2 min
+```
+
+`compiled inference` is the word that matters; `EAGER` means `ROLLOUT_COMPILED_INFERENCE` is off and
+you are about to repeat the 9.5-hour run. The **projection** in the second line is readable inside
+the first minute — if it says hours, kill it there rather than waiting. If an evaluation does run
+past `ROLLOUT_EVAL_BUDGET_MIN`, the train aborts with `RolloutBudgetExceeded` and the measured
+number, which is the intended outcome and not a crash to work around. **This is the first GPU
+measurement of the compiled path in this repository**, so treat epoch 3's elapsed time as the result
+of the step, and record it.
 
 ```bash
 # 7. Arm 3: the KPI replay pass itself. One game in ten of the subset at ten sims each, every sim

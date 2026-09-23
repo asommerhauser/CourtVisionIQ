@@ -113,14 +113,20 @@ _EAGER = object()  # sentinel cache value: this (model_key, signature) must run 
 _INPUT_CACHE_ENABLED = os.environ.get("CVIQ_INPUT_CACHE", "1") != "0"
 
 
-def _compiled_forward(cache: dict, model, model_key: str, inputs: dict):
+def _compiled_forward(cache: dict, model, model_key: str, inputs: dict,
+                      enabled: bool | None = None):
     """Run ``model(inputs, training=False)`` via a per-signature cached ``tf.function``.
 
     ``cache`` is owned by the caller (one per GameSimulator). The signature is the head key plus the
     sorted input names, so each distinct call shape compiles once; ``reduce_retracing`` absorbs the
     varying batch/sequence dims. Any exception (or the kill-switch) pins that signature to eager.
+
+    ``enabled`` overrides the process-wide ``CVIQ_TF_INFER`` for ONE simulator, so a caller that
+    knows it is about to make millions of tiny forward passes can opt in without flipping the
+    default for every other path. ``None`` (the default) keeps the env-var behaviour. Rung 2 sets
+    it True: see ``config.ROLLOUT_COMPILED_INFERENCE`` for the 9.5-hour measurement that forced it.
     """
-    if not _TF_INFER_ENABLED:
+    if not (_TF_INFER_ENABLED if enabled is None else enabled):
         return model(inputs, training=False)
 
     import tensorflow as tf
@@ -568,7 +574,8 @@ class GameSimulator:
                 f"'{model_key}' head not loaded; train it and load via GameSimulator.load()."
             )
         cache = self.__dict__.setdefault("_tf_infer_cache", {})
-        out = _compiled_forward(cache, model, model_key, inputs)
+        out = _compiled_forward(cache, model, model_key, inputs,
+                                enabled=getattr(self, "compiled_inference", None))
         return {k: np.asarray(v) for k, v in out.items()}
 
     def _log_decision(self, head: str, output: str, token) -> None:

@@ -11,6 +11,7 @@ loads. This module is that single source of truth.
 from __future__ import annotations
 
 import ast
+from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
@@ -78,7 +79,8 @@ def season_offsets(data_dir) -> dict[Path, int]:
 
 
 def load_all_cleaned(data_dir, parse_rosters: bool = False, *,
-                     min_season: int | None = None) -> pd.DataFrame:
+                     min_season: int | None = None,
+                     game_ids: Iterable[int] | None = None) -> pd.DataFrame:
     """Concatenate all cleaned CSVs, keeping ``game_id`` globally unique across files.
 
     The numbering is ``season_offsets``'; see there for why it is not computed here any more.
@@ -90,6 +92,12 @@ def load_all_cleaned(data_dir, parse_rosters: bool = False, *,
     corpus; see ``config.MIN_TRAIN_SEASON``. ``None`` (the default) means the whole corpus, which is
     what the box-score tool, the shell and the report stack want -- the floor is a *training* bound,
     not a corpus one, so it is opt-in and ``load_training_corpus`` is the thing that opts in.
+
+    ``game_ids`` keeps only those games, applied after the offset walk (so ids still mean what
+    they mean) and **before** ``parse_rosters``. That ordering is the point: roster decoding is a
+    per-row Python ``ast.literal_eval``, so parsing the whole corpus to slice twenty games out of
+    it afterwards costs minutes and ~20 GB of RSS for rows the caller is about to throw away.
+    ``models/rollout_bridge`` did exactly that inside the training process until 2026-09-22.
     """
     offsets = season_offsets(data_dir)
     frames = []
@@ -108,6 +116,9 @@ def load_all_cleaned(data_dir, parse_rosters: bool = False, *,
                 f"{Path(data_dir).resolve()} spans seasons "
                 f"{int(out['season'].min())}-{int(out['season'].max())}")
         out = out[kept].reset_index(drop=True)
+    if game_ids is not None:
+        wanted = {int(g) for g in game_ids}
+        out = out[out["game_id"].isin(wanted)].reset_index(drop=True)
     if parse_rosters:
         for col in (*ROSTER_STR_COLS, *REST_STR_COLS):
             if col in out.columns:

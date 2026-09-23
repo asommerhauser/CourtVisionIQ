@@ -92,6 +92,19 @@ ROLLOUT_EVAL_TAIL = 500
 # so a checkpoint cannot win by fixing the box while still never benching anyone.
 ROLLOUT_SCORE_DISPERSION_WEIGHT = 2.0
 ROLLOUT_SCORE_BEHAVIOUR_WEIGHT = 1.0
+# Rung 2's rollout runs INSIDE the training process, which is the one path where the eager
+# inference default is fatal: one scored evaluation is ~200 game-sims of tiny forward passes, and
+# eager dispatch leaves the card idle while a single core does Python op-dispatch (see the
+# "Compiled inference" block in simulation/game_simulator.py). Measured 2026-09-22 on the first
+# real invocation: 9.5 hours without finishing ONE evaluation, 122% CPU, 1% GPU. So this path opts
+# IN to the compiled forward regardless of CVIQ_TF_INFER, which stays off elsewhere until it is
+# measured there too. Set False to reproduce the eager behaviour.
+ROLLOUT_COMPILED_INFERENCE = True
+# Wall-clock ceiling for ONE evaluation, in minutes; exceeding it aborts the train with the measured
+# number instead of paying the same cost at every ROLLOUT_EVAL_EVERY epoch for the rest of the run.
+# 25 is ~3x the 7.5-minute estimate above -- wide enough to absorb the one-time simulator load the
+# first evaluation pays, narrow enough to fail inside a single epoch rather than overnight.
+ROLLOUT_EVAL_BUDGET_MIN = 25.0
 
 SCHEDULED_SAMPLING = True
 SCHEDULED_SAMPLING_MAX_P = 0.25
