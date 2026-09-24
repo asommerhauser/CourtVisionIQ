@@ -58,6 +58,17 @@ from training.replay_corpus import (assert_ids_fit, select_replay_games, sim_fra
 #: no val loss at all, and the run report is how this pass is read afterwards.
 VAL_FRACTION = 0.05
 
+
+def _echo(msg: str) -> None:
+    """``print`` that reaches a ``nohup`` log as it happens.
+
+    Every other long job here streams only because Keras flushes stdout with each progress-bar
+    update, carrying our buffered prints out with it. The rollout half of this pass has no Keras
+    in it, so without the flush its progress sat in the buffer for the whole simulation.
+    """
+    print(msg, flush=True)
+
+
 #: Rewritten between preprocess and train. Matched by substring because each head names its own file
 #: ("train.npz", "player_train.npz", "cond_train.npz") and a registry of those names would be a second
 #: place to forget a head -- which is the shape of bug this workstream keeps finding.
@@ -104,7 +115,7 @@ def score_game(real_box, real_rows, sim_boxes, sim_frames, real_summary: dict) -
 # ===================================================================== #
 
 def replay_one_chunk(sim, chunk, real_frames, real_summary, *, n_sims, batch_size,
-                     data_dir: str = "./data", echo=print):
+                     data_dir: str = "./data", echo=_echo):
     """Simulate and score a handful of games. Returns ``(frames, weights_by_head)``.
 
     Games are chunked rather than run one at a time because a single game keeps only ~2 sims on the same
@@ -156,7 +167,7 @@ def merge_weights(into: dict, more: dict) -> dict:
 # --- The weighted training pass                                       --
 # ===================================================================== #
 
-def reweight_split(processed_dir, expected_ids, weights_by_game, *, echo=print) -> list[Path]:
+def reweight_split(processed_dir, expected_ids, weights_by_game, *, echo=_echo) -> list[Path]:
     """Overwrite ``recency_weight`` in every preprocessed train file under ``processed_dir``.
 
     Every head's split orders its rows by sorted game id, so the weight vector is built in that order
@@ -191,7 +202,7 @@ def reweight_split(processed_dir, expected_ids, weights_by_game, *, echo=print) 
 def run_replay_pass(state: dict, *, out_root: str | None = None, work_dir: str | None = None,
                     fraction: float = REPLAY_GAME_FRACTION, n_sims: int = REPLAY_SIMS_PER_GAME,
                     seed: int = SEED, batch_size: int = ROLLOUT_BATCH_SIZE,
-                    games_per_chunk: int = 4, echo=print) -> dict:
+                    games_per_chunk: int = 4, echo=_echo) -> dict:
     """Run the whole pass and return its summary (also written to ``out_root/replay_pass.json``)."""
     import pandas as pd
 
