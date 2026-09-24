@@ -7,12 +7,12 @@
     "none": 4,
     "shot": 5,
     "rebound": 6,
-    "assist": 7,
+    "foul": 7,
     "turnover": 8,
-    "block": 9,
-    "foul": 10,
+    "assist": 9,
+    "timeout": 10,
     "substitution": 11,
-    "timeout": 12
+    "block": 12
   },
   "token_to_string": {
     "0": "PAD",
@@ -22,13 +22,13 @@
     "4": "none",
     "5": "shot",
     "6": "rebound",
-    "7": "assist",
+    "7": "foul",
     "8": "turnover",
-    "9": "block",
-    "10": "foul",
+    "9": "assist",
+    "10": "timeout",
     "11": "substitution",
-    "12": "timeout"
+    "12": "block"
   },
   "next_token": 13,
-  "frozen": false
+  "frozen": true
 }
