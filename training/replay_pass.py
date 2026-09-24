@@ -42,6 +42,8 @@ receive every subsequent game's weight shifted by one, which is a silent, plausi
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -67,6 +69,32 @@ def _echo(msg: str) -> None:
     in it, so without the flush its progress sat in the buffer for the whole simulation.
     """
     print(msg, flush=True)
+
+
+#: Seconds between heartbeat lines while the rollout runs. On a timer, not on completions: a chunk's
+#: sims all land together at the end, so a completion-driven line goes quiet for the whole chunk.
+HEARTBEAT_SECONDS = 60.0
+
+
+def _rss_gb() -> float | None:
+    """Resident memory of this process in GB, or None where /proc is absent (Windows).
+
+    Printed on every heartbeat because the likeliest silent death here is the OOM killer: SIGKILL
+    leaves no traceback, so the only evidence is the last RSS the log recorded before it stopped.
+    """
+    try:
+        with open("/proc/self/status", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / (1 << 20)
+    except OSError:
+        pass
+    return None
+
+
+def _mem() -> str:
+    rss = _rss_gb()
+    return f"RSS {rss:.1f} GB" if rss is not None else "RSS n/a"
 
 
 #: Rewritten between preprocess and train. Matched by substring because each head names its own file
@@ -115,8 +143,11 @@ def score_game(real_box, real_rows, sim_boxes, sim_frames, real_summary: dict) -
 # ===================================================================== #
 
 def replay_one_chunk(sim, chunk, real_frames, real_summary, *, n_sims, batch_size,
-                     data_dir: str = "./data", echo=_echo):
+                     data_dir: str = "./data", echo=_echo, progress=None):
     """Simulate and score a handful of games. Returns ``(frames, weights_by_head)``.
+
+    ``progress`` (a ``batched_rollout._Progress``) is shared across chunks so the heartbeat counts
+    sims for the whole pass, not just the current chunk.
 
     Games are chunked rather than run one at a time because a single game keeps only ~2 sims on the same
     head at once -- pooling is what fills the batch (``simulation/evaluation.simulate_games``).
@@ -138,7 +169,7 @@ def replay_one_chunk(sim, chunk, real_frames, real_summary, *, n_sims, batch_siz
         ids.append(int(gid))
 
     results = simulate_games(sim, specs, n_sims=n_sims, seed0=SEED, batch_size=batch_size,
-                             game_ids=ids)
+                             game_ids=ids, progress=progress)
 
     frames, weights_by_head = [], {}
     for gid, spec, (boxes, histories) in zip(ids, inputs, results):
@@ -226,7 +257,7 @@ def run_replay_pass(state: dict, *, out_root: str | None = None, work_dir: str |
     echo(f"[replay] {len(games)} games x {n_sims} sims = {len(games) * n_sims} game-sims "
          f"(subset of {len(subset)}), from {in_root} -> {out_root}")
 
-    echo("[replay] loading the real rows for the replayed games ...")
+    echo(f"[replay] loading the real rows for the replayed games ... ({_mem()})")
     # Filter BEFORE roster parsing: parsing the whole corpus to keep a few hundred games is the
     # ~13M-row literal_eval and most-of-20-GB footprint rung 2 already paid for once (departure 16).
     df = load_all_cleaned(data_dir, parse_rosters=True, game_ids=games)
@@ -239,20 +270,51 @@ def run_replay_pass(state: dict, *, out_root: str | None = None, work_dir: str |
     seasons = sorted({int(part["season"].iloc[0]) for part in real_frames.values()})
     real_summary = real_probe_summary(data_dir, seasons)
 
+    echo(f"[replay] {len(real_frames)} real games loaded, loading {in_root} ... ({_mem()})")
     sim = GameSimulator.load(artifacts_root=in_root)
+    echo(f"[replay] simulator ready, starting the rollout ({_mem()})")
+
+    from simulation.batched_rollout import _Progress
+    total_sims = len(games) * n_sims
+    progress = _Progress(total=total_sims, enabled=False)   # counts only; the pulse prints
+    started = time.monotonic()
+    games_done = [0]
+    stop = threading.Event()
+
+    def _pulse() -> None:
+        while not stop.wait(HEARTBEAT_SECONDS):
+            with progress._lock:
+                done, passes = progress.completed, progress.passes
+            mins = (time.monotonic() - started) / 60.0
+            line = (f"[replay] heartbeat: {games_done[0]}/{len(games)} games, {done}/{total_sims} "
+                    f"sims, {mins:.1f} min elapsed, {passes} fwd passes, {_mem()}")
+            if games_done[0]:
+                line += f", ~{mins / games_done[0] * (len(games) - games_done[0]):.0f} min left"
+            echo(line)
+
+    pulse = threading.Thread(target=_pulse, daemon=True)
+    pulse.start()
     frames, weights_by_head = [], {}
-    for start in range(0, len(games), games_per_chunk):
-        chunk = games[start:start + games_per_chunk]
-        got, weights = replay_one_chunk(sim, chunk, real_frames, real_summary, n_sims=n_sims,
-                                        batch_size=batch_size, data_dir=data_dir, echo=echo)
-        frames.extend(got)
-        merge_weights(weights_by_head, weights)
-        echo(f"[replay] {min(start + games_per_chunk, len(games))}/{len(games)} games simulated")
+    try:
+        for start in range(0, len(games), games_per_chunk):
+            chunk = games[start:start + games_per_chunk]
+            got, weights = replay_one_chunk(sim, chunk, real_frames, real_summary, n_sims=n_sims,
+                                            batch_size=batch_size, data_dir=data_dir, echo=echo,
+                                            progress=progress)
+            frames.extend(got)
+            merge_weights(weights_by_head, weights)
+            games_done[0] = min(start + games_per_chunk, len(games))
+            mins = (time.monotonic() - started) / 60.0
+            left = mins / games_done[0] * (len(games) - games_done[0])
+            echo(f"[replay] {games_done[0]}/{len(games)} games simulated, {mins:.1f} min elapsed, "
+                 f"~{left:.0f} min left, {_mem()}")
+    finally:
+        stop.set()
 
     if not frames:
         raise SystemExit("no sims survived the pass; nothing to train on")
     sim_ids = sorted({int(f["game_id"].iloc[0]) for f in frames})
-    echo(f"[replay] writing the corpus: {len(sim_ids)} sim games -> {corpus_dir}")
+    echo(f"[replay] writing the corpus: {len(sim_ids)} sim games -> {corpus_dir} ({_mem()})")
     write_corpus(frames, corpus_dir)
     write_priors(data_dir, corpus_dir, sim_ids)
 

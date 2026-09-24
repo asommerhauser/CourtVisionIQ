@@ -23,7 +23,22 @@ Evaluation lives in a separate CLI:  python evaluate.py --version 1.1
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import os
+import signal
+import sys
+
+# Under nohup stdout is a file, so Python block-buffers it: a print reaches the log only when Keras
+# happens to flush, and a job with no Keras in it (the replay pass's rollout) shows nothing until it
+# exits -- or ever, if it is killed. Line buffering makes every mode stream the way the trains do.
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+# A death below Python (segfault, abort in a TF kernel) otherwise leaves the log mid-line with no
+# traceback. SIGTERM gets the same stack dump, then dies as it would have. SIGKILL -- the OOM killer
+# -- cannot be caught; the replay heartbeat's RSS column is what shows that one coming.
+faulthandler.enable()
+if hasattr(faulthandler, "register"):     # POSIX only; the pod, not Windows
+    faulthandler.register(signal.SIGTERM, chain=True)
 
 # Grow the GPU allocation on demand instead of grabbing all VRAM up front — friendlier if anything
 # else shares the card. Must be set before TF imports, and importing FullRun pulls in keras.
