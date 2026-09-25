@@ -597,7 +597,8 @@ class FullRun:
         print(f"[retrain] '{name}' done.")
 
     # ------------------------------------------------------------ replay pass
-    def replay_pass(self, *, out_root: str | None = None, fraction=None, n_sims=None) -> dict:
+    def replay_pass(self, *, out_root: str | None = None, fraction=None, n_sims=None,
+                    procs=None) -> dict:
         """W4 rung 3: simulate the subset, score the sims, and train once on the good ones.
 
         Arm 3 of the 3.2 A/B. It needs a FINISHED bundle for the same reason rung 2 does -- a rollout
@@ -624,7 +625,8 @@ class FullRun:
             kwargs["fraction"] = float(fraction)
         if n_sims is not None:
             kwargs["n_sims"] = int(n_sims)
-        summary = run_replay_pass(self.state, out_root=out_root, **kwargs)
+        summary = run_replay_pass(self.state, out_root=out_root, procs=procs,
+                                  state_path=str(Path(self.state_path).resolve()), **kwargs)
 
         # W12's own record, in W12's shape: kept-per-head is the number that separates "the pass
         # trained on everything" from "no sim beat its siblings for this head", which are the two

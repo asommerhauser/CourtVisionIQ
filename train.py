@@ -60,6 +60,9 @@ def main() -> None:
                       help="W4 rung 3 (arm 3): simulate the training subset, score each sim against "
                            "the real game, and run ONE weighted pass over the sims that beat their "
                            "siblings. Needs a finished bundle; writes a NEW one (<name>-kpi).")
+    mode.add_argument("--replay-shard", dest="replay_shard", metavar="I/N",
+                      help="Internal: one child of `--replay-pass --procs N`. Simulates and saves "
+                           "games[I-1::N] of the pass's manifest, then exits.")
     mode.add_argument("--status", action="store_true", help="Show full-run progress.")
     mode.add_argument("--extend-holdout", dest="extend_holdout", action="store_true",
                       help="Re-cut the holdout to FINAL_HOLDOUT_GAMES on an already-trained "
@@ -81,6 +84,10 @@ def main() -> None:
     ap.add_argument("--out-root", dest="out_root", default=None, metavar="DIR",
                     help="With --replay-pass: where the fine-tuned bundle goes "
                          "(default: the input root plus config.REPLAY_ARTIFACTS_SUFFIX).")
+    ap.add_argument("--procs", default=None, metavar="N",
+                    help="With --replay-pass: split the rollout across N processes, or 'auto' to "
+                         "size from cores and free VRAM like evaluate.py. One process is GIL-bound "
+                         "at ~3.5 sims/min and leaves the GPU mostly idle.")
     ap.add_argument("--batch-size", type=int, help="Train batch size (required with --full).")
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--clean", action="store_true",
@@ -127,7 +134,11 @@ def main() -> None:
         run.extend_holdout()
     elif args.replay_pass:
         run.replay_pass(out_root=args.out_root, fraction=args.replay_games,
-                        n_sims=args.replay_sims)
+                        n_sims=args.replay_sims, procs=args.procs)
+    elif args.replay_shard:
+        from training.replay_pass import run_replay_shard
+        i, n = (int(x) for x in args.replay_shard.split("/"))
+        run_replay_shard(run.state, i, n)
     elif args.status:
         run.status()
 
