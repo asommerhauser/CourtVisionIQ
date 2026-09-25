@@ -442,7 +442,9 @@ def run_replay_pass(state: dict, *, out_root: str | None = None, work_dir: str |
     if not (sims_dir / "manifest.json").exists():
         (sims_dir / "manifest.json").write_text(json.dumps(want), encoding="utf-8")
 
-    if not (sims_dir / "real_summary.pkl").exists():
+    # An empty file is a pass killed mid-write before the write was atomic; treat it as missing.
+    summary_path = sims_dir / "real_summary.pkl"
+    if not summary_path.exists() or summary_path.stat().st_size == 0:
         echo(f"[replay] walking the real side of the probes ... ({_mem()})")
         # Filter BEFORE roster parsing: parsing the whole corpus to keep a few hundred games is the
         # ~13M-row literal_eval and most-of-20-GB footprint rung 2 already paid for once (departure 16).
@@ -453,8 +455,13 @@ def run_replay_pass(state: dict, *, out_root: str | None = None, work_dir: str |
             raise SystemExit(f"{len(missing)} replayed games have no rows in {data_dir} (first: {missing[0]})")
         seasons = sorted({int(s) for s in df["season"].unique()})
         del df
-        with open(sims_dir / "real_summary.pkl", "wb") as fh:
-            pickle.dump(real_probe_summary(data_dir, seasons), fh)
+        # Summarize BEFORE opening the file, then swap it in: a kill during the slow walk must not
+        # leave an empty pickle that every later run trusts because it exists.
+        real_summary = real_probe_summary(data_dir, seasons)
+        tmp = summary_path.with_suffix(".pkl.tmp")
+        with open(tmp, "wb") as fh:
+            pickle.dump(real_summary, fh)
+        tmp.replace(summary_path)
 
     remaining = len(games) - len(done_games(sims_dir))
     if remaining:
